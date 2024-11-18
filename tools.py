@@ -1,5 +1,6 @@
 # tools.py
 
+import logging
 from PyQt5.QtWidgets import QGraphicsPathItem, QGraphicsPolygonItem, QApplication
 from PyQt5.QtGui import QPen, QPainterPath, QColor, QPolygonF, QBrush, QScreen
 from PyQt5.QtCore import Qt, QPointF
@@ -26,7 +27,7 @@ class BrushTool:
             view.scene().addItem(self.path_item)
             print(f"BrushTool: Created path_item with brush size {pen.width()}")
         except Exception as e:
-            print(f"BrushTool: Exception in on_press: {e}")
+            logging.exception("Exception in BrushTool on_press:")
 
     def on_move(self, event, view):
         if self.path_item:
@@ -36,7 +37,7 @@ class BrushTool:
                 self.path.lineTo(scene_pos)
                 self.path_item.setPath(self.path)
             except Exception as e:
-                print(f"BrushTool: Exception in on_move: {e}")
+                logging.exception("Exception in BrushTool on_move:")
 
     def on_release(self, event, view):
         print("BrushTool: on_release")
@@ -54,7 +55,7 @@ class BrushTool:
                 self.path_item.setPen(pen)
                 print(f"BrushTool: Updated pen with new brush size {brush_size}")
             except Exception as e:
-                print(f"BrushTool: Exception in updatePen: {e}")
+                logging.exception("Exception in BrushTool updatePen:")
 
 class LassoFillTool:
     def __init__(self, settings):
@@ -77,7 +78,7 @@ class LassoFillTool:
             self.path_item.setPen(pen)
             view.scene().addItem(self.path_item)
         except Exception as e:
-            print(f"LassoFillTool: Exception in on_press: {e}")
+            logging.exception("Exception in LassoFillTool on_press:")
 
     def on_move(self, event, view):
         if self.path_item:
@@ -88,7 +89,7 @@ class LassoFillTool:
                 self.selection_polygon.append(scene_pos)
                 self.path_item.setPath(self.path)
             except Exception as e:
-                print(f"LassoFillTool: Exception in on_move: {e}")
+                logging.exception("Exception in LassoFillTool on_move:")
 
     def on_release(self, event, view):
         print("LassoFillTool: on_release")
@@ -117,7 +118,7 @@ class LassoFillTool:
             self.selection_polygon = []
             self.path = None
         except Exception as e:
-            print(f"LassoFillTool: Exception in on_release: {e}")
+            logging.exception("Exception in LassoFillTool on_release:")
 
 class LassoEraseTool:
     def __init__(self, settings):
@@ -140,7 +141,7 @@ class LassoEraseTool:
             self.path_item.setPen(pen)
             view.scene().addItem(self.path_item)
         except Exception as e:
-            print(f"LassoEraseTool: Exception in on_press: {e}")
+            logging.exception("Exception in LassoEraseTool on_press:")
 
     def on_move(self, event, view):
         if self.path_item:
@@ -151,7 +152,7 @@ class LassoEraseTool:
                 self.selection_polygon.append(scene_pos)
                 self.path_item.setPath(self.path)
             except Exception as e:
-                print(f"LassoEraseTool: Exception in on_move: {e}")
+                logging.exception("Exception in LassoEraseTool on_move:")
 
     def on_release(self, event, view):
         print("LassoEraseTool: on_release")
@@ -180,7 +181,7 @@ class LassoEraseTool:
             self.selection_polygon = []
             self.path = None
         except Exception as e:
-            print(f"LassoEraseTool: Exception in on_release: {e}")
+            logging.exception("Exception in LassoEraseTool on_release:")
 
 class EyedropperTool:
     def __init__(self, settings):
@@ -217,7 +218,7 @@ class EyedropperTool:
             else:
                 print("EyedropperTool: Failed to grab screenshot")
         except Exception as e:
-            print(f"EyedropperTool: Exception in on_press: {e}")
+            logging.exception("Exception in EyedropperTool on_press:")
 
     def on_move(self, event, view):
         pass

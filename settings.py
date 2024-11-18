@@ -17,7 +17,7 @@ class Settings:
         base_size = min_dim * (self.brush_size_percentage / 100)
 
         if zoom_factor <= 0:
-            print("Settings: Invalid zoom_factor <= 0, resetting to 1.0")
+            print("Settings: Invalid zoom_factor <= 0, resetting to 1")
             zoom_factor = 1.0
 
         actual_size = base_size / zoom_factor
