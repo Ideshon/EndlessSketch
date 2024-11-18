@@ -1,8 +1,8 @@
 # tools.py
 
-from PyQt5.QtWidgets import QGraphicsPathItem
-from PyQt5.QtGui import QPen, QPainterPath, QColor, QPolygonF
-from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QGraphicsPathItem, QGraphicsPolygonItem, QApplication
+from PyQt5.QtGui import QPen, QPainterPath, QColor, QPolygonF, QBrush, QScreen
+from PyQt5.QtCore import Qt, QPointF
 
 class BrushTool:
     def __init__(self, settings):
@@ -17,7 +17,8 @@ class BrushTool:
             self.path.moveTo(scene_pos)
 
             self.path_item = QGraphicsPathItem()
-            brush_size = self.settings.get_brush_size(view.viewport().width(), view.viewport().height(), view.zoom_factor)
+            brush_size = self.settings.get_brush_size(
+                view.viewport().width(), view.viewport().height(), view.zoom_factor)
             pen = QPen(self.settings.current_color, brush_size)
             pen.setCapStyle(Qt.RoundCap)
             pen.setJoinStyle(Qt.RoundJoin)
@@ -45,7 +46,8 @@ class BrushTool:
         print("BrushTool: updatePen")
         if self.path_item:
             try:
-                brush_size = self.settings.get_brush_size(view.viewport().width(), view.viewport().height(), view.zoom_factor)
+                brush_size = self.settings.get_brush_size(
+                    view.viewport().width(), view.viewport().height(), view.zoom_factor)
                 pen = QPen(self.settings.current_color, brush_size)
                 pen.setCapStyle(Qt.RoundCap)
                 pen.setJoinStyle(Qt.RoundJoin)
@@ -59,6 +61,7 @@ class LassoFillTool:
         self.settings = settings
         self.path_item = None
         self.selection_polygon = []
+        self.path = None
 
     def on_press(self, event, view):
         print("LassoFillTool: on_press")
@@ -67,26 +70,25 @@ class LassoFillTool:
             self.path = QPainterPath()
             self.path.moveTo(scene_pos)
             self.selection_polygon = [scene_pos]
+
+            self.path_item = QGraphicsPathItem()
+            pen = QPen(Qt.DotLine)
+            pen.setWidthF(2 / view.zoom_factor)
+            self.path_item.setPen(pen)
+            view.scene().addItem(self.path_item)
         except Exception as e:
             print(f"LassoFillTool: Exception in on_press: {e}")
 
     def on_move(self, event, view):
-        print("LassoFillTool: on_move")
-        try:
-            scene_pos = view.mapToScene(event.pos())
-            self.path.lineTo(scene_pos)
-            self.selection_polygon.append(scene_pos)
-
-            if self.path_item:
-                view.scene().removeItem(self.path_item)
-            self.path_item = QGraphicsPathItem()
-            pen = QPen(Qt.DotLine)
-            pen.setWidthF(2 / view.zoom_factor)  # Используем view.zoom_factor
-            self.path_item.setPen(pen)
-            self.path_item.setPath(self.path)
-            view.scene().addItem(self.path_item)
-        except Exception as e:
-            print(f"LassoFillTool: Exception in on_move: {e}")
+        if self.path_item:
+            print("LassoFillTool: on_move")
+            try:
+                scene_pos = view.mapToScene(event.pos())
+                self.path.lineTo(scene_pos)
+                self.selection_polygon.append(scene_pos)
+                self.path_item.setPath(self.path)
+            except Exception as e:
+                print(f"LassoFillTool: Exception in on_move: {e}")
 
     def on_release(self, event, view):
         print("LassoFillTool: on_release")
@@ -99,12 +101,21 @@ class LassoFillTool:
                 print("LassoFillTool: No selection polygon")
                 return
 
+            # Замыкаем полигон, если необходимо
+            if self.selection_polygon[0] != self.selection_polygon[-1]:
+                self.selection_polygon.append(self.selection_polygon[0])
+
             polygon = QPolygonF(self.selection_polygon)
             pen = QPen(Qt.NoPen)
-            brush = self.settings.current_color
-            fill_item = view.scene().addPolygon(polygon, pen, brush)
-            print(f"LassoFillTool: Filled polygon with color {brush.name()}")
+            brush = QBrush(self.settings.current_color)
+            fill_item = QGraphicsPolygonItem()
+            fill_item.setPolygon(polygon)
+            fill_item.setPen(pen)
+            fill_item.setBrush(brush)
+            view.scene().addItem(fill_item)
+            print(f"LassoFillTool: Filled polygon with color {self.settings.current_color.name()}")
             self.selection_polygon = []
+            self.path = None
         except Exception as e:
             print(f"LassoFillTool: Exception in on_release: {e}")
 
@@ -113,6 +124,7 @@ class LassoEraseTool:
         self.settings = settings
         self.path_item = None
         self.selection_polygon = []
+        self.path = None
 
     def on_press(self, event, view):
         print("LassoEraseTool: on_press")
@@ -121,26 +133,25 @@ class LassoEraseTool:
             self.path = QPainterPath()
             self.path.moveTo(scene_pos)
             self.selection_polygon = [scene_pos]
+
+            self.path_item = QGraphicsPathItem()
+            pen = QPen(Qt.DotLine)
+            pen.setWidthF(2 / view.zoom_factor)
+            self.path_item.setPen(pen)
+            view.scene().addItem(self.path_item)
         except Exception as e:
             print(f"LassoEraseTool: Exception in on_press: {e}")
 
     def on_move(self, event, view):
-        print("LassoEraseTool: on_move")
-        try:
-            scene_pos = view.mapToScene(event.pos())
-            self.path.lineTo(scene_pos)
-            self.selection_polygon.append(scene_pos)
-
-            if self.path_item:
-                view.scene().removeItem(self.path_item)
-            self.path_item = QGraphicsPathItem()
-            pen = QPen(Qt.DotLine)
-            pen.setWidthF(2 / view.zoom_factor)  # Используем view.zoom_factor
-            self.path_item.setPen(pen)
-            self.path_item.setPath(self.path)
-            view.scene().addItem(self.path_item)
-        except Exception as e:
-            print(f"LassoEraseTool: Exception in on_move: {e}")
+        if self.path_item:
+            print("LassoEraseTool: on_move")
+            try:
+                scene_pos = view.mapToScene(event.pos())
+                self.path.lineTo(scene_pos)
+                self.selection_polygon.append(scene_pos)
+                self.path_item.setPath(self.path)
+            except Exception as e:
+                print(f"LassoEraseTool: Exception in on_move: {e}")
 
     def on_release(self, event, view):
         print("LassoEraseTool: on_release")
@@ -153,12 +164,21 @@ class LassoEraseTool:
                 print("LassoEraseTool: No selection polygon")
                 return
 
+            # Замыкаем полигон, если необходимо
+            if self.selection_polygon[0] != self.selection_polygon[-1]:
+                self.selection_polygon.append(self.selection_polygon[0])
+
             polygon = QPolygonF(self.selection_polygon)
             pen = QPen(Qt.NoPen)
-            brush = QColor(255, 255, 255)  # White color for erase
-            fill_item = view.scene().addPolygon(polygon, pen, brush)
+            brush = QBrush(QColor(255, 255, 255))  # Белый цвет для стирания
+            fill_item = QGraphicsPolygonItem()
+            fill_item.setPolygon(polygon)
+            fill_item.setPen(pen)
+            fill_item.setBrush(brush)
+            view.scene().addItem(fill_item)
             print("LassoEraseTool: Erased polygon area")
             self.selection_polygon = []
+            self.path = None
         except Exception as e:
             print(f"LassoEraseTool: Exception in on_release: {e}")
 
@@ -169,15 +189,33 @@ class EyedropperTool:
     def on_press(self, event, view):
         print("EyedropperTool: on_press")
         try:
-            scene_pos = view.mapToScene(event.pos())
-            items = view.scene().items(scene_pos)
-            for item in items:
-                if isinstance(item, QGraphicsPathItem):
-                    pen = item.pen()
-                    color = pen.color()
+            # Получаем глобальные координаты курсора
+            global_pos = view.viewport().mapToGlobal(event.pos())
+
+            # Получаем экран, на котором находится курсор
+            screen = QApplication.screenAt(global_pos)
+            if not screen:
+                print("EyedropperTool: No screen found at cursor position")
+                return
+
+            # Учитываем коэффициент масштабирования экрана
+            scale_factor = screen.devicePixelRatio()
+
+            # Захватываем цвет пикселя под курсором
+            x = int(global_pos.x() * scale_factor)
+            y = int(global_pos.y() * scale_factor)
+            screenshot = screen.grabWindow(0, x, y, 1, 1)
+
+            if not screenshot.isNull():
+                image = screenshot.toImage()
+                if not image.isNull():
+                    color = image.pixelColor(0, 0)
                     self.settings.current_color = color
                     print(f"EyedropperTool: Color picked {color.name()}")
-                    break
+                else:
+                    print("EyedropperTool: Failed to get image from screenshot")
+            else:
+                print("EyedropperTool: Failed to grab screenshot")
         except Exception as e:
             print(f"EyedropperTool: Exception in on_press: {e}")
 

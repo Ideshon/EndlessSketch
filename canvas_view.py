@@ -3,10 +3,12 @@
 from PyQt5.QtWidgets import (
     QMainWindow, QGraphicsView, QGraphicsScene, QToolBar, QAction,
     QColorDialog, QSlider, QLabel, QFileDialog, QGraphicsPathItem,
-    QMenu, QWidgetAction, QWidget
+    QMenu, QWidgetAction, QWidget, QVBoxLayout, QHBoxLayout, QStatusBar, QGraphicsPolygonItem
 )
-from PyQt5.QtGui import QPainter, QMouseEvent, QWheelEvent, QPainterPath, QPen, QColor
-from PyQt5.QtCore import Qt, QEvent, QPoint
+from PyQt5.QtGui import (
+    QPainter, QMouseEvent, QWheelEvent, QPainterPath, QPen, QColor, QBrush, QPolygonF
+)
+from PyQt5.QtCore import Qt, QEvent, QPointF
 from tools import BrushTool, LassoFillTool, LassoEraseTool, EyedropperTool
 from settings import Settings
 import json
@@ -30,6 +32,9 @@ class CanvasWindow(QMainWindow):
 
         # Создаем меню для сохранения и загрузки
         self.createMenuBar()
+
+        # Добавляем ползунок размера кисти в статус-бар
+        self.createStatusBar()
 
     def createToolBar(self):
         toolbar = QToolBar("Инструменты")
@@ -65,9 +70,12 @@ class CanvasWindow(QMainWindow):
         color_action.setShortcut("C")  # Горячая клавиша C
         toolbar.addAction(color_action)
 
-        # Ползунок размера кисти
+    def createStatusBar(self):
+        status_bar = QStatusBar()
+        self.setStatusBar(status_bar)
+
         brush_size_label = QLabel("Размер кисти:")
-        toolbar.addWidget(brush_size_label)
+        status_bar.addPermanentWidget(brush_size_label)
 
         self.brush_slider = QSlider(Qt.Horizontal)
         self.brush_slider.setMinimum(1)
@@ -76,7 +84,7 @@ class CanvasWindow(QMainWindow):
         self.brush_slider.setTickPosition(QSlider.TicksBelow)
         self.brush_slider.setTickInterval(10)
         self.brush_slider.valueChanged.connect(self.changeBrushSize)
-        toolbar.addWidget(self.brush_slider)
+        status_bar.addPermanentWidget(self.brush_slider)
 
     def createMenuBar(self):
         menubar = self.menuBar()
@@ -139,7 +147,7 @@ class CanvasWindow(QMainWindow):
                                                       "EndlessSketch Files (*.ess)", options=options)
             if filename:
                 data = []
-                for item in self.scene.items():
+                for item in reversed(self.scene.items()):
                     if isinstance(item, QGraphicsPathItem):
                         path = item.path()
                         # Extract path as list of points
@@ -154,6 +162,16 @@ class CanvasWindow(QMainWindow):
                             'color': pen.color().name(),
                             'width': pen.widthF(),
                             'path': points
+                        }
+                        data.append(item_data)
+                    elif isinstance(item, QGraphicsPolygonItem):
+                        polygon = item.polygon()
+                        points = [(point.x(), point.y()) for point in polygon]
+                        brush = item.brush()
+                        item_data = {
+                            'type': 'polygon',
+                            'color': brush.color().name(),
+                            'points': points
                         }
                         data.append(item_data)
                 with open(filename, 'w') as f:
@@ -172,7 +190,7 @@ class CanvasWindow(QMainWindow):
                 with open(filename, 'r') as f:
                     data = json.load(f)
                 self.scene.clear()
-                for item_data in data:
+                for item_data in data:  # Загружаем в том же порядке
                     if item_data['type'] == 'path':
                         path = QPainterPath()
                         points = item_data['path']
@@ -186,6 +204,17 @@ class CanvasWindow(QMainWindow):
                         pen.setJoinStyle(Qt.RoundJoin)
                         path_item.setPen(pen)
                         self.scene.addItem(path_item)
+                    elif item_data['type'] == 'polygon':
+                        points = [QPointF(x, y) for x, y in item_data['points']]
+                        polygon = QPolygonF(points)
+                        brush_color = QColor(item_data['color'])
+                        brush = QBrush(brush_color)
+                        pen = QPen(Qt.NoPen)
+                        polygon_item = QGraphicsPolygonItem()
+                        polygon_item.setPolygon(polygon)
+                        polygon_item.setBrush(brush)
+                        polygon_item.setPen(pen)
+                        self.scene.addItem(polygon_item)
                 print(f"CanvasWindow: Canvas loaded from {filename}")
         except Exception as e:
             print(f"CanvasWindow: Exception in loadCanvas: {e}")
@@ -226,17 +255,11 @@ class CanvasWindow(QMainWindow):
                 if target_zoom <= 0:
                     print("CanvasWindow: Invalid zoom_factor in place file")
                     target_zoom = 1.0
-                while abs(self.view.zoom_factor - target_zoom) > 0.01:
-                    if self.view.zoom_factor < target_zoom:
-                        self.view.scale(1.25, 1.25)
-                        self.view.zoom_factor *= 1.25
-                    else:
-                        self.view.scale(0.8, 0.8)
-                        self.view.zoom_factor *= 0.8
-                print(f"CanvasWindow: Zoom factor set to {self.view.zoom_factor}")
 
-                # Update settings zoom_factor
-                self.settings.zoom_factor = self.view.zoom_factor
+                scale_factor = target_zoom / self.view.zoom_factor
+                self.view.scale(scale_factor, scale_factor)
+                self.view.zoom_factor = target_zoom
+                print(f"CanvasWindow: Zoom factor set to {self.view.zoom_factor}")
 
                 # Center view on saved coordinates
                 self.view.centerOn(place['x'], place['y'])
@@ -250,14 +273,8 @@ class CanvasWindow(QMainWindow):
     def resetZoom(self):
         print("CanvasWindow: Resetting zoom to 1.0")
         # Reset the view's scale to original
-        while self.view.zoom_factor > 1.01:
-            self.view.scale(0.8, 0.8)
-            self.view.zoom_factor *= 0.8
-        while self.view.zoom_factor < 0.99:
-            self.view.scale(1.25, 1.25)
-            self.view.zoom_factor *= 1.25
+        self.view.resetTransform()
         self.view.zoom_factor = 1.0
-        self.settings.zoom_factor = 1.0
         print("CanvasWindow: Zoom reset to 1.0")
 
 class CanvasView(QGraphicsView):
@@ -269,14 +286,19 @@ class CanvasView(QGraphicsView):
         self.last_point = None
         self.setDragMode(QGraphicsView.NoDrag)
         self.zoom_factor = 1.0  # Изначальный масштаб
-        self.settings.zoom_factor = self.zoom_factor
         print(f"CanvasView: Initialized with zoom_factor = {self.zoom_factor}")
 
-        # Отключаем прокрутку при приближении к краям
+        # Отключаем прокрутку
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setTransformationAnchor(QGraphicsView.NoAnchor)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.NoAnchor)
+
+        # Устанавливаем большой размер сцены
+        self.setSceneRect(-1e10, -1e10, 2e10, 2e10)
+
+        # Разрешаем перетаскивание холста
+        self.viewport().setCursor(Qt.CrossCursor)
 
     def wheelEvent(self, event: QWheelEvent):
         zoom_in_factor = 1.25
@@ -292,13 +314,13 @@ class CanvasView(QGraphicsView):
             print(f"CanvasView: Zooming out. New zoom factor: {self.zoom_factor}")
 
         self.scale(scale_factor, scale_factor)
-        self.settings.zoom_factor = self.zoom_factor
         self.updateBrushSize()
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MiddleButton:
             print("CanvasView: Middle mouse button pressed - activating drag mode")
             self.setDragMode(QGraphicsView.ScrollHandDrag)
+            self.viewport().setCursor(Qt.ClosedHandCursor)
             fake_event = QMouseEvent(
                 QEvent.MouseButtonPress,
                 event.localPos(),
@@ -331,6 +353,7 @@ class CanvasView(QGraphicsView):
         if event.button() == Qt.MiddleButton:
             print("CanvasView: Middle mouse button released - deactivating drag mode")
             self.setDragMode(QGraphicsView.NoDrag)
+            self.viewport().setCursor(Qt.CrossCursor)
             fake_event = QMouseEvent(
                 QEvent.MouseButtonRelease,
                 event.localPos(),
