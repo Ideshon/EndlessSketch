@@ -161,3 +161,28 @@ class LassoEraseTool:
             self.selection_polygon = []
         except Exception as e:
             print(f"LassoEraseTool: Exception in on_release: {e}")
+
+class EyedropperTool:
+    def __init__(self, settings):
+        self.settings = settings
+
+    def on_press(self, event, view):
+        print("EyedropperTool: on_press")
+        try:
+            scene_pos = view.mapToScene(event.pos())
+            items = view.scene().items(scene_pos)
+            for item in items:
+                if isinstance(item, QGraphicsPathItem):
+                    pen = item.pen()
+                    color = pen.color()
+                    self.settings.current_color = color
+                    print(f"EyedropperTool: Color picked {color.name()}")
+                    break
+        except Exception as e:
+            print(f"EyedropperTool: Exception in on_press: {e}")
+
+    def on_move(self, event, view):
+        pass
+
+    def on_release(self, event, view):
+        pass

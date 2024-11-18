@@ -2,11 +2,12 @@
 
 from PyQt5.QtWidgets import (
     QMainWindow, QGraphicsView, QGraphicsScene, QToolBar, QAction,
-    QColorDialog, QSlider, QLabel, QFileDialog, QGraphicsPathItem  # Добавлен QGraphicsPathItem здесь
+    QColorDialog, QSlider, QLabel, QFileDialog, QGraphicsPathItem,
+    QMenu, QWidgetAction, QWidget
 )
-from PyQt5.QtGui import QPainter, QMouseEvent, QWheelEvent, QPainterPath, QPen, QColor  # Добавлены QPen и QColor
-from PyQt5.QtCore import Qt, QEvent
-from tools import BrushTool, LassoFillTool, LassoEraseTool
+from PyQt5.QtGui import QPainter, QMouseEvent, QWheelEvent, QPainterPath, QPen, QColor
+from PyQt5.QtCore import Qt, QEvent, QPoint
+from tools import BrushTool, LassoFillTool, LassoEraseTool, EyedropperTool
 from settings import Settings
 import json
 
@@ -37,21 +38,31 @@ class CanvasWindow(QMainWindow):
         # Инструмент кисти
         brush_action = QAction("Кисть", self)
         brush_action.triggered.connect(self.selectBrushTool)
+        brush_action.setShortcut("B")  # Горячая клавиша B
         toolbar.addAction(brush_action)
 
         # Лассо Заливка
         lasso_fill_action = QAction("Лассо Заливка", self)
         lasso_fill_action.triggered.connect(self.selectLassoFillTool)
+        lasso_fill_action.setShortcut("L")  # Горячая клавиша L
         toolbar.addAction(lasso_fill_action)
 
         # Лассо Стирание
         lasso_erase_action = QAction("Лассо Стирание", self)
         lasso_erase_action.triggered.connect(self.selectLassoEraseTool)
+        lasso_erase_action.setShortcut("E")  # Горячая клавиша E
         toolbar.addAction(lasso_erase_action)
+
+        # Пипетка
+        eyedropper_action = QAction("Пипетка", self)
+        eyedropper_action.triggered.connect(self.selectEyedropperTool)
+        eyedropper_action.setShortcut("I")  # Горячая клавиша I
+        toolbar.addAction(eyedropper_action)
 
         # Выбор цвета
         color_action = QAction("Цвет", self)
         color_action.triggered.connect(self.chooseColor)
+        color_action.setShortcut("C")  # Горячая клавиша C
         toolbar.addAction(color_action)
 
         # Ползунок размера кисти
@@ -74,11 +85,13 @@ class CanvasWindow(QMainWindow):
         # Сохранить холст
         save_canvas_action = QAction('Сохранить холст', self)
         save_canvas_action.triggered.connect(self.saveCanvas)
+        save_canvas_action.setShortcut("Ctrl+S")  # Горячая клавиша Ctrl+S
         file_menu.addAction(save_canvas_action)
 
         # Загрузить холст
         load_canvas_action = QAction('Загрузить холст', self)
         load_canvas_action.triggered.connect(self.loadCanvas)
+        load_canvas_action.setShortcut("Ctrl+O")  # Горячая клавиша Ctrl+O
         file_menu.addAction(load_canvas_action)
 
         # Сохранить место
@@ -102,6 +115,10 @@ class CanvasWindow(QMainWindow):
     def selectLassoEraseTool(self):
         print("CanvasWindow: Selected LassoEraseTool")
         self.view.current_tool = LassoEraseTool(self.settings)
+
+    def selectEyedropperTool(self):
+        print("CanvasWindow: Selected EyedropperTool")
+        self.view.current_tool = EyedropperTool(self.settings)
 
     def chooseColor(self):
         color = QColorDialog.getColor()
@@ -255,6 +272,12 @@ class CanvasView(QGraphicsView):
         self.settings.zoom_factor = self.zoom_factor
         print(f"CanvasView: Initialized with zoom_factor = {self.zoom_factor}")
 
+        # Отключаем прокрутку при приближении к краям
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setTransformationAnchor(QGraphicsView.NoAnchor)
+        self.setResizeAnchor(QGraphicsView.NoAnchor)
+
     def wheelEvent(self, event: QWheelEvent):
         zoom_in_factor = 1.25
         zoom_out_factor = 0.8
@@ -284,6 +307,8 @@ class CanvasView(QGraphicsView):
                 event.modifiers()
             )
             super(CanvasView, self).mousePressEvent(fake_event)
+        elif event.button() == Qt.RightButton:
+            self.showContextMenu(event)
         else:
             self.current_tool.on_press(event, self)
             super(CanvasView, self).mousePressEvent(event)
@@ -325,3 +350,49 @@ class CanvasView(QGraphicsView):
                 self.current_tool.updatePen(self)
             except Exception as e:
                 print(f"CanvasView: Exception in updateBrushSize: {e}")
+
+    def showContextMenu(self, event):
+        context_menu = QMenu(self)
+        brush_size_widget = QWidget()
+        brush_size_layout = QVBoxLayout()
+        brush_size_label = QLabel("Размер кисти:")
+        brush_size_slider = QSlider(Qt.Horizontal)
+        brush_size_slider.setMinimum(1)
+        brush_size_slider.setMaximum(100)
+        brush_size_slider.setValue(self.settings.brush_size_percentage)
+        brush_size_slider.setTickPosition(QSlider.TicksBelow)
+        brush_size_slider.setTickInterval(10)
+        brush_size_slider.valueChanged.connect(self.changeBrushSize)
+
+        brush_size_layout.addWidget(brush_size_label)
+        brush_size_layout.addWidget(brush_size_slider)
+        brush_size_widget.setLayout(brush_size_layout)
+
+        brush_size_action = QWidgetAction(self)
+        brush_size_action.setDefaultWidget(brush_size_widget)
+        context_menu.addAction(brush_size_action)
+
+        # Добавляем действия инструментов
+        brush_action = QAction("Кисть (B)", self)
+        brush_action.triggered.connect(self.window().selectBrushTool)
+        context_menu.addAction(brush_action)
+
+        lasso_fill_action = QAction("Лассо Заливка (L)", self)
+        lasso_fill_action.triggered.connect(self.window().selectLassoFillTool)
+        context_menu.addAction(lasso_fill_action)
+
+        lasso_erase_action = QAction("Лассо Стирание (E)", self)
+        lasso_erase_action.triggered.connect(self.window().selectLassoEraseTool)
+        context_menu.addAction(lasso_erase_action)
+
+        eyedropper_action = QAction("Пипетка (I)", self)
+        eyedropper_action.triggered.connect(self.window().selectEyedropperTool)
+        context_menu.addAction(eyedropper_action)
+
+        # Показываем контекстное меню
+        context_menu.exec_(self.mapToGlobal(event.pos()))
+
+    def changeBrushSize(self, value):
+        print(f"CanvasView: Brush size percentage changed to {value}%")
+        self.settings.brush_size_percentage = value
+        self.updateBrushSize()
