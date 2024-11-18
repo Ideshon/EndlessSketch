@@ -2,13 +2,12 @@
 
 from PyQt5.QtWidgets import (
     QMainWindow, QGraphicsView, QGraphicsScene, QToolBar, QAction,
-    QColorDialog, QSlider, QLabel, QFileDialog
+    QColorDialog, QSlider, QLabel, QFileDialog, QGraphicsPathItem  # Добавлен QGraphicsPathItem здесь
 )
-from PyQt5.QtGui import QPainter, QMouseEvent, QWheelEvent, QPainterPath  # Добавлен QPainterPath
+from PyQt5.QtGui import QPainter, QMouseEvent, QWheelEvent, QPainterPath, QPen, QColor  # Добавлены QPen и QColor
 from PyQt5.QtCore import Qt, QEvent
 from tools import BrushTool, LassoFillTool, LassoEraseTool
 from settings import Settings
-from PyQt5.QtWidgets import QGraphicsPathItem
 import json
 
 class CanvasWindow(QMainWindow):
@@ -185,7 +184,7 @@ class CanvasWindow(QMainWindow):
                 place = {
                     'x': center.x(),
                     'y': center.y(),
-                    'zoom_factor': self.settings.zoom_factor
+                    'zoom_factor': self.view.zoom_factor  # Используем zoom_factor из view
                 }
                 with open(filename, 'w') as f:
                     json.dump(place, f, indent=4)
@@ -210,30 +209,37 @@ class CanvasWindow(QMainWindow):
                 if target_zoom <= 0:
                     print("CanvasWindow: Invalid zoom_factor in place file")
                     target_zoom = 1.0
-                while abs(self.settings.zoom_factor - target_zoom) > 0.01:
-                    if self.settings.zoom_factor < target_zoom:
+                while abs(self.view.zoom_factor - target_zoom) > 0.01:
+                    if self.view.zoom_factor < target_zoom:
                         self.view.scale(1.25, 1.25)
-                        self.settings.zoom_factor *= 1.25
+                        self.view.zoom_factor *= 1.25
                     else:
                         self.view.scale(0.8, 0.8)
-                        self.settings.zoom_factor *= 0.8
-                print(f"CanvasWindow: Zoom factor set to {self.settings.zoom_factor}")
+                        self.view.zoom_factor *= 0.8
+                print(f"CanvasWindow: Zoom factor set to {self.view.zoom_factor}")
+
+                # Update settings zoom_factor
+                self.settings.zoom_factor = self.view.zoom_factor
 
                 # Center view on saved coordinates
                 self.view.centerOn(place['x'], place['y'])
                 print(f"CanvasWindow: Place loaded from {filename}")
+
+                # Обновляем размер кисти после изменения масштаба
+                self.view.updateBrushSize()
         except Exception as e:
             print(f"CanvasWindow: Exception in loadPlace: {e}")
 
     def resetZoom(self):
         print("CanvasWindow: Resetting zoom to 1.0")
         # Reset the view's scale to original
-        while self.settings.zoom_factor > 1.01:
+        while self.view.zoom_factor > 1.01:
             self.view.scale(0.8, 0.8)
-            self.settings.zoom_factor *= 0.8
-        while self.settings.zoom_factor < 0.99:
+            self.view.zoom_factor *= 0.8
+        while self.view.zoom_factor < 0.99:
             self.view.scale(1.25, 1.25)
-            self.settings.zoom_factor *= 1.25
+            self.view.zoom_factor *= 1.25
+        self.view.zoom_factor = 1.0
         self.settings.zoom_factor = 1.0
         print("CanvasWindow: Zoom reset to 1.0")
 
@@ -264,11 +270,7 @@ class CanvasView(QGraphicsView):
 
         self.scale(scale_factor, scale_factor)
         self.settings.zoom_factor = self.zoom_factor
-        if hasattr(self.current_tool, 'updatePen'):
-            try:
-                self.current_tool.updatePen(self)
-            except Exception as e:
-                print(f"CanvasView: Exception in wheelEvent when updating pen: {e}")
+        self.updateBrushSize()
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MiddleButton:

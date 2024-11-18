@@ -7,9 +7,8 @@ class Settings:
     def __init__(self):
         self.current_color = QColor(0, 0, 0)  # Черный по умолчанию
         self.brush_size_percentage = 5  # Размер кисти в процентах (1-100)
-        self.zoom_factor = 1.0  # Текущий масштаб
 
-    def get_brush_size(self, view_width, view_height):
+    def get_brush_size(self, view_width, view_height, zoom_factor):
         # Ограничиваем brush_size_percentage до диапазона 1-100
         self.brush_size_percentage = max(1, min(self.brush_size_percentage, 100))
 
@@ -17,11 +16,11 @@ class Settings:
         min_dim = min(view_width, view_height)
         base_size = min_dim * (self.brush_size_percentage / 100)
 
-        if self.zoom_factor <= 0:
+        if zoom_factor <= 0:
             print("Settings: Invalid zoom_factor <= 0, resetting to 1.0")
-            self.zoom_factor = 1.0
+            zoom_factor = 1.0
 
-        actual_size = base_size / self.zoom_factor
+        actual_size = base_size / zoom_factor
         brush_size = max(1, actual_size)  # Минимальный размер кисти - 1 пиксель
         print(f"Settings: Calculated brush size: {brush_size}")
         return brush_size

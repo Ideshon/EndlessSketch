@@ -17,7 +17,7 @@ class BrushTool:
             self.path.moveTo(scene_pos)
 
             self.path_item = QGraphicsPathItem()
-            brush_size = self.settings.get_brush_size(view.viewport().width(), view.viewport().height())
+            brush_size = self.settings.get_brush_size(view.viewport().width(), view.viewport().height(), view.zoom_factor)
             pen = QPen(self.settings.current_color, brush_size)
             pen.setCapStyle(Qt.RoundCap)
             pen.setJoinStyle(Qt.RoundJoin)
@@ -45,7 +45,7 @@ class BrushTool:
         print("BrushTool: updatePen")
         if self.path_item:
             try:
-                brush_size = self.settings.get_brush_size(view.viewport().width(), view.viewport().height())
+                brush_size = self.settings.get_brush_size(view.viewport().width(), view.viewport().height(), view.zoom_factor)
                 pen = QPen(self.settings.current_color, brush_size)
                 pen.setCapStyle(Qt.RoundCap)
                 pen.setJoinStyle(Qt.RoundJoin)
@@ -81,7 +81,7 @@ class LassoFillTool:
                 view.scene().removeItem(self.path_item)
             self.path_item = QGraphicsPathItem()
             pen = QPen(Qt.DotLine)
-            pen.setWidthF(2 / self.settings.zoom_factor)  # Fixed width on screen
+            pen.setWidthF(2 / view.zoom_factor)  # Используем view.zoom_factor
             self.path_item.setPen(pen)
             self.path_item.setPath(self.path)
             view.scene().addItem(self.path_item)
@@ -135,7 +135,7 @@ class LassoEraseTool:
                 view.scene().removeItem(self.path_item)
             self.path_item = QGraphicsPathItem()
             pen = QPen(Qt.DotLine)
-            pen.setWidthF(2 / self.settings.zoom_factor)  # Fixed width on screen
+            pen.setWidthF(2 / view.zoom_factor)  # Используем view.zoom_factor
             self.path_item.setPen(pen)
             self.path_item.setPath(self.path)
             view.scene().addItem(self.path_item)
