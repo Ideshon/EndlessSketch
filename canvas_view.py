@@ -3,7 +3,7 @@
 from PyQt5.QtWidgets import (
     QMainWindow, QGraphicsView, QGraphicsScene, QToolBar, QAction,
     QColorDialog, QSlider, QLabel, QFileDialog, QGraphicsPathItem,
-    QMenu, QWidgetAction, QWidget, QVBoxLayout, QHBoxLayout, QStatusBar, QGraphicsPolygonItem
+    QMenu, QWidgetAction, QWidget, QVBoxLayout, QHBoxLayout, QStatusBar, QGraphicsPolygonItem, QMessageBox
 )
 from PyQt5.QtGui import (
     QPainter, QMouseEvent, QWheelEvent, QPainterPath, QPen, QColor, QBrush, QPolygonF
@@ -41,34 +41,40 @@ class CanvasWindow(QMainWindow):
         self.addToolBar(toolbar)
 
         # Инструмент кисти
-        brush_action = QAction("Кисть", self)
+        brush_action = QAction("Кисть(B)", self)
         brush_action.triggered.connect(self.selectBrushTool)
         brush_action.setShortcut("B")  # Горячая клавиша B
         toolbar.addAction(brush_action)
 
         # Лассо Заливка
-        lasso_fill_action = QAction("Лассо Заливка", self)
+        lasso_fill_action = QAction("Заливка(L)", self)
         lasso_fill_action.triggered.connect(self.selectLassoFillTool)
         lasso_fill_action.setShortcut("L")  # Горячая клавиша L
         toolbar.addAction(lasso_fill_action)
 
         # Лассо Стирание
-        lasso_erase_action = QAction("Лассо Стирание", self)
+        lasso_erase_action = QAction("ЛСтирание(E)", self)
         lasso_erase_action.triggered.connect(self.selectLassoEraseTool)
         lasso_erase_action.setShortcut("E")  # Горячая клавиша E
         toolbar.addAction(lasso_erase_action)
 
         # Пипетка
-        eyedropper_action = QAction("Пипетка", self)
+        eyedropper_action = QAction("Пипетка(I)", self)
         eyedropper_action.triggered.connect(self.selectEyedropperTool)
         eyedropper_action.setShortcut("I")  # Горячая клавиша I
         toolbar.addAction(eyedropper_action)
 
         # Выбор цвета
-        color_action = QAction("Цвет", self)
+        color_action = QAction("Цвет(C)", self)
         color_action.triggered.connect(self.chooseColor)
-        color_action.setShortcut("C")  # Горячая клавиша C
+        color_action.setShortcut("C")  # Горячая клавиша Ctrl+C
         toolbar.addAction(color_action)
+
+        # Кнопка Справка
+        help_action = QAction("Справка(F1)", self)
+        help_action.triggered.connect(self.showHelp)
+        help_action.setShortcut("F1")  # Горячая клавиша F1
+        toolbar.addAction(help_action)
 
     def createStatusBar(self):
         status_bar = QStatusBar()
@@ -82,7 +88,7 @@ class CanvasWindow(QMainWindow):
         self.brush_slider.setMaximum(100)
         self.brush_slider.setValue(self.settings.brush_size_percentage)
         self.brush_slider.setTickPosition(QSlider.TicksBelow)
-        self.brush_slider.setTickInterval(10)
+        self.brush_slider.setTickInterval(1)
         self.brush_slider.valueChanged.connect(self.changeBrushSize)
         status_bar.addPermanentWidget(self.brush_slider)
 
@@ -105,12 +111,15 @@ class CanvasWindow(QMainWindow):
         # Сохранить место
         save_place_action = QAction('Сохранить место', self)
         save_place_action.triggered.connect(self.savePlace)
+        save_place_action.setShortcut("Ctrl+Shift+S")  # Горячая клавиша Ctrl+Shift+S
         file_menu.addAction(save_place_action)
 
         # Загрузить место
         load_place_action = QAction('Загрузить место', self)
         load_place_action.triggered.connect(self.loadPlace)
+        load_place_action.setShortcut("Ctrl+Shift+O")  # Горячая клавиша Ctrl+Shift+O
         file_menu.addAction(load_place_action)
+
 
     def selectBrushTool(self):
         print("CanvasWindow: Selected BrushTool")
@@ -277,6 +286,50 @@ class CanvasWindow(QMainWindow):
         self.view.zoom_factor = 1.0
         print("CanvasWindow: Zoom reset to 1.0")
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier:
+            self.chooseColor()
+        elif event.key() == Qt.Key_S and event.modifiers() & Qt.ControlModifier and event.modifiers() & Qt.ShiftModifier:
+            self.savePlace()
+        elif event.key() == Qt.Key_F1:
+            self.showHelp()
+        else:
+            super().keyPressEvent(event)
+
+    def showHelp(self):
+        print("CanvasWindow: Showing help")
+        help_text = (
+            "<h2>EndlessSketch - Справка</h2>"
+            "<p>EndlessSketch - это приложение для рисования на бесконечном холсте (Еще нет).</p>"
+            "<h3>Инструменты:</h3>"
+            "<ul>"
+            "<li><b>Кисть:</b> Рисование свободной линией.</li>"
+            "<li><b>Лассо Заливка:</b> Создание произвольной залитой области.</li>"
+            "<li><b>ЛСтирание:</b> Стирание произвольной области.</li>"
+            "<li><b>Пипетка:</b> Выбор цвета из области холста.</li>"
+            "</ul>"
+            "<h3>Горячие клавиши:</h3>"
+            "<ul>"
+            "<li><b>B:</b> Выбрать инструмент Кисть.</li>"
+            "<li><b>L:</b> Выбрать инструмент Лассо Заливка.</li>"
+            "<li><b>E:</b> Выбрать инструмент Лассо Стирание.</li>"
+            "<li><b>I:</b> Выбрать инструмент Пипетка.</li>"
+            "<li><b>C:</b> Выбрать цвет.</li>"
+            "<li><b>Ctrl+S:</b> Сохранить холст.</li>"
+            "<li><b>Ctrl+O:</b> Загрузить холст.</li>"
+            "<li><b>Ctrl+Shift+S:</b> Сохранить место.</li>"
+            "<li><b>Ctrl+Shift+O:</b> Загрузить место.</li>"
+            "<li><b>F1:</b> Открыть справку.</li>"
+            "</ul>"
+            "<h3>Изменение размера кисти:</h3>"
+            "<p>Удерживайте клавишу <b>Shift</b> и прокручивайте колесико мыши для изменения размера кисти.</p>"
+            "<h3>Перемещение по холсту:</h3>"
+            "<p>Удерживайте <b>среднюю кнопку мыши</b> и перетаскивайте холст.</p>"
+            "<h3>Масштабирование:</h3>"
+            "<p>Используйте колесико мыши для увеличения или уменьшения масштаба.</p>"
+        )
+        QMessageBox.information(self, "Справка - EndlessSketch", help_text)
+
 class CanvasView(QGraphicsView):
     def __init__(self, scene, settings):
         super().__init__(scene)
@@ -301,19 +354,41 @@ class CanvasView(QGraphicsView):
         self.viewport().setCursor(Qt.CrossCursor)
 
     def wheelEvent(self, event: QWheelEvent):
-        zoom_in_factor = 1.25
-        zoom_out_factor = 0.8
-
-        if event.angleDelta().y() > 0:
-            scale_factor = zoom_in_factor
-            self.zoom_factor *= zoom_in_factor
-            print(f"CanvasView: Zooming in. New zoom factor: {self.zoom_factor}")
+        if event.modifiers() & Qt.ShiftModifier:
+            # Изменение размера кисти
+            delta = event.angleDelta().y() / 8  # Получаем число "щелчков" колесика
+            self.changeBrushSizeByDelta(delta)
         else:
-            scale_factor = zoom_out_factor
-            self.zoom_factor *= zoom_out_factor
-            print(f"CanvasView: Zooming out. New zoom factor: {self.zoom_factor}")
+            # Масштабирование
+            zoom_in_factor = 1.25
+            zoom_out_factor = 0.8
 
-        self.scale(scale_factor, scale_factor)
+            if event.angleDelta().y() > 0:
+                scale_factor = zoom_in_factor
+                self.zoom_factor *= zoom_in_factor
+                print(f"CanvasView: Zooming in. New zoom factor: {self.zoom_factor}")
+            else:
+                scale_factor = zoom_out_factor
+                self.zoom_factor *= zoom_out_factor
+                print(f"CanvasView: Zooming out. New zoom factor: {self.zoom_factor}")
+
+            self.scale(scale_factor, scale_factor)
+            self.updateBrushSize()
+
+    def changeBrushSizeByDelta(self, delta):
+        # Изменяем процент размера кисти в зависимости от прокрутки
+        step = 1  # Шаг изменения размера кисти в процентах
+        if delta > 0:
+            self.settings.brush_size_percentage += step
+        else:
+            self.settings.brush_size_percentage -= step
+
+        # Ограничиваем значение между 1 и 100
+        self.settings.brush_size_percentage = max(1, min(100, self.settings.brush_size_percentage))
+
+        # Обновляем ползунок в статус-баре
+        self.parent().brush_slider.setValue(self.settings.brush_size_percentage)
+        print(f"CanvasView: Brush size changed to {self.settings.brush_size_percentage}% via wheel")
         self.updateBrushSize()
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -418,4 +493,5 @@ class CanvasView(QGraphicsView):
     def changeBrushSize(self, value):
         print(f"CanvasView: Brush size percentage changed to {value}%")
         self.settings.brush_size_percentage = value
+        self.parent().brush_slider.setValue(value)
         self.updateBrushSize()
