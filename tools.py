@@ -19,7 +19,9 @@ class BrushTool:
 
             self.path_item = QGraphicsPathItem()
             brush_size = self.settings.get_brush_size(
-                view.viewport().width(), view.viewport().height(), view.zoom_factor)
+                view.viewport().width(),
+                view.viewport().height(),
+                view.zoom_factor)
             pen = QPen(self.settings.current_color, brush_size)
             pen.setCapStyle(Qt.RoundCap)
             pen.setJoinStyle(Qt.RoundJoin)
@@ -41,14 +43,19 @@ class BrushTool:
 
     def on_release(self, event, view):
         print("BrushTool: on_release")
-        self.path_item = None
+        if self.path_item:
+            # Добавляем действие в стек отмены
+            view.window().undo_stack.append([self.path_item])
+            self.path_item = None
 
     def updatePen(self, view):
         print("BrushTool: updatePen")
         if self.path_item:
             try:
                 brush_size = self.settings.get_brush_size(
-                    view.viewport().width(), view.viewport().height(), view.zoom_factor)
+                    view.viewport().width(),
+                    view.viewport().height(),
+                    view.zoom_factor)
                 pen = QPen(self.settings.current_color, brush_size)
                 pen.setCapStyle(Qt.RoundCap)
                 pen.setJoinStyle(Qt.RoundJoin)
@@ -115,10 +122,16 @@ class LassoFillTool:
             fill_item.setBrush(brush)
             view.scene().addItem(fill_item)
             print(f"LassoFillTool: Filled polygon with color {self.settings.current_color.name()}")
+
+            # Добавляем действие в стек отмены
+            view.window().undo_stack.append([fill_item])
+
             self.selection_polygon = []
             self.path = None
         except Exception as e:
             logging.exception("Exception in LassoFillTool on_release:")
+
+# Аналогично для LassoEraseTool
 
 class LassoEraseTool:
     def __init__(self, settings):
@@ -178,6 +191,10 @@ class LassoEraseTool:
             fill_item.setBrush(brush)
             view.scene().addItem(fill_item)
             print("LassoEraseTool: Erased polygon area")
+
+            # Добавляем действие в стек отмены
+            view.window().undo_stack.append([fill_item])
+
             self.selection_polygon = []
             self.path = None
         except Exception as e:

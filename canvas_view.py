@@ -21,6 +21,7 @@ class CanvasWindow(QMainWindow):
         self.setWindowTitle("EndlessSketch")
         self.setGeometry(100, 100, 800, 600)
         self.settings = Settings()
+        self.undo_stack = []  # Стек для отмены действий
         self.initUI()
 
     def initUI(self):
@@ -316,12 +317,27 @@ class CanvasWindow(QMainWindow):
         self.view.zoom_factor = 1.0
         print("CanvasWindow: Zoom reset to 1.0")
 
+    def undo(self):
+        try:
+            if self.undo_stack:
+                last_action = self.undo_stack.pop()
+                for item in last_action:
+                    self.scene.removeItem(item)
+                print("CanvasWindow: Last action undone")
+            else:
+                print("CanvasWindow: Undo stack is empty")
+        except Exception as e:
+            logging.exception("Exception in undo:")
+            QMessageBox.critical(self, "Ошибка", f"Произошла ошибка при отмене действия:\n{e}")
+
     def keyPressEvent(self, event):
         try:
             if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier:
                 self.chooseColor()
             elif event.key() == Qt.Key_S and event.modifiers() & Qt.ControlModifier and event.modifiers() & Qt.ShiftModifier:
                 self.savePlace()
+            elif event.key() == Qt.Key_Z and event.modifiers() & Qt.ControlModifier:
+                self.undo()
             elif event.key() == Qt.Key_F1:
                 self.showHelp()
             else:
@@ -350,6 +366,7 @@ class CanvasWindow(QMainWindow):
                 "<li><b>E:</b> Выбрать инструмент Лассо Стирание.</li>"
                 "<li><b>I:</b> Выбрать инструмент Пипетка.</li>"
                 "<li><b>C:</b> Выбрать цвет.</li>"
+                "<li><b>Ctrl+z:</b> Отмена.</li>"
                 "<li><b>Ctrl+S:</b> Сохранить холст.</li>"
                 "<li><b>Ctrl+O:</b> Загрузить холст.</li>"
                 "<li><b>Ctrl+Shift+S:</b> Сохранить место.</li>"
