@@ -101,8 +101,8 @@
     }
   ],
   "request_analysis": {
-    "updated_at_utc": "2026-06-26T05:01:17Z",
-    "request": "Z + mouse zoom works, but the app closed when navigating from depth 0 to -15 and back. Fix the crash and record future extreme-depth/distance optimization.",
+    "updated_at_utc": "2026-06-26T05:09:15Z",
+    "request": "Publish the Rust release to a new GitHub branch named Rust and include a ready-to-run exe build.",
     "analysis": [
       "Manual testing confirmed no visible flicker, line artifacts, fill deformation, or depth visibility defects from depth -15 through +15 after the latest tile/fill fixes.",
       "Fill rendering now uses PNG tiles as the authoritative layer, a bounded scanline fallback for nearby depths, 4x4 raster coverage for softer tile edges, and parallel tile rendering with stale-generation skipping.",
@@ -123,6 +123,8 @@
       "GPU texture retention now keeps only textures from the current visible tile set and current revision, releasing textures from previous depths/positions.",
       "Manual validation confirms the wgpu Out of Memory crash is fixed for fast depth 0 -> -15 navigation, return navigation, and wheel zoom.",
       "Future optimization request: after performance settings, add a dedicated fast-zoom path to reduce tile churn during rapid zoom gestures.",
+      "Release branch Rust was created locally and pushed to origin/Rust.",
+      "Ready-to-run executable is included in the branch at release/EndlessSketch-Rust/endless-sketch.exe with release/EndlessSketch-Rust/README.txt.",
       "Future planning: after performance/quality settings, add optimization and test passes for very large depths and lateral distances from origin, including -100..+100 and -1000..+1000 style ranges.",
       "Future low-priority items after the settings menu: configurable hotkeys and eraser fill mode.",
       "New known rendering defect: at depth 25 and zoom around 1.x, intermittent thin vertical seams appear between large filled/tiled regions; changing zoom usually hides them.",
@@ -138,7 +140,7 @@
       "Launch target/release/endless-sketch.exe with manual-depth-check.esketch for manual UI validation.",
       "Preserve all user-owned untracked files and do not revert unrelated dirty worktree changes."
     ],
-    "execution_result": "Captured backtrace showing wgpu Out of Memory in texture creation. Implemented visible-set retention for GPU tile textures so old depth/position textures are released. Validation passed: cargo fmt --all -- --check, cargo test --all-targets (30 tests), cargo clippy --all-targets -- -D warnings, and cargo build --release. User manually confirmed fast 0 -> -15, return navigation, and wheel zoom no longer crash."
+    "execution_result": "Created branch Rust, committed the Rust rewrite and release executable as commit 24893b7 Add Rust release build, and pushed it to origin/Rust. The ready-to-run exe is release/EndlessSketch-Rust/endless-sketch.exe. GitHub PR creation was not performed because gh is not installed; GitHub provided PR URL https://github.com/Ideshon/EndlessSketch/pull/new/Rust."
   },
   "recommended_next_action": {
     "type": "short_input_feature",
@@ -146,14 +148,14 @@
     "intent": "Add canvas panning with Space + left mouse drag, making sure it suppresses drawing while active."
   },
   "latest_check": {
-    "checked_at_utc": "2026-06-26T04:47:53Z",
-    "branch": "test",
-    "tracking": "origin/test",
+    "checked_at_utc": "2026-06-26T05:09:15Z",
+    "branch": "Rust",
+    "tracking": "origin/Rust",
     "ahead": 0,
-    "behind": 6,
+    "behind": 0,
     "rust_toolchain": "rustc 1.96.0 stable x86_64-pc-windows-msvc",
-    "release_executable": "target/release/endless-sketch.exe",
-    "release_executable_bytes": null,
+    "release_executable": "release/EndlessSketch-Rust/endless-sketch.exe",
+    "release_executable_bytes": 17292288,
     "million_stroke_generation_ms": 320,
     "million_stroke_index_ms": 1410,
     "million_stroke_49_queries_ms": 665,
@@ -167,7 +169,7 @@
     "cargo_test_debug": "30 passed, 0 failed, including deep negative zoom round-trip, Fill depth transition, bounded Fill fallback, bookmark rename/delete, Space-pan and Z-zoom input conditions, spatial sparse segment indexing, and tile cache revision tests.",
     "cargo_test_release": "Not run in the latest session; debug all-target tests passed.",
     "release_build": "Passed for endless-sketch.exe and stress.exe.",
-    "gui_smoke": "wgpu Windows GUI launched with manual-depth-check.esketch after GPU texture retention fix for wgpu Out of Memory. User confirmed depth 0 -> -15, return navigation, and wheel zoom work without closing. Separate known issue: intermittent thin vertical seams at depth 25 around zoom 1.x.",
+    "gui_smoke": "wgpu Windows GUI launched with manual-depth-check.esketch after GPU texture retention fix for wgpu Out of Memory. User confirmed depth 0 -> -15, return navigation, and wheel zoom work without closing. Rust release branch includes ready-to-run exe. Separate known issue: intermittent thin vertical seams at depth 25 around zoom 1.x.",
     "million_stroke_stress": "Passed after spatial broad-operation fallback; latest measured run was about 320ms generation, 1.41s indexing, and 665ms for 49 queries."
   }
 }
