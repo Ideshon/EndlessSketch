@@ -1,0 +1,173 @@
+{
+  "project": {
+    "name": "EndlessSketch",
+    "status": "active",
+    "stack": [
+      "Rust 1.96",
+      "eframe/egui",
+      "wgpu",
+      "SQLite/WAL"
+    ],
+    "summary": "Windows deep-zoom drawing application with effectively unbounded hierarchical coordinates, durable vector operations, and rebuildable PNG LOD tiles."
+  },
+  "main_goals": [
+    {
+      "priority": 100,
+      "goal": "Maintain a data-safe, responsive drawing workflow across arbitrary practical distances and depth levels.",
+      "status": "active"
+    }
+  ],
+  "architecture": {
+    "style": "Rust desktop application with a GPU UI, normalized hierarchical camera, persistent operation log, spatial tile index, background raster cache, and verified recovery checkpoints.",
+    "layers": [
+      "eframe/egui interaction and wgpu presentation",
+      "BigInt hierarchical coordinates and depth-normalized camera",
+      "Brush, eraser, lasso fill, eyedropper, bookmarks, and persistent undo/redo",
+      "SQLite/WAL vector source data and rotating verified backups",
+      "Spatially filtered asynchronous 512px PNG tile cache"
+    ],
+    "important_paths": [
+      "Cargo.toml",
+      "src/app.rs",
+      "src/coords.rs",
+      "src/storage.rs",
+      "src/raster.rs",
+      "README.md"
+    ],
+    "notes": [
+      "Documents use a directory-based .esketch format; PNG tiles are rebuildable and never replace vector source operations.",
+      "Content revisions are monotonic and persisted in SQLite so a stale tile cannot become current after restart.",
+      "The current local branch is test and remains six commits behind origin/test; no pull, commit, or push was performed.",
+      "Existing untracked .idea, .ess, and .esp files are user-owned and must not be changed or committed without an explicit request."
+    ]
+  },
+  "development_plan": [
+    "Investigate thin vertical tile/edge lines visible around depth 25 at zoom 1.x; screenshots from 2026-06-26 show intermittent vertical seams that disappear at other zoom levels.",
+    "After hotkeys/navigation gestures, add a settings menu for performance/quality tuning, including stroke point density and other rendering/input optimization parameters.",
+    "After the performance/quality settings menu, design an optimized fast-zoom path that avoids expensive tile churn during rapid zoom gestures.",
+    "After the performance/quality settings menu, optimize and test very large depths and distances from origin, including depth ranges like -100..+100 and -1000..+1000 plus large lateral offsets.",
+    "After the settings menu, optionally add configurable hotkeys.",
+    "After the settings menu, optionally add Fill behavior for the eraser.",
+    "Perform visible manual drawing and long zoom sessions on representative Windows 10 and Windows 11 systems.",
+    "Profile background raster generation on integrated and discrete GPUs after real-world canvases are available.",
+    "Add release packaging and signing after interaction validation.",
+    "Keep README and this status aligned with behavior, commands, validation, and known limits."
+  ],
+  "backlog": [
+    "Investigate and fix intermittent thin vertical seams at high depth around depth 25 and zoom 1.x.",
+    "Add performance/quality settings after hotkeys: stroke point density for smoother lines versus performance, Fill fallback limits, tile render worker count, tile LOD/blur behavior, and cache-related tuning.",
+    "After performance settings: implement an optimized rapid-zoom mode, for example temporarily reusing/scaling existing tiles, delaying high-quality tile requests until zoom settles, or prioritizing coarse placeholders over full tile churn.",
+    "After performance settings: stress optimize extreme navigation across very large depth and distance ranges, such as -100..+100, -1000..+1000, and large side offsets from the origin.",
+    "Later polish: reduce angularity of very fast Brush/Eraser jerks, likely through configurable point density or curve smoothing.",
+    "Low priority after settings: configurable hotkeys.",
+    "Low priority after settings: eraser fill mode.",
+    "Optional named manual layers in addition to automatic depth levels.",
+    "Image import and asset placement.",
+    "GPU-native tile tessellation for faster cold cache generation.",
+    "Configurable shortcuts and Windows installer packaging."
+  ],
+  "rules": [
+    {
+      "priority": 10000,
+      "rule": "System, developer, and direct user instructions take precedence over this project-local status file."
+    },
+    {
+      "priority": 9500,
+      "rule": "Higher numeric priority means stronger project-local precedence."
+    },
+    {
+      "priority": 8500,
+      "rule": "Read this status file before starting project work and update request_analysis before behavior-changing code edits."
+    },
+    {
+      "priority": 8400,
+      "rule": "Keep each task deliberately short and bounded. Split larger work into smaller checkpoints so the user can test and redirect during implementation; avoid bundling multiple interaction changes in one uninterrupted pass."
+    },
+    {
+      "priority": 8000,
+      "rule": "Do not modify or commit user-owned untracked files unless the user explicitly places them in scope."
+    },
+    {
+      "priority": 7900,
+      "rule": "Vector operations and SQLite metadata are authoritative; caches must always be safe to delete and rebuild."
+    },
+    {
+      "priority": 7600,
+      "rule": "Run cargo fmt, Clippy with warnings denied, relevant tests, and a release build after behavior, interface, dependency, or persistence changes."
+    },
+    {
+      "priority": 7400,
+      "rule": "Keep documentation aligned when behavior, commands, setup, or user workflows change."
+    }
+  ],
+  "request_analysis": {
+    "updated_at_utc": "2026-06-26T05:01:17Z",
+    "request": "Z + mouse zoom works, but the app closed when navigating from depth 0 to -15 and back. Fix the crash and record future extreme-depth/distance optimization.",
+    "analysis": [
+      "Manual testing confirmed no visible flicker, line artifacts, fill deformation, or depth visibility defects from depth -15 through +15 after the latest tile/fill fixes.",
+      "Fill rendering now uses PNG tiles as the authoritative layer, a bounded scanline fallback for nearby depths, 4x4 raster coverage for softer tile edges, and parallel tile rendering with stale-generation skipping.",
+      "Saved Fill fallback is disabled when the camera is more than six depth levels away from the operation native depth or when the projected point count is too high, preventing whole-screen black fallback artifacts and crashes at deep zoom.",
+      "Brush/Eraser live fallback uses per-segment line rendering with endpoint circles, and new drawing input rejects excessive pointer jumps to avoid accidental long straight segments.",
+      "Fast Brush/Eraser pointer jumps now split the current draft into a new stroke instead of blocking point acceptance until the cursor returns near the previous point.",
+      "Bookmark management now uses a persistent Bookmarks window instead of a transient ComboBox, so text fields remain usable while editing.",
+      "Manual validation confirms bookmark management works normally.",
+      "Fast Brush/Eraser pointer jumps now interpolate intermediate points rather than splitting the draft stroke, so quick jerks should remain visually continuous without a single huge segment.",
+      "Manual validation confirms fast Brush/Eraser jerk handling works normally. Remaining low-priority visual issue: very fast strokes can look angular.",
+      "Space + left mouse drag panning is implemented and manually confirmed working. Drawing is suppressed while this gesture is active. Z + mouse zoom remains the next separate checkpoint.",
+      "Z + left mouse drag zoom is implemented and manually confirmed working.",
+      "New crash regression: after zooming from depth 0 down to about -15 and returning toward 0, the application closed around the middle of the return path.",
+      "Backtrace captured the deep navigation close as a fatal wgpu Out of Memory during texture creation in egui_wgpu.",
+      "Cause: GPU tile textures were retained for all visited visible sets at the current content revision, not just the current visible tile set. Rapid zoom/depth navigation could exhaust GPU memory.",
+      "Tile rendering requests now use a bounded non-blocking queue, so stale generations cannot grow memory without limit. The UI retries missing tiles on later frames instead of blocking.",
+      "Additional crash mitigation: Z-drag zoom factor is clamped to 0.5..2.0 per frame so one fast mouse delta cannot skip many depth levels at once.",
+      "GPU texture retention now keeps only textures from the current visible tile set and current revision, releasing textures from previous depths/positions.",
+      "Manual validation confirms the wgpu Out of Memory crash is fixed for fast depth 0 -> -15 navigation, return navigation, and wheel zoom.",
+      "Future optimization request: after performance settings, add a dedicated fast-zoom path to reduce tile churn during rapid zoom gestures.",
+      "Future planning: after performance/quality settings, add optimization and test passes for very large depths and lateral distances from origin, including -100..+100 and -1000..+1000 style ranges.",
+      "Future low-priority items after the settings menu: configurable hotkeys and eraser fill mode.",
+      "New known rendering defect: at depth 25 and zoom around 1.x, intermittent thin vertical seams appear between large filled/tiled regions; changing zoom usually hides them.",
+      "Workflow update: future implementation should be split into smaller checkpoints and stop after each meaningful interaction change for user feedback."
+    ],
+    "planned_scope": [
+      "Next checkpoint: choose between investigating depth-25 vertical seams or starting the performance/quality settings menu.",
+      "After validation, choose between investigating depth-25 vertical seams or starting the performance/quality settings menu.",
+      "Do not bundle brush smoothing/fill changes/navigation changes together unless explicitly requested."
+    ],
+    "validation_plan": [
+      "Run cargo fmt --all -- --check, cargo test --all-targets, cargo clippy --all-targets -- -D warnings, and cargo build --release after behavior changes.",
+      "Launch target/release/endless-sketch.exe with manual-depth-check.esketch for manual UI validation.",
+      "Preserve all user-owned untracked files and do not revert unrelated dirty worktree changes."
+    ],
+    "execution_result": "Captured backtrace showing wgpu Out of Memory in texture creation. Implemented visible-set retention for GPU tile textures so old depth/position textures are released. Validation passed: cargo fmt --all -- --check, cargo test --all-targets (30 tests), cargo clippy --all-targets -- -D warnings, and cargo build --release. User manually confirmed fast 0 -> -15, return navigation, and wheel zoom no longer crash."
+  },
+  "recommended_next_action": {
+    "type": "short_input_feature",
+    "target": "src/app.rs navigation input",
+    "intent": "Add canvas panning with Space + left mouse drag, making sure it suppresses drawing while active."
+  },
+  "latest_check": {
+    "checked_at_utc": "2026-06-26T04:47:53Z",
+    "branch": "test",
+    "tracking": "origin/test",
+    "ahead": 0,
+    "behind": 6,
+    "rust_toolchain": "rustc 1.96.0 stable x86_64-pc-windows-msvc",
+    "release_executable": "target/release/endless-sketch.exe",
+    "release_executable_bytes": null,
+    "million_stroke_generation_ms": 320,
+    "million_stroke_index_ms": 1410,
+    "million_stroke_49_queries_ms": 665,
+    "github_repository": "Ideshon/EndlessSketch",
+    "github_default_branch": "master",
+    "local_https_push_ready": true
+  },
+  "test_file_statuses": {
+    "cargo_fmt": "Passed.",
+    "cargo_clippy_all_targets_deny_warnings": "Passed.",
+    "cargo_test_debug": "30 passed, 0 failed, including deep negative zoom round-trip, Fill depth transition, bounded Fill fallback, bookmark rename/delete, Space-pan and Z-zoom input conditions, spatial sparse segment indexing, and tile cache revision tests.",
+    "cargo_test_release": "Not run in the latest session; debug all-target tests passed.",
+    "release_build": "Passed for endless-sketch.exe and stress.exe.",
+    "gui_smoke": "wgpu Windows GUI launched with manual-depth-check.esketch after GPU texture retention fix for wgpu Out of Memory. User confirmed depth 0 -> -15, return navigation, and wheel zoom work without closing. Separate known issue: intermittent thin vertical seams at depth 25 around zoom 1.x.",
+    "million_stroke_stress": "Passed after spatial broad-operation fallback; latest measured run was about 320ms generation, 1.41s indexing, and 665ms for 49 queries."
+  }
+}
