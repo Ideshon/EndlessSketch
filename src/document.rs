@@ -40,12 +40,24 @@ impl CanvasDocument {
         self.revision
     }
 
+    pub fn max_sequence(&self) -> i64 {
+        self.operations
+            .iter()
+            .map(|operation| operation.sequence)
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn operations_for_tile(&self, key: &TileKey) -> Vec<EditOperation> {
         self.index
             .query(key)
             .into_iter()
             .filter_map(|index| self.operations.get(index).cloned())
             .collect()
+    }
+
+    pub fn operation_indices_for_tiles(&self, keys: &[TileKey]) -> Vec<usize> {
+        self.index.query_many(keys)
     }
 
     pub fn save_draft(&self, operation: &EditOperation) -> Result<()> {

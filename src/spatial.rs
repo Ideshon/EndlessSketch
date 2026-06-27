@@ -57,12 +57,18 @@ impl OperationIndex {
     }
 
     pub fn query(&self, tile: &TileKey) -> Vec<usize> {
+        self.query_many(std::slice::from_ref(tile))
+    }
+
+    pub fn query_many(&self, tiles: &[TileKey]) -> Vec<usize> {
         let mut matches: HashSet<_> = self.broad_operations.iter().copied().collect();
-        for (&source_depth, bucket) in &self.depths {
-            if source_depth <= tile.depth {
-                query_coarse_or_equal_depth(tile, source_depth, bucket, &mut matches);
-            } else {
-                query_finer_depth(tile, source_depth, bucket, &mut matches);
+        for tile in tiles {
+            for (&source_depth, bucket) in &self.depths {
+                if source_depth <= tile.depth {
+                    query_coarse_or_equal_depth(tile, source_depth, bucket, &mut matches);
+                } else {
+                    query_finer_depth(tile, source_depth, bucket, &mut matches);
+                }
             }
         }
         let mut matches: Vec<_> = matches.into_iter().collect();
@@ -255,6 +261,32 @@ mod tests {
             lod: 0,
         };
         assert_eq!(index.query(&key), vec![0]);
+    }
+
+    #[test]
+    fn multi_tile_query_deduplicates_and_excludes_distant_operations() {
+        let operations = vec![
+            operation(0, 0, 0),
+            operation(0, 1, 0),
+            operation(0, 10_000, 10_000),
+        ];
+        let index = OperationIndex::build(&operations);
+        let visible = vec![
+            TileKey {
+                depth: 0,
+                x: 0.into(),
+                y: 0.into(),
+                lod: 0,
+            },
+            TileKey {
+                depth: 0,
+                x: 1.into(),
+                y: 0.into(),
+                lod: 0,
+            },
+        ];
+
+        assert_eq!(index.query_many(&visible), vec![0, 1]);
     }
 
     #[test]

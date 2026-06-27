@@ -1,8 +1,12 @@
 pub mod app;
 pub mod coords;
 pub mod document;
+pub mod local_paths;
 pub mod model;
+pub mod projection_cache;
 pub mod raster;
+pub mod settings;
+pub mod smoothing;
 pub mod spatial;
 pub mod storage;
 pub mod tile_cache;

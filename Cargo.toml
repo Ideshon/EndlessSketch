@@ -9,7 +9,6 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0.102"
 crossbeam-channel = "0.5.15"
-directories = "6.0.0"
 eframe = { version = "0.34.3", features = ["persistence", "wgpu"] }
 egui = "0.34.3"
 env_logger = "0.11.10"
@@ -35,4 +34,3 @@ tempfile = "3.27.0"
 lto = "thin"
 codegen-units = 1
 strip = true
-

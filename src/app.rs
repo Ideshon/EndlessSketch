@@ -1,41 +1,91 @@
 use crate::coords::{CameraAddress, CanvasPoint};
 use crate::document::CanvasDocument;
+use crate::local_paths::{default_canvas_path, settings_path};
 use crate::model::{Bookmark, Color, EditKind, EditOperation, ToolKind};
+use crate::projection_cache::{ProjectedGeometryCache, VisibleOperationCache};
 use crate::raster::operation_width;
-use crate::tile_cache::{MAX_TILE_LOD, TILE_BLEED, TILE_SIZE, TileCache, TileKey, lod_scale};
-use crate::tile_scheduler::{TileJob, TileScheduler};
+use crate::settings::{
+    AppSettings, MAX_POINT_SPACING_PX, MIN_POINT_SPACING_PX, PerformanceProfile,
+};
+use crate::tile_cache::{
+    TILE_BLEED, TILE_RESOLUTIONS, TILE_SIZE, TileCache, TileKey, tile_lod_for_resolution,
+    tile_resolution,
+};
+use crate::tile_scheduler::{IncrementalTileUpdate, TileJob, TileScheduler};
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, Painter, PointerButton, Pos2, Rect, Sense, Stroke};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const BACKGROUND: Color = Color::WHITE;
-const DRAFT_SAVE_INTERVAL: Duration = Duration::from_millis(100);
-const BRUSH_POINT_SPACING_PX: f32 = 0.75;
-const FILL_POINT_SPACING_PX: f32 = 1.0;
-const MAX_DRAW_SEGMENT_PX: f32 = 96.0;
+const DRAFT_SAVE_INTERVAL: Duration = Duration::from_millis(500);
+const ACTIVE_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
+const TILE_POLL_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
+const MIN_BRUSH_INPUT_SPACING_PX: f32 = 0.75;
+const MIN_FILL_INPUT_SPACING_PX: f32 = 1.0;
 const ZOOM_DRAG_SENSITIVITY: f64 = 0.01;
 const MIN_ZOOM_DRAG_FACTOR: f64 = 0.5;
 const MAX_ZOOM_DRAG_FACTOR: f64 = 2.0;
-const MAX_FILL_FALLBACK_DEPTH_DELTA: i64 = 6;
-const MAX_FILL_FALLBACK_POINTS: usize = 4096;
-
-fn tile_lod_for_zoom(zoom: f64) -> Option<u8> {
-    if !zoom.is_finite() || zoom <= 0.0 {
-        return None;
-    }
-    let lod = zoom.log2().floor().max(0.0) as u8;
-    Some(lod.min(MAX_TILE_LOD))
-}
+const MIN_BRUSH_SIZE: f32 = 1.0;
+const MAX_BRUSH_SIZE: f32 = 100.0;
+const BRUSH_SIZE_DRAG_SCALE: f32 = 0.25;
+const FRAME_TIME_EMA_ALPHA: f32 = 0.15;
+const MAX_MEASURED_FRAME_TIME: f32 = 0.25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PointAppendDecision {
     Append,
     Skip,
     Interpolate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TileFallbackMode {
+    Current,
+    OverlayAfter(i64),
+    Full,
+}
+
+struct LoadedTileTexture {
+    revision: u64,
+    snapshot_sequence: i64,
+    texture: egui::TextureHandle,
+}
+
+#[derive(Default)]
+struct FrameRateTracker {
+    average_frame_time: Option<f32>,
+    interaction_active_last_frame: bool,
+}
+
+impl FrameRateTracker {
+    fn update(&mut self, frame_time: f32, interaction_active: bool) {
+        if !interaction_active {
+            self.interaction_active_last_frame = false;
+            return;
+        }
+        if !frame_time.is_finite()
+            || frame_time <= f32::EPSILON
+            || frame_time > MAX_MEASURED_FRAME_TIME
+        {
+            return;
+        }
+
+        if !self.interaction_active_last_frame || self.average_frame_time.is_none() {
+            self.average_frame_time = Some(frame_time);
+        } else if let Some(average) = self.average_frame_time.as_mut() {
+            *average += (frame_time - *average) * FRAME_TIME_EMA_ALPHA;
+        }
+        self.interaction_active_last_frame = true;
+    }
+
+    fn metrics(&self) -> Option<(f32, f32)> {
+        self.average_frame_time
+            .map(|frame_time| (1.0 / frame_time, frame_time * 1_000.0))
+    }
 }
 
 pub struct EndlessSketchApp {
@@ -49,21 +99,40 @@ pub struct EndlessSketchApp {
     last_pointer_position: Option<Pos2>,
     status_message: String,
     tile_scheduler: TileScheduler,
-    tile_textures: HashMap<(TileKey, u64), egui::TextureHandle>,
+    tile_textures: HashMap<TileKey, LoadedTileTexture>,
     pending_tiles: HashSet<(TileKey, u64)>,
     visible_tile_generation: u64,
     visible_tile_set: HashSet<TileKey>,
+    last_zoom_change: Option<Instant>,
+    settings: AppSettings,
+    settings_path: PathBuf,
     bookmarks: Vec<Bookmark>,
     bookmark_edits: HashMap<Uuid, String>,
     show_bookmarks: bool,
+    show_settings: bool,
+    brush_sizing_drag_active: bool,
+    frame_rate: FrameRateTracker,
+    projected_geometry: ProjectedGeometryCache,
+    visible_operations: VisibleOperationCache,
+    automatic_tile_generation_pause: bool,
 }
 
 impl EndlessSketchApp {
     pub fn new(_context: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Result<Self> {
         let path = path.unwrap_or_else(default_canvas_path);
+        let settings_path = settings_path();
+        let mut status_message = "Ready".to_owned();
+        let settings = match AppSettings::load_or_create(&settings_path) {
+            Ok(settings) => settings,
+            Err(error) => {
+                status_message = format!("Settings failed: {error:#}");
+                AppSettings::default()
+            }
+        };
         let document = CanvasDocument::open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
-        let tile_scheduler = TileScheduler::new(TileCache::new(document.root())?);
+        let tile_scheduler =
+            TileScheduler::new(TileCache::new(document.root())?, settings.tile_worker_count);
         let bookmarks = document.bookmarks()?;
         let bookmark_edits = bookmark_edit_names(&bookmarks);
         Ok(Self {
@@ -75,15 +144,24 @@ impl EndlessSketchApp {
             draft: None,
             last_draft_save: Instant::now(),
             last_pointer_position: None,
-            status_message: "Ready".to_owned(),
+            status_message,
             tile_scheduler,
             tile_textures: HashMap::new(),
             pending_tiles: HashSet::new(),
             visible_tile_generation: 0,
             visible_tile_set: HashSet::new(),
+            last_zoom_change: None,
+            settings,
+            settings_path,
             bookmarks,
             bookmark_edits,
             show_bookmarks: false,
+            show_settings: false,
+            brush_sizing_drag_active: false,
+            frame_rate: FrameRateTracker::default(),
+            projected_geometry: ProjectedGeometryCache::default(),
+            visible_operations: VisibleOperationCache::default(),
+            automatic_tile_generation_pause: false,
         })
     }
 
@@ -94,15 +172,13 @@ impl EndlessSketchApp {
             ui.selectable_value(&mut self.tool, ToolKind::LassoFill, "Fill (L)");
             ui.selectable_value(&mut self.tool, ToolKind::Eyedropper, "Picker (I)");
             ui.separator();
-            ui.add(egui::Slider::new(&mut self.brush_size, 1.0..=100.0).text("Size"));
-            let mut color = Color32::from_rgba_unmultiplied(
-                self.color.r,
-                self.color.g,
-                self.color.b,
-                self.color.a,
+            ui.add(
+                egui::Slider::new(&mut self.brush_size, MIN_BRUSH_SIZE..=MAX_BRUSH_SIZE)
+                    .text("Size"),
             );
-            if ui.color_edit_button_srgba(&mut color).changed() {
-                self.color = Color::rgba(color.r(), color.g(), color.b(), color.a());
+            let mut color = [self.color.r, self.color.g, self.color.b];
+            if ui.color_edit_button_srgb(&mut color).changed() {
+                self.color = color_from_srgb(color);
             }
             ui.separator();
             if ui.button("Undo").clicked() {
@@ -132,7 +208,159 @@ impl EndlessSketchApp {
             if ui.button("Bookmarks").clicked() {
                 self.show_bookmarks = true;
             }
+            if ui.button("Settings").clicked() {
+                self.show_settings = true;
+            }
         });
+    }
+
+    fn settings_window(&mut self, context: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+
+        let mut open = self.show_settings;
+        let mut changed = false;
+        let mut reset_requested = false;
+        let previous_tile_worker_count = self.settings.tile_worker_count;
+        let previous_tile_resolution = self.settings.tile_resolution_px;
+        let previous_pause_tile_generation = self.settings.pause_tile_generation;
+        let previous_pause_while_drawing = self.settings.pause_tile_generation_while_drawing;
+
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .default_width(360.0)
+            .resizable(false)
+            .collapsible(false)
+            .show(context, |ui| {
+                let mut active_profile = self.settings.performance_profile();
+                ui.horizontal(|ui| {
+                    ui.label("Profile");
+                    for profile in PerformanceProfile::PRESETS {
+                        if ui
+                            .selectable_label(active_profile == profile, profile.label())
+                            .clicked()
+                        {
+                            self.settings.apply_performance_profile(profile);
+                            active_profile = profile;
+                            changed = true;
+                        }
+                    }
+                    let _ = ui.selectable_label(
+                        active_profile == PerformanceProfile::Custom,
+                        PerformanceProfile::Custom.label(),
+                    );
+                });
+                ui.separator();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.brush_point_spacing_px,
+                            MIN_POINT_SPACING_PX..=MAX_POINT_SPACING_PX,
+                        )
+                        .logarithmic(true)
+                        .text("Brush spacing px"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.fill_point_spacing_px,
+                            MIN_POINT_SPACING_PX..=MAX_POINT_SPACING_PX,
+                        )
+                        .logarithmic(true)
+                        .text("Fill spacing px"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.fill_fallback_max_points,
+                            128..=65_536,
+                        )
+                        .text("Fill fallback points"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.fill_fallback_max_depth_delta, 0..=32)
+                            .text("Fill fallback depth"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.fast_zoom_tile_settle_ms, 0..=1_000)
+                            .text("Zoom settle ms"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.tile_worker_count, 1..=4)
+                            .text("Tile workers"),
+                    )
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label("Tile resolution");
+                    egui::ComboBox::from_id_salt("tile_resolution")
+                        .selected_text(format!("{} px", self.settings.tile_resolution_px))
+                        .show_ui(ui, |ui| {
+                            for resolution in TILE_RESOLUTIONS {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.settings.tile_resolution_px,
+                                        resolution,
+                                        format!("{resolution} px"),
+                                    )
+                                    .changed();
+                            }
+                        });
+                });
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.pause_tile_generation,
+                        "Pause tile generation",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.pause_tile_generation_while_drawing,
+                        "Pause tile generation while drawing",
+                    )
+                    .changed();
+                ui.separator();
+                if ui.button("Reset").clicked() {
+                    reset_requested = true;
+                }
+            });
+
+        self.show_settings = open;
+        if reset_requested {
+            self.settings = AppSettings::default();
+            changed = true;
+        }
+        if changed {
+            self.settings.normalize();
+            let tile_worker_count_changed =
+                self.settings.tile_worker_count != previous_tile_worker_count;
+            let tile_resolution_changed =
+                self.settings.tile_resolution_px != previous_tile_resolution;
+            let pause_tile_generation_changed =
+                self.settings.pause_tile_generation != previous_pause_tile_generation;
+            let pause_while_drawing_changed =
+                self.settings.pause_tile_generation_while_drawing != previous_pause_while_drawing;
+            if tile_worker_count_changed {
+                self.recreate_tile_scheduler();
+            } else if tile_resolution_changed {
+                self.invalidate_tile_rendering();
+            }
+            if pause_tile_generation_changed {
+                self.apply_tile_generation_pause();
+            }
+            if pause_while_drawing_changed {
+                self.apply_pause_while_drawing_setting();
+            }
+            self.save_settings();
+        }
     }
 
     fn bookmark_window(&mut self, context: &egui::Context) {
@@ -208,13 +436,21 @@ impl EndlessSketchApp {
     fn canvas(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         painter.rect_filled(response.rect, 0.0, to_color32(BACKGROUND));
+        let frame_time = ui.input(|input| input.unstable_dt);
 
         self.handle_shortcuts(context);
         self.handle_navigation(ui, &response);
         self.handle_drawing(ui, &response);
-        let tiles_ready = self.paint_cached_tiles(context, &painter, response.rect);
-        if !tiles_ready {
-            self.paint_operations(&painter, response.rect);
+        let interaction_active = self.draft.is_some()
+            || self.zoom_tile_requests_deferred()
+            || ui.input(|input| input.pointer.any_down());
+        self.frame_rate.update(frame_time, interaction_active);
+        match self.paint_cached_tiles(context, &painter, response.rect) {
+            TileFallbackMode::Current => {}
+            TileFallbackMode::OverlayAfter(sequence) => {
+                self.paint_operations_after(&painter, response.rect, sequence);
+            }
+            TileFallbackMode::Full => self.paint_operations(&painter, response.rect),
         }
         self.paint_draft(&painter, response.rect);
         self.paint_overlay(&painter, response.rect);
@@ -266,6 +502,7 @@ impl EndlessSketchApp {
                     response.rect.width() as f64,
                     response.rect.height() as f64,
                 );
+                self.mark_zoom_changed();
             }
         }
 
@@ -290,6 +527,7 @@ impl EndlessSketchApp {
                     response.rect.width() as f64,
                     response.rect.height() as f64,
                 );
+                self.mark_zoom_changed();
             }
             return;
         }
@@ -312,13 +550,38 @@ impl EndlessSketchApp {
         let primary_pressed = pointer.button_pressed(PointerButton::Primary);
         let primary_down = pointer.button_down(PointerButton::Primary);
         let primary_released = pointer.button_released(PointerButton::Primary);
+        let events = ui.input(|input| input.events.clone());
+        let (event_press_position, mut drag_positions) =
+            primary_pointer_positions(&events, primary_down);
+        let shift_down = ui.input(|input| input.modifiers.shift);
+        let ctrl_down = ui.input(|input| input.modifiers.ctrl);
 
-        if primary_pressed && response.hovered() {
-            if self.tool == ToolKind::Eyedropper {
-                self.pick_color_at(position, response.rect);
+        if primary_pressed && ctrl_down && response.hovered() {
+            self.brush_sizing_drag_active = true;
+        }
+        if self.brush_sizing_drag_active {
+            if primary_down {
+                let delta = pointer.delta();
+                if delta.y.abs() > f32::EPSILON {
+                    self.adjust_brush_size(-delta.y * BRUSH_SIZE_DRAG_SCALE);
+                }
+                self.last_pointer_position = position;
                 return;
             }
-            if let Some(position) = position {
+            if primary_released || !primary_down {
+                self.brush_sizing_drag_active = false;
+                self.last_pointer_position = position;
+                return;
+            }
+        }
+
+        if primary_pressed && response.hovered() {
+            let press_position = event_press_position.or(position);
+            if self.tool == ToolKind::Eyedropper {
+                self.pick_color_at(press_position, response.rect);
+                return;
+            }
+            if let Some(position) = press_position {
                 let point = self.position_to_canvas(position, response.rect);
                 let kind = match self.tool {
                     ToolKind::Brush => EditKind::Paint,
@@ -340,53 +603,29 @@ impl EndlessSketchApp {
                     self.brush_size,
                 ));
                 self.last_draft_save = Instant::now();
+                self.begin_drawing_tile_pause();
             }
         }
 
         if primary_down
-            && response.hovered()
-            && let (Some(position), Some(draft)) = (position, self.draft.as_ref())
+            && let Some(position) = position
+            && drag_positions.last().is_none_or(|last| *last != position)
         {
-            let point = screen_to_canvas_for_camera(&self.camera, position, response.rect);
-            let append_decision = draft
-                .points
-                .last()
-                .map_or(PointAppendDecision::Append, |last| {
-                    self.camera
-                        .canvas_to_screen(
-                            last,
-                            response.rect.width() as f64,
-                            response.rect.height() as f64,
-                        )
-                        .map_or(PointAppendDecision::Append, |(x, y)| {
-                            let previous = Pos2::new(
-                                response.rect.left() + x as f32,
-                                response.rect.top() + y as f32,
-                            );
-                            point_append_decision(draft.kind, previous.distance(position))
-                        })
-                });
-            match append_decision {
-                PointAppendDecision::Append => {
-                    if let Some(draft) = self.draft.as_mut() {
-                        draft.points.push(point);
-                    }
-                }
-                PointAppendDecision::Skip => {}
-                PointAppendDecision::Interpolate => {
-                    if let Some(draft) = self.draft.as_mut() {
-                        append_interpolated_points(draft, &self.camera, position, response.rect);
-                    }
-                }
+            drag_positions.push(position);
+        }
+        for drag_position in drag_positions {
+            if response.rect.contains(drag_position) && self.draft.is_some() {
+                self.extend_draft_to(drag_position, response.rect, shift_down);
             }
-            if self.last_draft_save.elapsed() >= DRAFT_SAVE_INTERVAL {
-                if let Some(draft) = &self.draft
-                    && let Err(error) = self.document.save_draft(draft)
-                {
-                    self.status_message = format!("Autosave failed: {error:#}");
-                }
-                self.last_draft_save = Instant::now();
+        }
+
+        if self.draft.is_some() && self.last_draft_save.elapsed() >= DRAFT_SAVE_INTERVAL {
+            if let Some(draft) = &self.draft
+                && let Err(error) = self.document.save_draft(draft)
+            {
+                self.status_message = format!("Autosave failed: {error:#}");
             }
+            self.last_draft_save = Instant::now();
         }
 
         if primary_released {
@@ -395,27 +634,121 @@ impl EndlessSketchApp {
         self.last_pointer_position = position;
     }
 
-    fn finish_draft(&mut self) {
-        let Some(mut draft) = self.draft.take() else {
+    fn extend_draft_to(&mut self, position: Pos2, rect: Rect, shift_down: bool) {
+        let Some(draft) = self.draft.as_ref() else {
             return;
         };
-        if draft.kind == EditKind::Fill && draft.points.len() >= 3 {
-            draft.points.push(draft.points[0].clone());
-        }
-        if draft.points.len() < 2 {
-            let _ = self.document.discard_draft(&draft);
+        let point = screen_to_canvas_for_camera(&self.camera, position, rect);
+        let append_decision = draft
+            .points
+            .last()
+            .map_or(PointAppendDecision::Append, |last| {
+                self.camera
+                    .canvas_to_screen(last, rect.width() as f64, rect.height() as f64)
+                    .map_or(PointAppendDecision::Append, |(x, y)| {
+                        let previous = Pos2::new(rect.left() + x as f32, rect.top() + y as f32);
+                        point_append_decision(
+                            draft.kind,
+                            previous.distance(position),
+                            &self.settings,
+                        )
+                    })
+            });
+        if straight_line_requested(draft.kind, shift_down) {
+            if should_update_straight_endpoint(draft, &self.camera, position, rect, &self.settings)
+                && let Some(draft) = self.draft.as_mut()
+            {
+                set_straight_draft_endpoint(draft, point);
+            }
             return;
         }
-        match self.document.commit(draft) {
-            Ok(()) => self.status_message = "Saved".to_owned(),
-            Err(error) => self.status_message = format!("Save failed: {error:#}"),
+
+        match append_decision {
+            PointAppendDecision::Append => {
+                if let Some(draft) = self.draft.as_mut() {
+                    append_draft_point(draft, point, &self.settings);
+                }
+            }
+            PointAppendDecision::Skip => {}
+            PointAppendDecision::Interpolate => {
+                if let Some(draft) = self.draft.as_mut() {
+                    append_interpolated_points(draft, &self.camera, position, rect, &self.settings);
+                }
+            }
         }
     }
 
-    fn paint_operations(&self, painter: &Painter, rect: Rect) {
-        for operation in self.document.operations() {
-            self.paint_operation(painter, rect, operation, false);
+    fn finish_draft(&mut self) {
+        let Some(mut draft) = self.draft.take() else {
+            self.end_drawing_tile_pause();
+            return;
+        };
+        prepare_draft_for_commit(&mut draft);
+        if draft.points.len() < 2 {
+            let _ = self.document.discard_draft(&draft);
+            self.end_drawing_tile_pause();
+            return;
         }
+        match self.document.commit(draft) {
+            Ok(()) => {
+                self.begin_new_document_revision();
+                self.status_message = "Saved".to_owned();
+            }
+            Err(error) => self.status_message = format!("Save failed: {error:#}"),
+        }
+        self.end_drawing_tile_pause();
+    }
+
+    fn paint_operations(&mut self, painter: &Painter, rect: Rect) {
+        for (index, points) in self.projected_operations(rect, None) {
+            if let Some(operation) = self.document.operations().get(index) {
+                self.paint_operation_points(painter, rect, operation, false, points);
+            }
+        }
+    }
+
+    fn paint_operations_after(&mut self, painter: &Painter, rect: Rect, sequence: i64) {
+        for (index, points) in self.projected_operations(rect, Some(sequence)) {
+            if let Some(operation) = self.document.operations().get(index) {
+                self.paint_operation_points(painter, rect, operation, false, points);
+            }
+        }
+    }
+
+    fn projected_operations(
+        &mut self,
+        rect: Rect,
+        after_sequence: Option<i64>,
+    ) -> Vec<(usize, Vec<Pos2>)> {
+        let indices = self.visible_operation_indices(rect);
+        let Some(frame) = self.projected_geometry.begin_frame(&self.camera, rect) else {
+            return Vec::new();
+        };
+        let operations = self.document.operations();
+        let mut projected = Vec::with_capacity(indices.len());
+        for index in indices {
+            let Some(operation) = operations.get(index) else {
+                continue;
+            };
+            if after_sequence.is_some_and(|sequence| operation.sequence <= sequence) {
+                continue;
+            }
+            let points = self.projected_geometry.project_operation(operation, frame);
+            projected.push((index, points));
+        }
+        projected
+    }
+
+    fn visible_operation_indices(&mut self, rect: Rect) -> Vec<usize> {
+        let lod = tile_lod_for_resolution(self.settings.tile_resolution_px);
+        let visible_tiles = self.visible_tiles(rect, lod);
+        let revision = self.document.revision();
+        let document = &self.document;
+        self.visible_operations
+            .get_or_update(revision, &visible_tiles, || {
+                document.operation_indices_for_tiles(&visible_tiles)
+            })
+            .to_vec()
     }
 
     fn paint_draft(&self, painter: &Painter, rect: Rect) {
@@ -436,35 +769,59 @@ impl EndlessSketchApp {
             .iter()
             .filter_map(|point| self.point_to_position(point, rect))
             .collect();
+        self.paint_operation_points(painter, rect, operation, is_draft, points);
+    }
+
+    fn paint_operation_points(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        operation: &EditOperation,
+        is_draft: bool,
+        points: Vec<Pos2>,
+    ) {
         if points.len() < 2 {
             return;
         }
 
         let width = operation_width(operation, self.camera.depth, self.camera.zoom);
-        let color = to_color32(operation.visible_color(BACKGROUND));
+        let color = to_color32(operation.opaque_visible_color(BACKGROUND));
         if operation.kind == EditKind::Fill {
             if is_draft {
                 painter.add(egui::Shape::line(points, Stroke::new(1.5, color)));
-            } else if should_paint_fill_fallback(operation, self.camera.depth, points.len()) {
+            } else if should_paint_fill_fallback(
+                operation,
+                self.camera.depth,
+                points.len(),
+                &self.settings,
+            ) {
                 paint_fill_scanlines(painter, rect, &points, color);
             }
         } else {
-            for &point in &points {
-                painter.circle_filled(point, width * 0.5, color);
-            }
-            for segment in points.windows(2) {
-                painter.line_segment([segment[0], segment[1]], Stroke::new(width, color));
-            }
+            paint_stroke_fallback(painter, points, width, color);
         }
     }
 
     fn paint_overlay(&self, painter: &Painter, rect: Rect) {
+        let tile_state = if self.settings.pause_tile_generation {
+            "   tiles paused"
+        } else if self.automatic_tile_generation_pause {
+            "   tiles paused: drawing"
+        } else {
+            ""
+        };
+        let performance = self.frame_rate.metrics().map_or_else(
+            || "fps --".to_owned(),
+            |(fps, frame_time)| format!("fps {fps:.1} ({frame_time:.1} ms)"),
+        );
         let text = format!(
-            "depth {}   zoom {:.3}×   {} ops   {}",
+            "depth {}   zoom {:.3}×   {} ops   {}   {}{}",
             self.camera.depth,
             self.camera.zoom,
             self.document.operations().len(),
-            self.status_message
+            performance,
+            self.status_message,
+            tile_state
         );
         painter.text(
             rect.left_top() + egui::vec2(12.0, 12.0),
@@ -480,22 +837,21 @@ impl EndlessSketchApp {
         context: &egui::Context,
         painter: &Painter,
         rect: Rect,
-    ) -> bool {
+    ) -> TileFallbackMode {
         self.collect_tile_results(context);
         let revision = self.document.revision();
-        self.tile_textures
-            .retain(|(_, cached_revision), _| *cached_revision == revision);
         self.pending_tiles
             .retain(|(_, cached_revision)| *cached_revision == revision);
 
-        let Some(lod) = tile_lod_for_zoom(self.camera.zoom) else {
-            return false;
-        };
+        if self.zoom_tile_requests_deferred() {
+            return TileFallbackMode::Full;
+        }
+
+        let lod = tile_lod_for_resolution(self.settings.tile_resolution_px);
         let visible = self.visible_tiles(rect, lod);
         let visible_set: HashSet<_> = visible.iter().cloned().collect();
-        self.tile_textures.retain(|(key, cached_revision), _| {
-            *cached_revision == revision && visible_set.contains(key)
-        });
+        self.tile_textures
+            .retain(|key, _| visible_set.contains(key));
         if visible_set != self.visible_tile_set {
             self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
             self.visible_tile_set = visible_set;
@@ -506,24 +862,44 @@ impl EndlessSketchApp {
             });
         }
 
-        let missing: Vec<TileKey> = visible
-            .iter()
-            .filter(|key| {
-                !self.tile_textures.contains_key(&((*key).clone(), revision))
-                    && !self.pending_tiles.contains(&((*key).clone(), revision))
-            })
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
+        if !tile_generation_is_paused(
+            self.settings.pause_tile_generation,
+            self.automatic_tile_generation_pause,
+        ) {
+            let missing: Vec<TileKey> = visible
+                .iter()
+                .filter(|key| {
+                    self.tile_textures
+                        .get(*key)
+                        .is_none_or(|loaded| loaded.revision != revision)
+                        && !self.pending_tiles.contains(&((*key).clone(), revision))
+                })
+                .cloned()
+                .collect();
+            let snapshot_sequence = self.document.max_sequence();
             for key in missing {
-                let operations = Arc::new(self.document.operations_for_tile(&key));
+                let operations = self.document.operations_for_tile(&key);
+                let incremental_update = self.tile_textures.get(&key).and_then(|loaded| {
+                    (loaded.revision < revision)
+                        .then(|| {
+                            incremental_paint_operations(loaded.snapshot_sequence, &operations)
+                        })
+                        .flatten()
+                        .map(|incremental_operations| IncrementalTileUpdate {
+                            base_revision: loaded.revision,
+                            operations: Arc::new(incremental_operations),
+                        })
+                });
+                let operations = Arc::new(operations);
                 if self
                     .tile_scheduler
                     .request(TileJob {
                         key: key.clone(),
                         revision,
+                        snapshot_sequence,
                         generation: self.visible_tile_generation,
                         operations: Arc::clone(&operations),
+                        incremental_update,
                         background: BACKGROUND,
                     })
                     .is_ok()
@@ -533,36 +909,32 @@ impl EndlessSketchApp {
             }
         }
 
-        let mut all_tiles_ready = true;
+        let mut snapshots = Vec::with_capacity(visible.len());
         for key in visible {
-            let Some(texture) = self.tile_textures.get(&(key.clone(), revision)) else {
-                all_tiles_ready = false;
+            let Some(loaded) = self.tile_textures.get(&key) else {
+                snapshots.push(None);
                 continue;
             };
+            snapshots.push(Some((loaded.revision, loaded.snapshot_sequence)));
             let top_left = CanvasPoint::new(key.depth, key.x, key.y, 0.0, 0.0);
             let Some(position) = self.point_to_position(&top_left, rect) else {
                 continue;
             };
-            let source_scale = lod_scale(key.lod) as f32;
-            let world_bleed = TILE_BLEED as f32 / source_scale;
-            let bleed = world_bleed * self.camera.zoom as f32;
-            let size = (TILE_SIZE as f32 + world_bleed * 2.0) * self.camera.zoom as f32;
-            let tile_rect =
-                Rect::from_min_size(position - egui::vec2(bleed, bleed), egui::vec2(size, size));
-            painter.image(
-                texture.id(),
-                tile_rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            let (tile_rect, source_rect) =
+                tile_display_rects(position, self.camera.zoom as f32, key.lod);
+            painter.image(loaded.texture.id(), tile_rect, source_rect, Color32::WHITE);
         }
-        all_tiles_ready
+        tile_fallback_mode(revision, snapshots)
     }
 
     fn texture_name(&self, key: &TileKey, revision: u64) -> String {
         format!(
-            "tile-d{}-l{}-x{}-y{}-r{}",
-            key.depth, key.lod, key.x, key.y, revision
+            "tile-d{}-p{}-x{}-y{}-r{}",
+            key.depth,
+            tile_resolution(key.lod),
+            key.x,
+            key.y,
+            revision
         )
     }
 
@@ -583,8 +955,20 @@ impl EndlessSketchApp {
                         color_image,
                         egui::TextureOptions::LINEAR,
                     );
-                    self.tile_textures
-                        .insert((result.key, result.revision), texture);
+                    let should_replace = self
+                        .tile_textures
+                        .get(&result.key)
+                        .is_none_or(|loaded| loaded.revision <= result.revision);
+                    if should_replace {
+                        self.tile_textures.insert(
+                            result.key,
+                            LoadedTileTexture {
+                                revision: result.revision,
+                                snapshot_sequence: result.snapshot_sequence,
+                                texture,
+                            },
+                        );
+                    }
                 }
                 Err(error) => self.status_message = format!("Tile rebuild failed: {error}"),
             }
@@ -633,7 +1017,7 @@ impl EndlessSketchApp {
             return;
         };
         for operation in self.document.operations().iter().rev() {
-            let color = operation.visible_color(BACKGROUND);
+            let color = operation.opaque_visible_color(BACKGROUND);
             if color == BACKGROUND {
                 continue;
             }
@@ -650,7 +1034,10 @@ impl EndlessSketchApp {
 
     fn run_undo(&mut self) {
         match self.document.undo() {
-            Ok(true) => self.status_message = "Undone".to_owned(),
+            Ok(true) => {
+                self.invalidate_tile_rendering();
+                self.status_message = "Undone".to_owned();
+            }
             Ok(false) => self.status_message = "Nothing to undo".to_owned(),
             Err(error) => self.status_message = format!("Undo failed: {error:#}"),
         }
@@ -658,7 +1045,10 @@ impl EndlessSketchApp {
 
     fn run_redo(&mut self) {
         match self.document.redo() {
-            Ok(true) => self.status_message = "Redone".to_owned(),
+            Ok(true) => {
+                self.invalidate_tile_rendering();
+                self.status_message = "Redone".to_owned();
+            }
             Ok(false) => self.status_message = "Nothing to redo".to_owned(),
             Err(error) => self.status_message = format!("Redo failed: {error:#}"),
         }
@@ -715,7 +1105,10 @@ impl EndlessSketchApp {
             Ok(document) => {
                 self.document = document;
                 match TileCache::new(self.document.root()) {
-                    Ok(cache) => self.tile_scheduler = TileScheduler::new(cache),
+                    Ok(cache) => {
+                        self.tile_scheduler =
+                            TileScheduler::new(cache, self.settings.tile_worker_count)
+                    }
                     Err(error) => {
                         self.status_message = format!("Tile cache failed: {error:#}");
                         return;
@@ -723,8 +1116,10 @@ impl EndlessSketchApp {
                 }
                 self.tile_textures.clear();
                 self.pending_tiles.clear();
+                self.invalidate_projection_caches();
                 self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
                 self.visible_tile_set.clear();
+                self.last_zoom_change = None;
                 self.tile_scheduler
                     .set_generation(self.visible_tile_generation);
                 self.bookmarks = self.document.bookmarks().unwrap_or_default();
@@ -735,16 +1130,124 @@ impl EndlessSketchApp {
             Err(error) => self.status_message = format!("Open failed: {error:#}"),
         }
     }
+
+    fn adjust_brush_size(&mut self, delta: f32) {
+        self.brush_size = adjusted_brush_size(self.brush_size, delta);
+    }
+
+    fn mark_zoom_changed(&mut self) {
+        self.last_zoom_change = Some(Instant::now());
+        self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
+        self.tile_scheduler
+            .set_generation(self.visible_tile_generation);
+        self.pending_tiles.clear();
+    }
+
+    fn zoom_tile_requests_deferred(&self) -> bool {
+        zoom_tile_requests_deferred_since(
+            self.last_zoom_change,
+            Instant::now(),
+            self.settings.fast_zoom_tile_settle_interval(),
+        )
+    }
+
+    fn save_settings(&mut self) {
+        match self.settings.save(&self.settings_path) {
+            Ok(()) => self.status_message = "Settings saved".to_owned(),
+            Err(error) => self.status_message = format!("Settings failed: {error:#}"),
+        }
+    }
+
+    fn recreate_tile_scheduler(&mut self) {
+        match TileCache::new(self.document.root()) {
+            Ok(cache) => {
+                self.tile_scheduler = TileScheduler::new(cache, self.settings.tile_worker_count);
+                self.invalidate_tile_rendering();
+            }
+            Err(error) => self.status_message = format!("Tile cache failed: {error:#}"),
+        }
+    }
+
+    fn invalidate_tile_rendering(&mut self) {
+        self.tile_textures.clear();
+        self.pending_tiles.clear();
+        self.invalidate_projection_caches();
+        self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
+        self.visible_tile_set.clear();
+        self.tile_scheduler
+            .set_generation(self.visible_tile_generation);
+    }
+
+    fn invalidate_projection_caches(&mut self) {
+        self.projected_geometry.clear();
+        self.visible_operations.clear();
+    }
+
+    fn begin_new_document_revision(&mut self) {
+        self.pending_tiles.clear();
+        self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
+        self.tile_scheduler
+            .set_generation(self.visible_tile_generation);
+    }
+
+    fn apply_tile_generation_pause(&mut self) {
+        self.pending_tiles.clear();
+        self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
+        self.tile_scheduler
+            .set_generation(self.visible_tile_generation);
+        if self.settings.pause_tile_generation {
+            self.status_message = "Tile generation paused".to_owned();
+        } else if self.automatic_tile_generation_pause {
+            self.status_message = "Tile generation paused while drawing".to_owned();
+        } else {
+            self.visible_tile_set.clear();
+            self.status_message = "Tile generation resumed".to_owned();
+        }
+    }
+
+    fn apply_pause_while_drawing_setting(&mut self) {
+        if self.settings.pause_tile_generation_while_drawing && self.draft.is_some() {
+            self.begin_drawing_tile_pause();
+        } else {
+            self.end_drawing_tile_pause();
+        }
+    }
+
+    fn begin_drawing_tile_pause(&mut self) {
+        if !self.settings.pause_tile_generation_while_drawing
+            || self.automatic_tile_generation_pause
+        {
+            return;
+        }
+        self.automatic_tile_generation_pause = true;
+        self.pending_tiles.clear();
+        self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
+        self.tile_scheduler
+            .set_generation(self.visible_tile_generation);
+    }
+
+    fn end_drawing_tile_pause(&mut self) {
+        if !self.automatic_tile_generation_pause {
+            return;
+        }
+        self.automatic_tile_generation_pause = false;
+        self.visible_tile_set.clear();
+    }
+}
+
+fn tile_generation_is_paused(manual_pause: bool, drawing_pause: bool) -> bool {
+    manual_pause || drawing_pause
 }
 
 fn should_paint_fill_fallback(
     operation: &EditOperation,
     camera_depth: i64,
     screen_point_count: usize,
+    settings: &AppSettings,
 ) -> bool {
-    screen_point_count <= MAX_FILL_FALLBACK_POINTS
+    screen_point_count <= settings.fill_fallback_max_points
         && camera_depth.saturating_sub(operation.native_depth).abs()
-            <= MAX_FILL_FALLBACK_DEPTH_DELTA
+            <= settings.fill_fallback_max_depth_delta
 }
 
 fn paint_fill_scanlines(painter: &Painter, clip_rect: Rect, points: &[Pos2], color: Color32) {
@@ -805,15 +1308,40 @@ fn paint_fill_scanlines(painter: &Painter, clip_rect: Rect, points: &[Pos2], col
     }
 }
 
+fn paint_stroke_fallback(painter: &Painter, points: Vec<Pos2>, width: f32, color: Color32) {
+    painter.extend(fast_stroke_fallback_shapes(points, width, color));
+}
+
+fn fast_stroke_fallback_shapes(points: Vec<Pos2>, width: f32, color: Color32) -> Vec<egui::Shape> {
+    if points.len() < 2 {
+        return Vec::new();
+    }
+    debug_assert_eq!(color.a(), u8::MAX);
+    let radius = width * 0.5;
+    if points.len() == 2 && points[0].distance(points[1]) <= f32::EPSILON {
+        return vec![egui::Shape::circle_filled(points[0], radius, color)];
+    }
+    let start = points[0];
+    let end = *points.last().expect("stroke has at least two points");
+    vec![
+        egui::Shape::line(points, Stroke::new(width, color)),
+        egui::Shape::circle_filled(start, radius, color),
+        egui::Shape::circle_filled(end, radius, color),
+    ]
+}
+
 impl eframe::App for EndlessSketchApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         egui::Panel::top("toolbar").show_inside(ui, |ui| self.toolbar(ui));
         self.bookmark_window(&context);
+        self.settings_window(&context);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show_inside(ui, |ui| self.canvas(ui, &context));
-        context.request_repaint_after(Duration::from_millis(16));
+        if let Some(interval) = self.repaint_interval() {
+            context.request_repaint_after(interval);
+        }
     }
 
     fn on_exit(&mut self) {
@@ -829,6 +1357,30 @@ impl eframe::App for EndlessSketchApp {
         if let Err(error) = self.document.checkpoint() {
             log::error!("periodic checkpoint failed: {error:#}");
         }
+    }
+}
+
+impl EndlessSketchApp {
+    fn repaint_interval(&self) -> Option<Duration> {
+        repaint_interval_for_work(
+            self.draft.is_some(),
+            !self.pending_tiles.is_empty(),
+            self.zoom_tile_requests_deferred(),
+        )
+    }
+}
+
+fn repaint_interval_for_work(
+    has_draft: bool,
+    has_pending_tiles: bool,
+    zoom_requests_deferred: bool,
+) -> Option<Duration> {
+    if has_draft || zoom_requests_deferred {
+        Some(ACTIVE_REPAINT_INTERVAL)
+    } else if has_pending_tiles {
+        Some(TILE_POLL_REPAINT_INTERVAL)
+    } else {
+        None
     }
 }
 
@@ -868,51 +1420,224 @@ fn z_drag_zoom_factor(delta_y: f32) -> f64 {
         .clamp(MIN_ZOOM_DRAG_FACTOR, MAX_ZOOM_DRAG_FACTOR)
 }
 
+fn zoom_tile_requests_deferred_since(
+    last_zoom_change: Option<Instant>,
+    now: Instant,
+    settle_interval: Duration,
+) -> bool {
+    last_zoom_change
+        .is_some_and(|last_change| now.saturating_duration_since(last_change) < settle_interval)
+}
+
+fn tile_display_rects(position: Pos2, zoom: f32, lod: u8) -> (Rect, Rect) {
+    let destination_size = TILE_SIZE as f32 * zoom;
+    let destination = Rect::from_min_size(position, egui::vec2(destination_size, destination_size));
+
+    let content_pixels = tile_resolution(lod) as f32;
+    let texture_pixels = content_pixels + TILE_BLEED as f32 * 2.0;
+    let bleed_uv = TILE_BLEED as f32 / texture_pixels;
+    let source = Rect::from_min_max(
+        Pos2::new(bleed_uv, bleed_uv),
+        Pos2::new(1.0 - bleed_uv, 1.0 - bleed_uv),
+    );
+
+    (destination, source)
+}
+
+fn tile_fallback_mode(
+    current_revision: u64,
+    snapshots: impl IntoIterator<Item = Option<(u64, i64)>>,
+) -> TileFallbackMode {
+    let mut oldest_retained_sequence = None;
+    for snapshot in snapshots {
+        let Some((revision, sequence)) = snapshot else {
+            return TileFallbackMode::Full;
+        };
+        if revision > current_revision {
+            return TileFallbackMode::Full;
+        }
+        if revision < current_revision {
+            oldest_retained_sequence =
+                Some(oldest_retained_sequence.map_or(sequence, |oldest: i64| oldest.min(sequence)));
+        }
+    }
+    oldest_retained_sequence.map_or(TileFallbackMode::Current, TileFallbackMode::OverlayAfter)
+}
+
+fn incremental_paint_operations(
+    snapshot_sequence: i64,
+    operations: &[EditOperation],
+) -> Option<Vec<EditOperation>> {
+    let newer: Vec<_> = operations
+        .iter()
+        .filter(|operation| operation.sequence > snapshot_sequence)
+        .collect();
+    if newer
+        .iter()
+        .all(|operation| operation.kind == EditKind::Paint && operation.color.is_opaque())
+    {
+        Some(newer.into_iter().cloned().collect())
+    } else {
+        None
+    }
+}
+
+fn primary_pointer_positions(
+    events: &[egui::Event],
+    primary_down_after_events: bool,
+) -> (Option<Pos2>, Vec<Pos2>) {
+    let mut primary_down = primary_down_after_events;
+    for event in events.iter().rev() {
+        if let egui::Event::PointerButton {
+            button: PointerButton::Primary,
+            pressed,
+            ..
+        } = event
+        {
+            primary_down = !pressed;
+        }
+    }
+
+    let mut press_position = None;
+    let mut drag_positions = Vec::new();
+    for event in events {
+        match event {
+            egui::Event::PointerMoved(position) if primary_down => {
+                drag_positions.push(*position);
+            }
+            egui::Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                ..
+            } => {
+                if *pressed {
+                    press_position = Some(*pos);
+                } else if primary_down {
+                    drag_positions.push(*pos);
+                }
+                primary_down = *pressed;
+            }
+            _ => {}
+        }
+    }
+
+    (press_position, drag_positions)
+}
+
 fn append_interpolated_points(
     draft: &mut EditOperation,
     camera: &CameraAddress,
     position: Pos2,
     rect: Rect,
+    settings: &AppSettings,
 ) {
+    if fill_draft_is_full(draft, settings) {
+        return;
+    }
     let Some(last) = draft.points.last() else {
-        draft
-            .points
-            .push(screen_to_canvas_for_camera(camera, position, rect));
+        append_draft_point(
+            draft,
+            screen_to_canvas_for_camera(camera, position, rect),
+            settings,
+        );
         return;
     };
     let Some((last_x, last_y)) =
         camera.canvas_to_screen(last, rect.width() as f64, rect.height() as f64)
     else {
-        draft
-            .points
-            .push(screen_to_canvas_for_camera(camera, position, rect));
+        append_draft_point(
+            draft,
+            screen_to_canvas_for_camera(camera, position, rect),
+            settings,
+        );
         return;
     };
     let previous = Pos2::new(rect.left() + last_x as f32, rect.top() + last_y as f32);
     let distance = previous.distance(position);
-    if !distance.is_finite() || distance <= MAX_DRAW_SEGMENT_PX {
-        draft
-            .points
-            .push(screen_to_canvas_for_camera(camera, position, rect));
+    if !distance.is_finite() || distance <= configured_point_spacing_px(draft.kind, settings) {
+        append_draft_point(
+            draft,
+            screen_to_canvas_for_camera(camera, position, rect),
+            settings,
+        );
         return;
     }
 
-    let step_count = (distance / (MAX_DRAW_SEGMENT_PX * 0.5)).ceil().max(1.0) as usize;
+    let step_count = interpolation_step_count(draft.kind, draft.points.len(), distance, settings);
+    if step_count == 0 {
+        return;
+    }
     for step in 1..=step_count {
         let t = step as f32 / step_count as f32;
         let interpolated = previous.lerp(position, t);
-        draft
-            .points
-            .push(screen_to_canvas_for_camera(camera, interpolated, rect));
+        append_draft_point(
+            draft,
+            screen_to_canvas_for_camera(camera, interpolated, rect),
+            settings,
+        );
     }
 }
 
-fn point_append_decision(kind: EditKind, distance: f32) -> PointAppendDecision {
-    if distance < point_spacing_px(kind) {
+fn prepare_draft_for_commit(draft: &mut EditOperation) {
+    if draft.kind == EditKind::Paint && draft.points.len() == 1 {
+        draft.points.push(draft.points[0].clone());
+    }
+    if draft.kind == EditKind::Fill && draft.points.len() >= 3 {
+        draft.points.push(draft.points[0].clone());
+    }
+}
+
+fn straight_line_requested(kind: EditKind, shift_down: bool) -> bool {
+    shift_down && matches!(kind, EditKind::Paint | EditKind::Erase)
+}
+
+fn should_update_straight_endpoint(
+    draft: &EditOperation,
+    camera: &CameraAddress,
+    position: Pos2,
+    rect: Rect,
+    settings: &AppSettings,
+) -> bool {
+    let Some(start) = draft.points.first() else {
+        return true;
+    };
+    let Some((start_x, start_y)) =
+        camera.canvas_to_screen(start, rect.width() as f64, rect.height() as f64)
+    else {
+        return true;
+    };
+    let start = Pos2::new(rect.left() + start_x as f32, rect.top() + start_y as f32);
+    start.distance(position) >= point_spacing_px(draft.kind, settings)
+}
+
+fn set_straight_draft_endpoint(draft: &mut EditOperation, endpoint: CanvasPoint) {
+    if draft.points.is_empty() {
+        draft.points.push(endpoint);
+        return;
+    }
+    if draft.points.len() == 1 {
+        draft.points.push(endpoint);
+    } else {
+        draft.points.truncate(2);
+        draft.points[1] = endpoint;
+    }
+}
+
+fn adjusted_brush_size(current: f32, delta: f32) -> f32 {
+    (current + delta).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE)
+}
+
+fn point_append_decision(
+    kind: EditKind,
+    distance: f32,
+    settings: &AppSettings,
+) -> PointAppendDecision {
+    if distance < point_spacing_px(kind, settings) {
         return PointAppendDecision::Skip;
     }
-    if distance > MAX_DRAW_SEGMENT_PX {
-        if matches!(kind, EditKind::Paint | EditKind::Erase) {
+    if distance > configured_point_spacing_px(kind, settings) {
+        if matches!(kind, EditKind::Paint | EditKind::Erase | EditKind::Fill) {
             PointAppendDecision::Interpolate
         } else {
             PointAppendDecision::Skip
@@ -922,11 +1647,49 @@ fn point_append_decision(kind: EditKind, distance: f32) -> PointAppendDecision {
     }
 }
 
-fn point_spacing_px(kind: EditKind) -> f32 {
+fn append_draft_point(draft: &mut EditOperation, point: CanvasPoint, settings: &AppSettings) {
+    if fill_draft_is_full(draft, settings) {
+        return;
+    }
+    draft.points.push(point);
+}
+
+fn fill_draft_is_full(draft: &EditOperation, settings: &AppSettings) -> bool {
+    draft.kind == EditKind::Fill && draft.points.len() >= settings.fill_draft_max_points()
+}
+
+fn interpolation_step_count(
+    kind: EditKind,
+    existing_points: usize,
+    distance: f32,
+    settings: &AppSettings,
+) -> usize {
+    let desired = (distance / configured_point_spacing_px(kind, settings))
+        .ceil()
+        .max(1.0) as usize;
     if kind == EditKind::Fill {
-        FILL_POINT_SPACING_PX
+        let remaining = settings
+            .fill_draft_max_points()
+            .saturating_sub(existing_points);
+        desired.min(remaining)
     } else {
-        BRUSH_POINT_SPACING_PX
+        desired
+    }
+}
+
+fn point_spacing_px(kind: EditKind, settings: &AppSettings) -> f32 {
+    if kind == EditKind::Fill {
+        (settings.fill_point_spacing_px * 0.25).max(MIN_FILL_INPUT_SPACING_PX)
+    } else {
+        (settings.brush_point_spacing_px * 0.25).max(MIN_BRUSH_INPUT_SPACING_PX)
+    }
+}
+
+fn configured_point_spacing_px(kind: EditKind, settings: &AppSettings) -> f32 {
+    if kind == EditKind::Fill {
+        settings.fill_point_spacing_px
+    } else {
+        settings.brush_point_spacing_px
     }
 }
 
@@ -934,10 +1697,8 @@ fn to_color32(color: Color) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a)
 }
 
-fn default_canvas_path() -> PathBuf {
-    directories::ProjectDirs::from("app", "EndlessSketch", "EndlessSketch")
-        .map(|directories| directories.data_local_dir().join("default.esketch"))
-        .unwrap_or_else(|| Path::new("default.esketch").to_path_buf())
+fn color_from_srgb(color: [u8; 3]) -> Color {
+    Color::rgba(color[0], color[1], color[2], u8::MAX)
 }
 
 fn bookmark_edit_names(bookmarks: &[Bookmark]) -> HashMap<Uuid, String> {
@@ -950,47 +1711,430 @@ fn bookmark_edit_names(bookmarks: &[Bookmark]) -> HashMap<Uuid, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PointAppendDecision, point_append_decision, should_paint_fill_fallback,
-        space_pan_requested, tile_lod_for_zoom, z_drag_zoom_factor, z_zoom_requested,
+        ACTIVE_REPAINT_INTERVAL, FRAME_TIME_EMA_ALPHA, FrameRateTracker, MAX_BRUSH_SIZE,
+        MIN_BRUSH_SIZE, PointAppendDecision, TILE_POLL_REPAINT_INTERVAL, TileFallbackMode,
+        adjusted_brush_size, color_from_srgb, fast_stroke_fallback_shapes,
+        incremental_paint_operations, interpolation_step_count, point_append_decision,
+        prepare_draft_for_commit, primary_pointer_positions, repaint_interval_for_work,
+        set_straight_draft_endpoint, should_paint_fill_fallback, space_pan_requested,
+        straight_line_requested, tile_display_rects, tile_fallback_mode, tile_generation_is_paused,
+        z_drag_zoom_factor, z_zoom_requested, zoom_tile_requests_deferred_since,
     };
     use crate::coords::CanvasPoint;
     use crate::model::EditKind;
     use crate::model::{Color, EditOperation};
+    use crate::settings::AppSettings;
+    use crate::tile_cache::{TILE_BLEED, TILE_SIZE, tile_lod_for_resolution, tile_resolution};
+    use eframe::egui::{Color32, Event, Modifiers, PointerButton, Pos2, Shape};
     use num_bigint::BigInt;
+    use std::time::{Duration, Instant};
 
     #[test]
-    fn cached_tiles_are_softly_upscaled_between_lod_steps() {
-        assert_eq!(tile_lod_for_zoom(1.0), Some(0));
-        assert_eq!(tile_lod_for_zoom(1.01), Some(0));
-        assert_eq!(tile_lod_for_zoom(2.0), Some(1));
-        assert_eq!(tile_lod_for_zoom(2.01), Some(1));
-        assert_eq!(tile_lod_for_zoom(4.0), Some(2));
-        assert_eq!(tile_lod_for_zoom(4.01), Some(2));
-        assert_eq!(tile_lod_for_zoom(7.99), Some(2));
+    fn tile_display_uses_content_rect_and_source_bleed_crop() {
+        let lod = tile_lod_for_resolution(128);
+        let (destination, source) = tile_display_rects(Pos2::new(10.0, 20.0), 1.25, lod);
+        let texture_pixels = (tile_resolution(lod) + TILE_BLEED * 2) as f32;
+        let bleed_uv = TILE_BLEED as f32 / texture_pixels;
+
+        assert_eq!(destination.min, Pos2::new(10.0, 20.0));
+        assert_eq!(destination.width(), TILE_SIZE as f32 * 1.25);
+        assert_eq!(destination.height(), TILE_SIZE as f32 * 1.25);
+        assert_eq!(source.min, Pos2::new(bleed_uv, bleed_uv));
+        assert_eq!(source.max, Pos2::new(1.0 - bleed_uv, 1.0 - bleed_uv));
     }
 
     #[test]
-    fn drawing_rejects_tiny_fill_jitter_and_large_pointer_jumps() {
+    fn adjacent_tile_destinations_share_their_content_edge() {
+        let zoom = 1.125;
+        let lod = tile_lod_for_resolution(256);
+        let (left, _) = tile_display_rects(Pos2::new(5.0, 0.0), zoom, lod);
+        let (right, _) =
+            tile_display_rects(Pos2::new(5.0 + TILE_SIZE as f32 * zoom, 0.0), zoom, lod);
+
+        assert_eq!(left.max.x, right.min.x);
+    }
+
+    #[test]
+    fn tile_fallback_uses_only_operations_newer_than_the_oldest_retained_tile() {
         assert_eq!(
-            point_append_decision(EditKind::Paint, 1.0),
-            PointAppendDecision::Append
+            tile_fallback_mode(8, [Some((8, 12)), Some((8, 12))]),
+            TileFallbackMode::Current
         );
         assert_eq!(
-            point_append_decision(EditKind::Paint, 128.0),
+            tile_fallback_mode(8, [Some((8, 12)), Some((7, 10)), Some((6, 7))]),
+            TileFallbackMode::OverlayAfter(7)
+        );
+        assert_eq!(
+            tile_fallback_mode(8, [Some((8, 12)), None]),
+            TileFallbackMode::Full
+        );
+        assert_eq!(
+            tile_fallback_mode(8, [Some((9, 12))]),
+            TileFallbackMode::Full
+        );
+    }
+
+    #[test]
+    fn incremental_tile_updates_accept_only_new_opaque_paint_operations() {
+        let point = CanvasPoint::new(0, 0.into(), 0.into(), 0.5, 0.5);
+        let operation = |kind, color, sequence| {
+            let mut operation =
+                EditOperation::draft(kind, 0, 1.0, vec![point.clone(), point.clone()], color, 8.0);
+            operation.sequence = sequence;
+            operation
+        };
+        let old = operation(EditKind::Paint, Color::BLACK, 1);
+        let first = operation(EditKind::Paint, Color::BLACK, 2);
+        let second = operation(EditKind::Paint, Color::rgba(200, 20, 20, 255), 3);
+
+        let incremental =
+            incremental_paint_operations(1, &[old.clone(), first.clone(), second.clone()])
+                .expect("opaque Paint delta");
+        assert_eq!(incremental.len(), 2);
+        assert_eq!(incremental[0].sequence, 2);
+        assert_eq!(incremental[1].sequence, 3);
+        assert!(
+            incremental_paint_operations(3, &[old.clone(), first.clone(), second.clone()])
+                .expect("empty tile-local delta")
+                .is_empty()
+        );
+
+        let transparent = operation(EditKind::Paint, Color::rgba(20, 20, 20, 128), 4);
+        let erase = operation(EditKind::Erase, Color::WHITE, 4);
+        let fill = operation(EditKind::Fill, Color::BLACK, 4);
+        assert!(incremental_paint_operations(3, &[transparent]).is_none());
+        assert!(incremental_paint_operations(3, &[erase]).is_none());
+        assert!(incremental_paint_operations(3, &[fill]).is_none());
+    }
+
+    #[test]
+    fn frame_rate_tracker_measures_active_interactions_and_resets_after_idle() {
+        let mut tracker = FrameRateTracker::default();
+
+        tracker.update(1.0 / 20.0, false);
+        assert_eq!(tracker.metrics(), None);
+
+        tracker.update(1.0 / 60.0, true);
+        let (fps, frame_time) = tracker.metrics().expect("active measurement");
+        assert!((fps - 60.0).abs() < 0.01);
+        assert!((frame_time - 1000.0 / 60.0).abs() < 0.01);
+
+        tracker.update(1.0 / 30.0, true);
+        let expected = 1.0 / 60.0 + (1.0 / 30.0 - 1.0 / 60.0) * FRAME_TIME_EMA_ALPHA;
+        assert!(
+            (tracker.metrics().expect("averaged measurement").1 - expected * 1000.0).abs() < 0.01
+        );
+
+        tracker.update(1.0 / 20.0, false);
+        tracker.update(1.0 / 40.0, true);
+        let (fps, _) = tracker.metrics().expect("reset measurement");
+        assert!((fps - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn frame_rate_tracker_rejects_invalid_frame_times() {
+        let mut tracker = FrameRateTracker::default();
+
+        tracker.update(f32::NAN, true);
+        tracker.update(0.0, true);
+        tracker.update(1.0, true);
+
+        assert_eq!(tracker.metrics(), None);
+    }
+
+    #[test]
+    fn manual_and_drawing_tile_pauses_are_independent() {
+        assert!(!tile_generation_is_paused(false, false));
+        assert!(tile_generation_is_paused(true, false));
+        assert!(tile_generation_is_paused(false, true));
+        assert!(tile_generation_is_paused(true, true));
+    }
+
+    #[test]
+    fn primary_pointer_positions_preserve_all_drag_events_in_order() {
+        let events = vec![
+            Event::PointerMoved(Pos2::new(0.0, 0.0)),
+            Event::PointerButton {
+                pos: Pos2::new(1.0, 1.0),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+            Event::PointerMoved(Pos2::new(2.0, 2.0)),
+            Event::PointerMoved(Pos2::new(3.0, 3.0)),
+            Event::PointerButton {
+                pos: Pos2::new(4.0, 4.0),
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+            Event::PointerMoved(Pos2::new(5.0, 5.0)),
+        ];
+
+        let (press, positions) = primary_pointer_positions(&events, false);
+
+        assert_eq!(press, Some(Pos2::new(1.0, 1.0)));
+        assert_eq!(
+            positions,
+            vec![
+                Pos2::new(2.0, 2.0),
+                Pos2::new(3.0, 3.0),
+                Pos2::new(4.0, 4.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn primary_pointer_positions_restore_down_state_from_release_event() {
+        let events = vec![
+            Event::PointerMoved(Pos2::new(6.0, 6.0)),
+            Event::PointerButton {
+                pos: Pos2::new(7.0, 7.0),
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+
+        let (press, positions) = primary_pointer_positions(&events, false);
+
+        assert_eq!(press, None);
+        assert_eq!(positions, vec![Pos2::new(6.0, 6.0), Pos2::new(7.0, 7.0)]);
+    }
+
+    #[test]
+    fn drawing_interpolates_large_pointer_jumps() {
+        let settings = AppSettings::default();
+
+        assert_eq!(
+            point_append_decision(EditKind::Paint, 1.0, &settings),
+            PointAppendDecision::Skip
+        );
+        assert_eq!(
+            point_append_decision(EditKind::Paint, 64.0, &settings),
             PointAppendDecision::Interpolate
         );
         assert_eq!(
-            point_append_decision(EditKind::Fill, 1.0),
+            point_append_decision(EditKind::Fill, 1.0, &settings),
+            PointAppendDecision::Skip
+        );
+        assert_eq!(
+            point_append_decision(EditKind::Fill, 0.5, &settings),
+            PointAppendDecision::Skip
+        );
+        assert_eq!(
+            point_append_decision(EditKind::Fill, 64.0, &settings),
+            PointAppendDecision::Interpolate
+        );
+    }
+
+    #[test]
+    fn fill_interpolation_is_bounded_by_the_draft_point_limit() {
+        let settings = AppSettings::default();
+        let max_fill_draft_points = settings.fill_draft_max_points();
+
+        assert_eq!(
+            interpolation_step_count(EditKind::Fill, 10, 128.0, &settings),
+            11
+        );
+        assert_eq!(
+            interpolation_step_count(
+                EditKind::Fill,
+                max_fill_draft_points - 1,
+                10_000.0,
+                &settings
+            ),
+            1
+        );
+        assert_eq!(
+            interpolation_step_count(EditKind::Fill, max_fill_draft_points, 10_000.0, &settings),
+            0
+        );
+        assert!(
+            interpolation_step_count(EditKind::Paint, max_fill_draft_points, 10_000.0, &settings)
+                > 1
+        );
+    }
+
+    #[test]
+    fn drawing_settings_change_spacing_and_fill_limits() {
+        let dense_settings = AppSettings {
+            brush_point_spacing_px: 4.0,
+            fill_point_spacing_px: 4.0,
+            ..AppSettings::default()
+        }
+        .normalized();
+        let sparse_settings = AppSettings {
+            brush_point_spacing_px: 64.0,
+            fill_point_spacing_px: 64.0,
+            ..AppSettings::default()
+        }
+        .normalized();
+        let very_sparse_settings = AppSettings {
+            brush_point_spacing_px: 1024.0,
+            fill_point_spacing_px: 1024.0,
+            ..AppSettings::default()
+        }
+        .normalized();
+        let fill_limited_settings = AppSettings {
+            fill_fallback_max_points: 2,
+            fill_fallback_max_depth_delta: 0,
+            ..AppSettings::default()
+        }
+        .normalized();
+        let fill = EditOperation::draft(
+            EditKind::Fill,
+            0,
+            1.0,
+            vec![
+                CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.25, 0.25),
+                CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.75, 0.25),
+                CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.75, 0.75),
+            ],
+            Color::BLACK,
+            8.0,
+        );
+
+        assert_eq!(
+            point_append_decision(EditKind::Paint, 3.5, &dense_settings),
             PointAppendDecision::Append
         );
         assert_eq!(
-            point_append_decision(EditKind::Fill, 0.5),
+            point_append_decision(EditKind::Paint, 32.0, &dense_settings),
+            PointAppendDecision::Interpolate
+        );
+        assert_eq!(
+            point_append_decision(EditKind::Paint, 32.0, &sparse_settings),
+            PointAppendDecision::Append
+        );
+        assert!(
+            interpolation_step_count(EditKind::Paint, 0, 128.0, &dense_settings)
+                > interpolation_step_count(EditKind::Paint, 0, 128.0, &sparse_settings)
+        );
+        assert_eq!(
+            point_append_decision(EditKind::Paint, 0.5, &dense_settings),
             PointAppendDecision::Skip
         );
         assert_eq!(
-            point_append_decision(EditKind::Fill, 128.0),
+            point_append_decision(EditKind::Paint, 120.0, &very_sparse_settings),
             PointAppendDecision::Skip
         );
+        assert_eq!(
+            point_append_decision(EditKind::Paint, 300.0, &very_sparse_settings),
+            PointAppendDecision::Append
+        );
+        assert_eq!(
+            point_append_decision(EditKind::Paint, 2048.0, &very_sparse_settings),
+            PointAppendDecision::Interpolate
+        );
+        assert!(!should_paint_fill_fallback(
+            &fill,
+            0,
+            129,
+            &fill_limited_settings
+        ));
+    }
+
+    #[test]
+    fn brush_single_click_becomes_a_visible_dot_operation() {
+        let point = CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.5, 0.5);
+        let mut paint = EditOperation::draft(
+            EditKind::Paint,
+            0,
+            1.0,
+            vec![point.clone()],
+            Color::BLACK,
+            12.0,
+        );
+        prepare_draft_for_commit(&mut paint);
+
+        assert_eq!(paint.points.len(), 2);
+        assert_eq!(paint.points[0].local_x, point.local_x);
+        assert_eq!(paint.points[1].local_x, point.local_x);
+        assert_eq!(paint.points[0].local_y, point.local_y);
+        assert_eq!(paint.points[1].local_y, point.local_y);
+    }
+
+    #[test]
+    fn click_to_dot_does_not_apply_to_eraser_or_fill() {
+        let point = CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.5, 0.5);
+        let mut erase = EditOperation::draft(
+            EditKind::Erase,
+            0,
+            1.0,
+            vec![point.clone()],
+            Color::WHITE,
+            12.0,
+        );
+        let mut fill =
+            EditOperation::draft(EditKind::Fill, 0, 1.0, vec![point], Color::BLACK, 12.0);
+
+        prepare_draft_for_commit(&mut erase);
+        prepare_draft_for_commit(&mut fill);
+
+        assert_eq!(erase.points.len(), 1);
+        assert_eq!(fill.points.len(), 1);
+    }
+
+    #[test]
+    fn shift_straight_lines_are_limited_to_brush_and_eraser() {
+        assert!(straight_line_requested(EditKind::Paint, true));
+        assert!(straight_line_requested(EditKind::Erase, true));
+        assert!(!straight_line_requested(EditKind::Fill, true));
+        assert!(!straight_line_requested(EditKind::Paint, false));
+    }
+
+    #[test]
+    fn straight_line_endpoint_collapses_draft_to_start_and_current_point() {
+        let start = CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.1, 0.1);
+        let middle = CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.3, 0.4);
+        let old_end = CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.5, 0.6);
+        let new_end = CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.8, 0.9);
+        let mut paint = EditOperation::draft(
+            EditKind::Paint,
+            0,
+            1.0,
+            vec![start.clone(), middle, old_end],
+            Color::BLACK,
+            12.0,
+        );
+
+        set_straight_draft_endpoint(&mut paint, new_end.clone());
+
+        assert_eq!(paint.points, vec![start, new_end]);
+    }
+
+    #[test]
+    fn brush_size_adjustment_is_clamped_to_toolbar_range() {
+        assert_eq!(adjusted_brush_size(10.0, 5.0), 15.0);
+        assert_eq!(adjusted_brush_size(10.0, -20.0), MIN_BRUSH_SIZE);
+        assert_eq!(adjusted_brush_size(99.0, 20.0), MAX_BRUSH_SIZE);
+    }
+
+    #[test]
+    fn rgb_color_edit_produces_opaque_drawing_color() {
+        assert_eq!(
+            color_from_srgb([250, 240, 40]),
+            Color::rgba(250, 240, 40, 255)
+        );
+    }
+
+    #[test]
+    fn fast_stroke_fallback_keeps_raw_points_and_uses_three_shapes() {
+        let points: Vec<_> = (0..100)
+            .map(|index| Pos2::new(index as f32, (index % 7) as f32))
+            .collect();
+        let expected_points = points.clone();
+
+        let shapes = fast_stroke_fallback_shapes(points, 8.0, Color32::BLACK);
+
+        assert_eq!(shapes.len(), 3);
+        let Shape::Path(path) = &shapes[0] else {
+            panic!("first fallback shape must be one polyline");
+        };
+        assert_eq!(path.points, expected_points);
+        assert!(matches!(shapes[1], Shape::Circle(_)));
+        assert!(matches!(shapes[2], Shape::Circle(_)));
     }
 
     #[test]
@@ -1019,6 +2163,59 @@ mod tests {
     }
 
     #[test]
+    fn tile_requests_are_deferred_only_while_zoom_is_settling() {
+        let now = Instant::now();
+        let settle_interval = AppSettings::default().fast_zoom_tile_settle_interval();
+
+        assert!(!zoom_tile_requests_deferred_since(
+            None,
+            now,
+            settle_interval
+        ));
+
+        let recent_zoom = now
+            .checked_sub(Duration::from_millis(
+                settle_interval.as_millis() as u64 / 2,
+            ))
+            .expect("test interval should be representable");
+        assert!(zoom_tile_requests_deferred_since(
+            Some(recent_zoom),
+            now,
+            settle_interval
+        ));
+
+        let settled_zoom = now
+            .checked_sub(settle_interval + Duration::from_millis(1))
+            .expect("test interval should be representable");
+        assert!(!zoom_tile_requests_deferred_since(
+            Some(settled_zoom),
+            now,
+            settle_interval
+        ));
+    }
+
+    #[test]
+    fn repaint_interval_prioritizes_interaction_over_tile_polling() {
+        assert_eq!(repaint_interval_for_work(false, false, false), None);
+        assert_eq!(
+            repaint_interval_for_work(true, false, false),
+            Some(ACTIVE_REPAINT_INTERVAL)
+        );
+        assert_eq!(
+            repaint_interval_for_work(false, true, false),
+            Some(TILE_POLL_REPAINT_INTERVAL)
+        );
+        assert_eq!(
+            repaint_interval_for_work(false, false, true),
+            Some(ACTIVE_REPAINT_INTERVAL)
+        );
+        assert_eq!(
+            repaint_interval_for_work(true, true, false),
+            Some(ACTIVE_REPAINT_INTERVAL)
+        );
+    }
+
+    #[test]
     fn fill_fallback_is_disabled_far_below_native_depth() {
         let fill = EditOperation::draft(
             EditKind::Fill,
@@ -1033,7 +2230,19 @@ mod tests {
             8.0,
         );
 
-        assert!(should_paint_fill_fallback(&fill, 6, fill.points.len()));
-        assert!(!should_paint_fill_fallback(&fill, 7, fill.points.len()));
+        let settings = AppSettings::default();
+
+        assert!(should_paint_fill_fallback(
+            &fill,
+            6,
+            fill.points.len(),
+            &settings
+        ));
+        assert!(!should_paint_fill_fallback(
+            &fill,
+            7,
+            fill.points.len(),
+            &settings
+        ));
     }
 }

@@ -1,6 +1,6 @@
 use crate::model::Color;
 use crate::model::EditOperation;
-use crate::raster::render_tile;
+use crate::raster::{render_operations_onto_tile, render_tile};
 use anyhow::{Context, Result};
 use image::{ImageFormat, RgbaImage};
 use num_bigint::BigInt;
@@ -13,7 +13,10 @@ use std::time::SystemTime;
 
 pub const TILE_SIZE: u32 = 512;
 pub const TILE_BLEED: u32 = 2;
-pub const MAX_TILE_LOD: u8 = 2;
+pub const TILE_RESOLUTIONS: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
+pub const DEFAULT_TILE_RESOLUTION: u32 = 512;
+pub const MAX_TILE_LOD: u8 = TILE_RESOLUTIONS.len() as u8 - 1;
+const TILE_RENDERER_CACHE_VERSION: u32 = 5;
 const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -24,8 +27,31 @@ pub struct TileKey {
     pub lod: u8,
 }
 
-pub fn lod_scale(lod: u8) -> u32 {
-    1 << lod.min(MAX_TILE_LOD)
+pub fn tile_resolution(lod: u8) -> u32 {
+    TILE_RESOLUTIONS[usize::from(lod.min(MAX_TILE_LOD))]
+}
+
+pub fn tile_lod_for_resolution(resolution: u32) -> u8 {
+    TILE_RESOLUTIONS
+        .iter()
+        .position(|candidate| *candidate == resolution)
+        .map_or_else(
+            || {
+                TILE_RESOLUTIONS
+                    .iter()
+                    .position(|candidate| *candidate == DEFAULT_TILE_RESOLUTION)
+                    .expect("default tile resolution must be supported") as u8
+            },
+            |index| index as u8,
+        )
+}
+
+pub fn nearest_tile_resolution(resolution: u32) -> u32 {
+    TILE_RESOLUTIONS
+        .iter()
+        .copied()
+        .min_by_key(|candidate| candidate.abs_diff(resolution))
+        .expect("tile resolutions must not be empty")
 }
 
 #[derive(Clone)]
@@ -47,9 +73,14 @@ impl TileCache {
     pub fn path_for(&self, key: &TileKey, revision: u64) -> PathBuf {
         self.root
             .join(format!("d{}", key.depth))
-            .join(format!("l{}", key.lod))
+            .join(format!("p{}", tile_resolution(key.lod)))
             .join(sanitize_bigint(&key.x))
-            .join(format!("{}_r{}.png", sanitize_bigint(&key.y), revision))
+            .join(format!(
+                "{}_rv{}_r{}.png",
+                sanitize_bigint(&key.y),
+                TILE_RENDERER_CACHE_VERSION,
+                revision
+            ))
     }
 
     pub fn load(&self, key: &TileKey, revision: u64) -> Result<Option<RgbaImage>> {
@@ -94,6 +125,26 @@ impl TileCache {
         let image = render_tile(operations, key, background);
         self.store_atomic(key, revision, &image)?;
         Ok(image)
+    }
+
+    pub fn rebuild_incremental(
+        &self,
+        key: &TileKey,
+        base_revision: u64,
+        revision: u64,
+        operations: &[EditOperation],
+        background: Color,
+    ) -> Result<Option<RgbaImage>> {
+        let Some(mut image) = self.load(key, base_revision)? else {
+            return Ok(None);
+        };
+        let expected_size = tile_resolution(key.lod) + TILE_BLEED * 2;
+        if image.width() != expected_size || image.height() != expected_size {
+            return Ok(None);
+        }
+        render_operations_onto_tile(&mut image, operations, key, background);
+        self.store_atomic(key, revision, &image)?;
+        Ok(Some(image))
     }
 
     pub fn blank(background: Color) -> RgbaImage {
@@ -180,6 +231,20 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn tile_resolution_indices_round_trip_all_supported_sizes() {
+        for (index, resolution) in TILE_RESOLUTIONS.into_iter().enumerate() {
+            let lod = tile_lod_for_resolution(resolution);
+            assert_eq!(lod, index as u8);
+            assert_eq!(tile_resolution(lod), resolution);
+        }
+        assert_eq!(nearest_tile_resolution(300), 256);
+        assert_eq!(
+            tile_lod_for_resolution(300),
+            tile_lod_for_resolution(DEFAULT_TILE_RESOLUTION)
+        );
+    }
+
+    #[test]
     fn corrupt_png_is_rebuildable_cache_miss() -> Result<()> {
         let temporary = TempDir::new()?;
         let cache = TileCache::new(temporary.path())?;
@@ -216,6 +281,33 @@ mod tests {
     }
 
     #[test]
+    fn renderer_version_invalidates_legacy_tile_paths() -> Result<()> {
+        let temporary = TempDir::new()?;
+        let cache = TileCache::new(temporary.path())?;
+        let key = TileKey {
+            depth: 0,
+            x: 0.into(),
+            y: 0.into(),
+            lod: 0,
+        };
+        let current = cache.path_for(&key, 7);
+        let legacy = current.parent().expect("tile path parent").join("0_r7.png");
+        fs::create_dir_all(legacy.parent().expect("legacy tile parent"))?;
+        TileCache::blank(Color::WHITE).save_with_format(&legacy, ImageFormat::Png)?;
+
+        assert!(legacy.exists());
+        assert!(
+            current
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("_rv5_r7.png"))
+        );
+        assert!(current.to_string_lossy().contains("p64"));
+        assert!(cache.load(&key, 7)?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn cache_budget_removes_oldest_png_files() -> Result<()> {
         let temporary = TempDir::new()?;
         let cache = TileCache::new(temporary.path())?;
@@ -227,6 +319,41 @@ mod tests {
         cache.enforce_budget(150)?;
         assert!(!first.exists());
         assert!(second.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_rebuild_requires_a_valid_matching_base_image() -> Result<()> {
+        let temporary = TempDir::new()?;
+        let cache = TileCache::new(temporary.path())?;
+        let key = TileKey {
+            depth: 0,
+            x: 0.into(),
+            y: 0.into(),
+            lod: tile_lod_for_resolution(64),
+        };
+
+        assert!(
+            cache
+                .rebuild_incremental(&key, 1, 2, &[], Color::WHITE)?
+                .is_none()
+        );
+
+        let wrong_size = RgbaImage::new(10, 10);
+        cache.store_atomic(&key, 1, &wrong_size)?;
+        assert!(
+            cache
+                .rebuild_incremental(&key, 1, 2, &[], Color::WHITE)?
+                .is_none()
+        );
+
+        let valid = render_tile(&[], &key, Color::WHITE);
+        cache.store_atomic(&key, 1, &valid)?;
+        let rebuilt = cache
+            .rebuild_incremental(&key, 1, 2, &[], Color::WHITE)?
+            .expect("valid incremental base");
+        assert_eq!(rebuilt, valid);
+        assert!(cache.path_for(&key, 2).exists());
         Ok(())
     }
 }

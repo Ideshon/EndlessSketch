@@ -22,6 +22,26 @@ impl Color {
     pub fn is_opaque(self) -> bool {
         self.a == u8::MAX
     }
+
+    pub fn flattened_over(self, background: Self) -> Self {
+        if self.is_opaque() {
+            return self;
+        }
+        let alpha = u32::from(self.a);
+        let inverse_alpha = u32::from(u8::MAX - self.a);
+        let flatten_channel = |source: u8, destination: u8| {
+            ((u32::from(source) * alpha
+                + u32::from(destination) * inverse_alpha
+                + u32::from(u8::MAX) / 2)
+                / u32::from(u8::MAX)) as u8
+        };
+        Self::rgba(
+            flatten_channel(self.r, background.r),
+            flatten_channel(self.g, background.g),
+            flatten_channel(self.b, background.b),
+            u8::MAX,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,5 +111,38 @@ impl EditOperation {
         } else {
             self.color
         }
+    }
+
+    pub fn opaque_visible_color(&self, background: Color) -> Color {
+        self.visible_color(background).flattened_over(background)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Color, EditKind, EditOperation};
+    use crate::coords::CanvasPoint;
+    use num_bigint::BigInt;
+
+    #[test]
+    fn flattening_preserves_stored_alpha_and_returns_opaque_color() {
+        let source = Color::rgba(0, 0, 0, 128);
+        let operation = EditOperation::draft(
+            EditKind::Paint,
+            0,
+            1.0,
+            vec![
+                CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.25, 0.5),
+                CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.75, 0.5),
+            ],
+            source,
+            8.0,
+        );
+
+        let flattened = operation.opaque_visible_color(Color::WHITE);
+
+        assert_eq!(operation.color, source);
+        assert_eq!(operation.color.a, 128);
+        assert_eq!(flattened, Color::rgba(125, 125, 124, 255));
     }
 }
