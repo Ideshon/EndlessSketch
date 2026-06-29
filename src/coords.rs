@@ -139,6 +139,20 @@ impl CameraAddress {
         }
     }
 
+    pub fn jump_to_depth(&mut self, target_depth: i64) {
+        while self.depth < target_depth {
+            self.depth += 1;
+            promote_axis(&mut self.tile_x, &mut self.local_x);
+            promote_axis(&mut self.tile_y, &mut self.local_y);
+        }
+        while self.depth > target_depth {
+            self.depth -= 1;
+            demote_axis(&mut self.tile_x, &mut self.local_x);
+            demote_axis(&mut self.tile_y, &mut self.local_y);
+        }
+        self.normalize_position();
+    }
+
     fn normalize_position(&mut self) {
         normalize_axis(&mut self.tile_x, &mut self.local_x);
         normalize_axis(&mut self.tile_y, &mut self.local_y);
@@ -313,5 +327,99 @@ mod tests {
             .canvas_to_screen(&center, 1920.0, 1080.0)
             .expect("relative coordinates stay small");
         assert_eq!((x, y), (960.0, 540.0));
+    }
+
+    #[test]
+    fn exact_hundred_level_zoom_keeps_center_and_screen_round_trips_stable() {
+        for (target_depth, factor) in [(-100, 1.0 / DEPTH_RATIO as f64), (100, DEPTH_RATIO as f64)]
+        {
+            let mut camera = CameraAddress::default();
+            let anchor = camera.center_point();
+            for _ in 0..100 {
+                camera.zoom_at(factor, 640.0, 360.0, 1280.0, 720.0);
+            }
+
+            assert_eq!(camera.depth, target_depth);
+            assert_eq!(camera.zoom, 1.0);
+            let (anchor_x, anchor_y) = camera
+                .canvas_to_screen(&anchor, 1280.0, 720.0)
+                .expect("center anchor remains representable");
+            assert!((anchor_x - 640.0).abs() < 0.001, "x={anchor_x}");
+            assert!((anchor_y - 360.0).abs() < 0.001, "y={anchor_y}");
+
+            for (screen_x, screen_y) in [(0.0, 0.0), (321.5, 654.25), (1279.0, 719.0)] {
+                let point = camera.screen_to_canvas(screen_x, screen_y, 1280.0, 720.0);
+                let (result_x, result_y) = camera
+                    .canvas_to_screen(&point, 1280.0, 720.0)
+                    .expect("same-depth point remains representable");
+                assert!((result_x - screen_x).abs() < 0.001, "x={result_x}");
+                assert!((result_y - screen_y).abs() < 0.001, "y={result_y}");
+            }
+        }
+    }
+
+    #[test]
+    fn direct_depth_jump_preserves_visible_center_at_each_target() {
+        let original = CameraAddress {
+            tile_x: BigInt::from(-123_456),
+            tile_y: BigInt::from(987_654),
+            local_x: 0.25,
+            local_y: 0.75,
+            zoom: 3.5,
+            ..CameraAddress::default()
+        };
+        let center = original.center_point();
+
+        for depth in [100, -100] {
+            let mut camera = original.clone();
+            camera.jump_to_depth(depth);
+            assert_eq!(camera.depth, depth);
+            assert_eq!(camera.zoom, original.zoom);
+            let (x, y) = camera
+                .canvas_to_screen(&center, 1280.0, 720.0)
+                .expect("center remains representable");
+            assert!((x - 640.0).abs() < 0.001, "depth={depth} x={x}");
+            assert!((y - 360.0).abs() < 0.001, "depth={depth} y={y}");
+        }
+    }
+
+    #[test]
+    fn thousand_depth_same_level_round_trip_is_stable() {
+        for depth in [-1000, 1000] {
+            let camera = CameraAddress {
+                depth,
+                tile_x: BigInt::from(10u8).pow(500),
+                tile_y: -BigInt::from(10u8).pow(500),
+                local_x: 0.125,
+                local_y: 0.875,
+                zoom: 2.5,
+            };
+            for (screen_x, screen_y) in [(0.0, 0.0), (321.5, 654.25), (1279.0, 719.0)] {
+                let point = camera.screen_to_canvas(screen_x, screen_y, 1280.0, 720.0);
+                let (result_x, result_y) = camera
+                    .canvas_to_screen(&point, 1280.0, 720.0)
+                    .expect("same-depth point remains representable");
+                assert!(
+                    (result_x - screen_x).abs() < 0.001,
+                    "depth={depth} x={result_x}"
+                );
+                assert!(
+                    (result_y - screen_y).abs() < 0.001,
+                    "depth={depth} y={result_y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unrepresentable_cross_depth_projection_is_rejected() {
+        let point = CanvasPoint::new(0, 0.into(), 0.into(), 0.5, 0.5);
+        for depth in [-1000, 1000] {
+            let camera = CameraAddress {
+                depth,
+                ..CameraAddress::default()
+            };
+            assert!(camera.canvas_to_screen(&point, 1280.0, 720.0).is_none());
+        }
     }
 }

@@ -317,4 +317,84 @@ mod tests {
         assert_eq!(queries, 3);
         assert_eq!(cache.indices, vec![4]);
     }
+
+    #[test]
+    fn projected_center_survives_minus_to_plus_hundred_depth_reanchors() {
+        let viewport = Rect::from_min_max(Pos2::ZERO, Pos2::new(1280.0, 720.0));
+        let mut camera = CameraAddress::default();
+        let center = camera.center_point();
+        let operation = EditOperation::draft(
+            EditKind::Paint,
+            0,
+            1.0,
+            vec![center.clone(), center],
+            Color::BLACK,
+            8.0,
+        );
+        let mut cache = ProjectedGeometryCache::default();
+
+        for _ in 0..100 {
+            camera.zoom_at(1.0 / DEPTH_RATIO as f64, 640.0, 360.0, 1280.0, 720.0);
+        }
+        assert_eq!(camera.depth, -100);
+        assert_matches_direct_projection(&mut cache, &camera, viewport, &operation);
+
+        for _ in 0..200 {
+            camera.zoom_at(DEPTH_RATIO as f64, 640.0, 360.0, 1280.0, 720.0);
+        }
+        assert_eq!(camera.depth, 100);
+        assert_matches_direct_projection(&mut cache, &camera, viewport, &operation);
+        assert_eq!(cache.cached_operation_count(), 1);
+    }
+
+    #[test]
+    fn projection_cache_resets_safely_across_two_thousand_levels() {
+        let viewport = Rect::from_min_max(Pos2::ZERO, Pos2::new(1280.0, 720.0));
+        let mut cache = ProjectedGeometryCache::default();
+
+        for depth in [-1000, 1000] {
+            let camera = CameraAddress {
+                depth,
+                ..CameraAddress::default()
+            };
+            let center = camera.center_point();
+            let operation = EditOperation::draft(
+                EditKind::Paint,
+                depth,
+                1.0,
+                vec![center.clone(), center],
+                Color::BLACK,
+                8.0,
+            );
+            assert_matches_direct_projection(&mut cache, &camera, viewport, &operation);
+            assert_eq!(cache.cached_operation_count(), 1);
+        }
+    }
+
+    #[test]
+    fn projection_cache_reanchors_at_thousand_digit_lateral_offsets() {
+        let viewport = Rect::from_min_max(Pos2::ZERO, Pos2::new(1280.0, 720.0));
+        let mut cache = ProjectedGeometryCache::default();
+        let origin_camera = CameraAddress::default();
+        let origin_operation = operation();
+        assert_matches_direct_projection(&mut cache, &origin_camera, viewport, &origin_operation);
+
+        let huge = BigInt::from(10u8).pow(1000);
+        let distant_camera = CameraAddress {
+            tile_x: huge.clone(),
+            tile_y: -huge,
+            ..CameraAddress::default()
+        };
+        let center = distant_camera.center_point();
+        let distant_operation = EditOperation::draft(
+            EditKind::Paint,
+            0,
+            1.0,
+            vec![center.clone(), center],
+            Color::BLACK,
+            8.0,
+        );
+        assert_matches_direct_projection(&mut cache, &distant_camera, viewport, &distant_operation);
+        assert_eq!(cache.cached_operation_count(), 1);
+    }
 }

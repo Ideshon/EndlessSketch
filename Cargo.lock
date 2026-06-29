@@ -1100,6 +1100,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "proptest",
+ "raw-window-handle",
  "rayon",
  "rfd",
  "rusqlite",
@@ -1108,6 +1109,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "uuid",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 

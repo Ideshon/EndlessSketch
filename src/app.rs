@@ -2,10 +2,18 @@ use crate::coords::{CameraAddress, CanvasPoint};
 use crate::document::CanvasDocument;
 use crate::local_paths::{default_canvas_path, settings_path};
 use crate::model::{Bookmark, Color, EditKind, EditOperation, ToolKind};
+use crate::mouse_history::{MouseHistory, NativeWindow, native_window};
 use crate::projection_cache::{ProjectedGeometryCache, VisibleOperationCache};
 use crate::raster::operation_width;
 use crate::settings::{
-    AppSettings, MAX_POINT_SPACING_PX, MIN_POINT_SPACING_PX, PerformanceProfile,
+    AppSettings, EdgeQuality, MAX_BRUSH_INPUT_SPACING_PX, MAX_CACHE_SIZE_MIB,
+    MAX_FILL_INPUT_SPACING_PX, MAX_PREVIEW_FPS, MAX_TILE_PREFETCH_RADIUS,
+    MIN_BRUSH_INPUT_SPACING_PX, MIN_CACHE_SIZE_MIB, MIN_FILL_INPUT_SPACING_PX, MIN_PREVIEW_FPS,
+    PerformanceProfile, PngCompression, SmoothingLevel, TileRebuildPolicy,
+};
+use crate::smoothing::{
+    GeometryClipRect, clip_polygon_to_rect, clip_polyline_to_rect, simplify_render_points,
+    smooth_closed_points, smooth_stroke_points,
 };
 use crate::tile_cache::{
     TILE_BLEED, TILE_RESOLUTIONS, TILE_SIZE, TileCache, TileKey, tile_lod_for_resolution,
@@ -14,6 +22,7 @@ use crate::tile_cache::{
 use crate::tile_scheduler::{IncrementalTileUpdate, TileJob, TileScheduler};
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, Painter, PointerButton, Pos2, Rect, Sense, Stroke};
+use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,10 +31,9 @@ use uuid::Uuid;
 
 const BACKGROUND: Color = Color::WHITE;
 const DRAFT_SAVE_INTERVAL: Duration = Duration::from_millis(500);
-const ACTIVE_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 const TILE_POLL_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
-const MIN_BRUSH_INPUT_SPACING_PX: f32 = 0.75;
-const MIN_FILL_INPUT_SPACING_PX: f32 = 1.0;
+const MAX_BRUSH_INTERPOLATION_GAP_PX: f32 = 8.0;
+const MAX_FILL_INTERPOLATION_GAP_PX: f32 = 4.0;
 const ZOOM_DRAG_SENSITIVITY: f64 = 0.01;
 const MIN_ZOOM_DRAG_FACTOR: f64 = 0.5;
 const MAX_ZOOM_DRAG_FACTOR: f64 = 2.0;
@@ -34,6 +42,13 @@ const MAX_BRUSH_SIZE: f32 = 100.0;
 const BRUSH_SIZE_DRAG_SCALE: f32 = 0.25;
 const FRAME_TIME_EMA_ALPHA: f32 = 0.15;
 const MAX_MEASURED_FRAME_TIME: f32 = 0.25;
+const MAX_FALLBACK_SMOOTHING_INPUT_POINTS: usize = 4096;
+const MAX_FALLBACK_SMOOTHING_OUTPUT_POINTS: usize = 8192;
+const MIN_QUICK_DEPTH: i64 = -10_000;
+const MAX_QUICK_DEPTH: i64 = 10_000;
+const MAX_LATERAL_COORDINATE_DIGITS: usize = 10_000;
+const MAX_EXACT_OVERLAY_COORDINATE_DIGITS: usize = 18;
+const OVERLAY_COORDINATE_EDGE_DIGITS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PointAppendDecision {
@@ -88,6 +103,27 @@ impl FrameRateTracker {
     }
 }
 
+#[derive(Default)]
+struct CoordinateOverlayCache {
+    tile_x: Option<BigInt>,
+    tile_y: Option<BigInt>,
+    formatted_x: String,
+    formatted_y: String,
+}
+
+impl CoordinateOverlayCache {
+    fn update(&mut self, camera: &CameraAddress) {
+        if self.tile_x.as_ref() != Some(&camera.tile_x) {
+            self.formatted_x = format_overlay_coordinate(&camera.tile_x);
+            self.tile_x = Some(camera.tile_x.clone());
+        }
+        if self.tile_y.as_ref() != Some(&camera.tile_y) {
+            self.formatted_y = format_overlay_coordinate(&camera.tile_y);
+            self.tile_y = Some(camera.tile_y.clone());
+        }
+    }
+}
+
 pub struct EndlessSketchApp {
     document: CanvasDocument,
     camera: CameraAddress,
@@ -104,6 +140,7 @@ pub struct EndlessSketchApp {
     visible_tile_generation: u64,
     visible_tile_set: HashSet<TileKey>,
     last_zoom_change: Option<Instant>,
+    last_tile_rebuild_interaction: Option<Instant>,
     settings: AppSettings,
     settings_path: PathBuf,
     bookmarks: Vec<Bookmark>,
@@ -115,6 +152,11 @@ pub struct EndlessSketchApp {
     projected_geometry: ProjectedGeometryCache,
     visible_operations: VisibleOperationCache,
     automatic_tile_generation_pause: bool,
+    mouse_history: MouseHistory,
+    depth_jump_target: i64,
+    lateral_jump_x: String,
+    lateral_jump_y: String,
+    coordinate_overlay: CoordinateOverlayCache,
 }
 
 impl EndlessSketchApp {
@@ -131,8 +173,10 @@ impl EndlessSketchApp {
         };
         let document = CanvasDocument::open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
-        let tile_scheduler =
-            TileScheduler::new(TileCache::new(document.root())?, settings.tile_worker_count);
+        let tile_scheduler = TileScheduler::new(
+            TileCache::with_options(document.root(), settings.tile_cache_options())?,
+            settings.tile_worker_count,
+        );
         let bookmarks = document.bookmarks()?;
         let bookmark_edits = bookmark_edit_names(&bookmarks);
         Ok(Self {
@@ -151,6 +195,7 @@ impl EndlessSketchApp {
             visible_tile_generation: 0,
             visible_tile_set: HashSet::new(),
             last_zoom_change: None,
+            last_tile_rebuild_interaction: None,
             settings,
             settings_path,
             bookmarks,
@@ -162,6 +207,11 @@ impl EndlessSketchApp {
             projected_geometry: ProjectedGeometryCache::default(),
             visible_operations: VisibleOperationCache::default(),
             automatic_tile_generation_pause: false,
+            mouse_history: MouseHistory::default(),
+            depth_jump_target: 0,
+            lateral_jump_x: "0".to_owned(),
+            lateral_jump_y: "0".to_owned(),
+            coordinate_overlay: CoordinateOverlayCache::default(),
         })
     }
 
@@ -212,6 +262,48 @@ impl EndlessSketchApp {
                 self.show_settings = true;
             }
         });
+        let mut jump_requested = false;
+        ui.horizontal(|ui| {
+            ui.label(format!("Current depth: {}", self.camera.depth));
+            ui.label("Jump to");
+            let response = ui.add(
+                egui::DragValue::new(&mut self.depth_jump_target)
+                    .range(MIN_QUICK_DEPTH..=MAX_QUICK_DEPTH)
+                    .speed(1),
+            );
+            let submit_by_enter =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            jump_requested = ui.button("Go").clicked() || submit_by_enter;
+        });
+        if jump_requested {
+            self.jump_to_target_depth();
+        }
+        let mut lateral_jump_requested = false;
+        let mut origin_requested = false;
+        ui.horizontal(|ui| {
+            ui.label("Tile jump");
+            ui.label("X");
+            let x_response = ui.add(
+                egui::TextEdit::singleline(&mut self.lateral_jump_x)
+                    .desired_width(150.0)
+                    .char_limit(MAX_LATERAL_COORDINATE_DIGITS + 8),
+            );
+            ui.label("Y");
+            let y_response = ui.add(
+                egui::TextEdit::singleline(&mut self.lateral_jump_y)
+                    .desired_width(150.0)
+                    .char_limit(MAX_LATERAL_COORDINATE_DIGITS + 8),
+            );
+            let submit_by_enter = (x_response.lost_focus() || y_response.lost_focus())
+                && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            lateral_jump_requested = ui.button("Go XY").clicked() || submit_by_enter;
+            origin_requested = ui.button("Origin").clicked();
+        });
+        if lateral_jump_requested {
+            self.jump_to_lateral_target();
+        } else if origin_requested {
+            self.jump_to_lateral_origin();
+        }
     }
 
     fn settings_window(&mut self, context: &egui::Context) {
@@ -226,6 +318,12 @@ impl EndlessSketchApp {
         let previous_tile_resolution = self.settings.tile_resolution_px;
         let previous_pause_tile_generation = self.settings.pause_tile_generation;
         let previous_pause_while_drawing = self.settings.pause_tile_generation_while_drawing;
+        let previous_rebuild_policy = self.settings.tile_rebuild_policy;
+        let previous_prefetch_radius = self.settings.tile_prefetch_radius;
+        let previous_edge_quality = self.settings.edge_quality;
+        let previous_smoothing = self.settings.smoothing;
+        let previous_cache_size_mib = self.settings.cache_size_mib;
+        let previous_png_compression = self.settings.png_compression;
 
         egui::Window::new("Settings")
             .open(&mut open)
@@ -255,21 +353,19 @@ impl EndlessSketchApp {
                 changed |= ui
                     .add(
                         egui::Slider::new(
-                            &mut self.settings.brush_point_spacing_px,
-                            MIN_POINT_SPACING_PX..=MAX_POINT_SPACING_PX,
+                            &mut self.settings.brush_input_spacing_px,
+                            MIN_BRUSH_INPUT_SPACING_PX..=MAX_BRUSH_INPUT_SPACING_PX,
                         )
-                        .logarithmic(true)
-                        .text("Brush spacing px"),
+                        .text("Brush input px"),
                     )
                     .changed();
                 changed |= ui
                     .add(
                         egui::Slider::new(
-                            &mut self.settings.fill_point_spacing_px,
-                            MIN_POINT_SPACING_PX..=MAX_POINT_SPACING_PX,
+                            &mut self.settings.fill_input_spacing_px,
+                            MIN_FILL_INPUT_SPACING_PX..=MAX_FILL_INPUT_SPACING_PX,
                         )
-                        .logarithmic(true)
-                        .text("Fill spacing px"),
+                        .text("Fill input px"),
                     )
                     .changed();
                 changed |= ui
@@ -327,6 +423,104 @@ impl EndlessSketchApp {
                         "Pause tile generation while drawing",
                     )
                     .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.deferred_drawing_preview,
+                        "Deferred drawing preview",
+                    )
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label("Rebuild policy");
+                    egui::ComboBox::from_id_salt("tile_rebuild_policy")
+                        .selected_text(self.settings.tile_rebuild_policy.label())
+                        .show_ui(ui, |ui| {
+                            for policy in TileRebuildPolicy::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.settings.tile_rebuild_policy,
+                                        policy,
+                                        policy.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+                });
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.tile_prefetch_radius,
+                            0..=MAX_TILE_PREFETCH_RADIUS,
+                        )
+                        .text("Prefetch tiles"),
+                    )
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label("Edge quality");
+                    egui::ComboBox::from_id_salt("edge_quality")
+                        .selected_text(self.settings.edge_quality.label())
+                        .show_ui(ui, |ui| {
+                            for quality in EdgeQuality::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.settings.edge_quality,
+                                        quality,
+                                        quality.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Smoothing");
+                    egui::ComboBox::from_id_salt("smoothing")
+                        .selected_text(self.settings.smoothing.label())
+                        .show_ui(ui, |ui| {
+                            for smoothing in SmoothingLevel::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.settings.smoothing,
+                                        smoothing,
+                                        smoothing.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+                });
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.cache_size_mib,
+                            MIN_CACHE_SIZE_MIB..=MAX_CACHE_SIZE_MIB,
+                        )
+                        .logarithmic(true)
+                        .text("Cache size MiB"),
+                    )
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label("PNG compression");
+                    egui::ComboBox::from_id_salt("png_compression")
+                        .selected_text(self.settings.png_compression.label())
+                        .show_ui(ui, |ui| {
+                            for compression in PngCompression::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.settings.png_compression,
+                                        compression,
+                                        compression.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+                });
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.preview_fps,
+                            MIN_PREVIEW_FPS..=MAX_PREVIEW_FPS,
+                        )
+                        .text("Preview FPS"),
+                    )
+                    .changed();
                 ui.separator();
                 if ui.button("Reset").clicked() {
                     reset_requested = true;
@@ -348,7 +542,15 @@ impl EndlessSketchApp {
                 self.settings.pause_tile_generation != previous_pause_tile_generation;
             let pause_while_drawing_changed =
                 self.settings.pause_tile_generation_while_drawing != previous_pause_while_drawing;
-            if tile_worker_count_changed {
+            let rebuild_policy_changed =
+                self.settings.tile_rebuild_policy != previous_rebuild_policy;
+            let prefetch_radius_changed =
+                self.settings.tile_prefetch_radius != previous_prefetch_radius;
+            let render_quality_changed = self.settings.edge_quality != previous_edge_quality
+                || self.settings.smoothing != previous_smoothing;
+            let cache_settings_changed = self.settings.cache_size_mib != previous_cache_size_mib
+                || self.settings.png_compression != previous_png_compression;
+            if tile_worker_count_changed || render_quality_changed || cache_settings_changed {
                 self.recreate_tile_scheduler();
             } else if tile_resolution_changed {
                 self.invalidate_tile_rendering();
@@ -358,6 +560,9 @@ impl EndlessSketchApp {
             }
             if pause_while_drawing_changed {
                 self.apply_pause_while_drawing_setting();
+            }
+            if rebuild_policy_changed || prefetch_radius_changed {
+                self.apply_tile_request_settings();
             }
             self.save_settings();
         }
@@ -419,6 +624,8 @@ impl EndlessSketchApp {
 
         if let Some(camera) = selected_camera {
             self.camera = camera;
+            self.depth_jump_target = self.camera.depth;
+            self.mark_zoom_changed();
             self.status_message = "Bookmark opened".to_owned();
         }
         if let Some((id, name)) = rename_request {
@@ -433,17 +640,19 @@ impl EndlessSketchApp {
         self.show_bookmarks = open;
     }
 
-    fn canvas(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+    fn canvas(&mut self, ui: &mut egui::Ui, context: &egui::Context, window: Option<NativeWindow>) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         painter.rect_filled(response.rect, 0.0, to_color32(BACKGROUND));
         let frame_time = ui.input(|input| input.unstable_dt);
 
         self.handle_shortcuts(context);
         self.handle_navigation(ui, &response);
-        self.handle_drawing(ui, &response);
-        let interaction_active = self.draft.is_some()
-            || self.zoom_tile_requests_deferred()
-            || ui.input(|input| input.pointer.any_down());
+        self.handle_drawing(ui, &response, window);
+        let pointer_down = ui.input(|input| input.pointer.any_down());
+        let input_active = self.draft.is_some() || pointer_down;
+        self.update_tile_rebuild_interaction(input_active);
+        let interaction_active =
+            input_active || self.zoom_tile_requests_deferred() || self.tile_rebuild_is_deferred();
         self.frame_rate.update(frame_time, interaction_active);
         match self.paint_cached_tiles(context, &painter, response.rect) {
             TileFallbackMode::Current => {}
@@ -540,12 +749,19 @@ impl EndlessSketchApp {
         }
     }
 
-    fn handle_drawing(&mut self, ui: &egui::Ui, response: &egui::Response) {
+    fn handle_drawing(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        window: Option<NativeWindow>,
+    ) {
         if is_space_pan_active(ui) || is_z_zoom_active(ui) {
+            self.mouse_history.reset();
             return;
         }
 
         let pointer = ui.input(|input| input.pointer.clone());
+        let pixels_per_point = ui.ctx().pixels_per_point();
         let position = pointer.interact_pos();
         let primary_pressed = pointer.button_pressed(PointerButton::Primary);
         let primary_down = pointer.button_down(PointerButton::Primary);
@@ -560,6 +776,7 @@ impl EndlessSketchApp {
             self.brush_sizing_drag_active = true;
         }
         if self.brush_sizing_drag_active {
+            self.mouse_history.reset();
             if primary_down {
                 let delta = pointer.delta();
                 if delta.y.abs() > f32::EPSILON {
@@ -602,6 +819,7 @@ impl EndlessSketchApp {
                     color,
                     self.brush_size,
                 ));
+                self.mouse_history.begin(window, position, pixels_per_point);
                 self.last_draft_save = Instant::now();
                 self.begin_drawing_tile_pause();
             }
@@ -612,6 +830,16 @@ impl EndlessSketchApp {
             && drag_positions.last().is_none_or(|last| *last != position)
         {
             drag_positions.push(position);
+        }
+        if self.draft.is_some()
+            && (primary_down || primary_released)
+            && let Some(position) = position
+            && let Some(history_positions) =
+                self.mouse_history
+                    .positions_since(window, position, pixels_per_point)
+            && history_positions.len() > drag_positions.len()
+        {
+            drag_positions = history_positions;
         }
         for drag_position in drag_positions {
             if response.rect.contains(drag_position) && self.draft.is_some() {
@@ -629,6 +857,11 @@ impl EndlessSketchApp {
         }
 
         if primary_released {
+            if let Some(position) = position
+                && response.rect.contains(position)
+            {
+                self.preserve_draft_endpoint(position, response.rect, shift_down);
+            }
             self.finish_draft();
         }
         self.last_pointer_position = position;
@@ -678,13 +911,41 @@ impl EndlessSketchApp {
         }
     }
 
+    fn preserve_draft_endpoint(&mut self, position: Pos2, rect: Rect, shift_down: bool) {
+        let Some(draft) = self.draft.as_ref() else {
+            return;
+        };
+        let endpoint = screen_to_canvas_for_camera(&self.camera, position, rect);
+        if straight_line_requested(draft.kind, shift_down) {
+            if let Some(draft) = self.draft.as_mut() {
+                set_straight_draft_endpoint(draft, endpoint);
+            }
+            return;
+        }
+        let endpoint_is_new = draft
+            .points
+            .last()
+            .and_then(|last| {
+                self.camera
+                    .canvas_to_screen(last, rect.width() as f64, rect.height() as f64)
+            })
+            .is_none_or(|(x, y)| {
+                let last = Pos2::new(rect.left() + x as f32, rect.top() + y as f32);
+                last.distance(position) > f32::EPSILON
+            });
+        if endpoint_is_new && let Some(draft) = self.draft.as_mut() {
+            append_interpolated_points(draft, &self.camera, position, rect, &self.settings);
+        }
+    }
+
     fn finish_draft(&mut self) {
+        self.mouse_history.reset();
         let Some(mut draft) = self.draft.take() else {
             self.end_drawing_tile_pause();
             return;
         };
         prepare_draft_for_commit(&mut draft);
-        if draft.points.len() < 2 {
+        if !draft_is_committable(&draft) {
             let _ = self.document.discard_draft(&draft);
             self.end_drawing_tile_pause();
             return;
@@ -752,6 +1013,9 @@ impl EndlessSketchApp {
     }
 
     fn paint_draft(&self, painter: &Painter, rect: Rect) {
+        if !should_paint_live_draft(self.settings.deferred_drawing_preview) {
+            return;
+        }
         if let Some(operation) = &self.draft {
             self.paint_operation(painter, rect, operation, true);
         }
@@ -788,25 +1052,51 @@ impl EndlessSketchApp {
         let color = to_color32(operation.opaque_visible_color(BACKGROUND));
         if operation.kind == EditKind::Fill {
             if is_draft {
+                let points =
+                    smooth_pos2_draft(&points, usize::from(self.settings.smoothing.passes()));
                 painter.add(egui::Shape::line(points, Stroke::new(1.5, color)));
-            } else if should_paint_fill_fallback(
-                operation,
-                self.camera.depth,
-                points.len(),
-                &self.settings,
-            ) {
-                paint_fill_scanlines(painter, rect, &points, color);
+            } else {
+                let points = simplify_pos2_render_points(&points, true);
+                if should_paint_fill_fallback(
+                    operation,
+                    self.camera.depth,
+                    points.len(),
+                    &self.settings,
+                ) {
+                    let points = smooth_pos2_saved_fallback(
+                        &points,
+                        usize::from(self.settings.smoothing.passes()),
+                        true,
+                    );
+                    let clipped = clip_pos2_polygon(&points, rect);
+                    paint_fill_scanlines(painter, rect, &clipped, color);
+                }
             }
-        } else {
+        } else if is_draft {
+            let points = smooth_pos2_draft(&points, usize::from(self.settings.smoothing.passes()));
             paint_stroke_fallback(painter, points, width, color);
+        } else {
+            let points = simplify_pos2_render_points(&points, false);
+            let clip_rect = rect.expand(width * 0.5 + 1.0);
+            for run in clip_pos2_polyline(&points, clip_rect) {
+                let run = smooth_pos2_saved_fallback(
+                    &run,
+                    usize::from(self.settings.smoothing.passes()),
+                    false,
+                );
+                paint_stroke_fallback(painter, run, width, color);
+            }
         }
     }
 
-    fn paint_overlay(&self, painter: &Painter, rect: Rect) {
+    fn paint_overlay(&mut self, painter: &Painter, rect: Rect) {
+        self.coordinate_overlay.update(&self.camera);
         let tile_state = if self.settings.pause_tile_generation {
             "   tiles paused"
         } else if self.automatic_tile_generation_pause {
             "   tiles paused: drawing"
+        } else if self.tile_rebuild_is_deferred() {
+            "   rebuild waiting"
         } else {
             ""
         };
@@ -815,13 +1105,19 @@ impl EndlessSketchApp {
             |(fps, frame_time)| format!("fps {fps:.1} ({frame_time:.1} ms)"),
         );
         let text = format!(
-            "depth {}   zoom {:.3}×   {} ops   {}   {}{}",
+            "depth {}   zoom {:.3}×   {} ops   {}   {}{}\n\
+             tile X {}\n\
+             tile Y {}   local X {:.6}   Y {:.6}",
             self.camera.depth,
             self.camera.zoom,
             self.document.operations().len(),
             performance,
             self.status_message,
-            tile_state
+            tile_state,
+            self.coordinate_overlay.formatted_x,
+            self.coordinate_overlay.formatted_y,
+            self.camera.local_x,
+            self.camera.local_y
         );
         painter.text(
             rect.left_top() + egui::vec2(12.0, 12.0),
@@ -849,7 +1145,9 @@ impl EndlessSketchApp {
 
         let lod = tile_lod_for_resolution(self.settings.tile_resolution_px);
         let visible = self.visible_tiles(rect, lod);
-        let visible_set: HashSet<_> = visible.iter().cloned().collect();
+        let requested =
+            tile_keys_for_view(&self.camera, rect, lod, self.settings.tile_prefetch_radius);
+        let visible_set: HashSet<_> = requested.iter().cloned().collect();
         self.tile_textures
             .retain(|key, _| visible_set.contains(key));
         if visible_set != self.visible_tile_set {
@@ -865,8 +1163,9 @@ impl EndlessSketchApp {
         if !tile_generation_is_paused(
             self.settings.pause_tile_generation,
             self.automatic_tile_generation_pause,
-        ) {
-            let missing: Vec<TileKey> = visible
+        ) && !self.tile_rebuild_is_deferred()
+        {
+            let missing: Vec<TileKey> = requested
                 .iter()
                 .filter(|key| {
                     self.tile_textures
@@ -976,26 +1275,50 @@ impl EndlessSketchApp {
     }
 
     fn visible_tiles(&self, rect: Rect, lod: u8) -> Vec<TileKey> {
-        let half_width =
-            rect.width() as f64 / (2.0 * crate::coords::TILE_PIXELS * self.camera.zoom);
-        let half_height =
-            rect.height() as f64 / (2.0 * crate::coords::TILE_PIXELS * self.camera.zoom);
-        let min_x = (self.camera.local_x - half_width).floor() as i64 - 1;
-        let max_x = (self.camera.local_x + half_width).ceil() as i64 + 1;
-        let min_y = (self.camera.local_y - half_height).floor() as i64 - 1;
-        let max_y = (self.camera.local_y + half_height).ceil() as i64 + 1;
-        let mut keys = Vec::new();
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                keys.push(TileKey {
-                    depth: self.camera.depth,
-                    x: &self.camera.tile_x + x,
-                    y: &self.camera.tile_y + y,
-                    lod,
-                });
+        tile_keys_for_view(&self.camera, rect, lod, 0)
+    }
+
+    fn update_tile_rebuild_interaction(&mut self, interaction_active: bool) {
+        let Some(idle_interval) = self.settings.tile_rebuild_policy.idle_interval() else {
+            self.last_tile_rebuild_interaction = None;
+            return;
+        };
+        let now = Instant::now();
+        let was_deferred =
+            tile_rebuild_deferred_since(self.last_tile_rebuild_interaction, now, idle_interval);
+        if interaction_active {
+            if !was_deferred {
+                self.pending_tiles.clear();
+                self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
+                self.tile_scheduler
+                    .set_generation(self.visible_tile_generation);
             }
+            self.last_tile_rebuild_interaction = Some(now);
+        } else if !was_deferred {
+            self.last_tile_rebuild_interaction = None;
         }
-        keys
+    }
+
+    fn tile_rebuild_is_deferred(&self) -> bool {
+        self.settings
+            .tile_rebuild_policy
+            .idle_interval()
+            .is_some_and(|idle_interval| {
+                tile_rebuild_deferred_since(
+                    self.last_tile_rebuild_interaction,
+                    Instant::now(),
+                    idle_interval,
+                )
+            })
+    }
+
+    fn apply_tile_request_settings(&mut self) {
+        self.last_tile_rebuild_interaction = None;
+        self.pending_tiles.clear();
+        self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
+        self.visible_tile_set.clear();
+        self.tile_scheduler
+            .set_generation(self.visible_tile_generation);
     }
 
     fn position_to_canvas(&self, position: Pos2, rect: Rect) -> CanvasPoint {
@@ -1104,7 +1427,10 @@ impl EndlessSketchApp {
         match CanvasDocument::open(path) {
             Ok(document) => {
                 self.document = document;
-                match TileCache::new(self.document.root()) {
+                match TileCache::with_options(
+                    self.document.root(),
+                    self.settings.tile_cache_options(),
+                ) {
                     Ok(cache) => {
                         self.tile_scheduler =
                             TileScheduler::new(cache, self.settings.tile_worker_count)
@@ -1120,11 +1446,13 @@ impl EndlessSketchApp {
                 self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
                 self.visible_tile_set.clear();
                 self.last_zoom_change = None;
+                self.last_tile_rebuild_interaction = None;
                 self.tile_scheduler
                     .set_generation(self.visible_tile_generation);
                 self.bookmarks = self.document.bookmarks().unwrap_or_default();
                 self.bookmark_edits = bookmark_edit_names(&self.bookmarks);
                 self.camera = CameraAddress::default();
+                self.depth_jump_target = self.camera.depth;
                 self.status_message = "Canvas opened".to_owned();
             }
             Err(error) => self.status_message = format!("Open failed: {error:#}"),
@@ -1135,7 +1463,46 @@ impl EndlessSketchApp {
         self.brush_size = adjusted_brush_size(self.brush_size, delta);
     }
 
+    fn jump_to_target_depth(&mut self) {
+        let target = clamp_quick_depth(self.depth_jump_target);
+        self.depth_jump_target = target;
+        if target == self.camera.depth {
+            self.status_message = format!("Already at depth {target}");
+            return;
+        }
+        self.camera.jump_to_depth(target);
+        self.mark_zoom_changed();
+        self.status_message = format!("Depth {target}");
+    }
+
+    fn jump_to_lateral_target(&mut self) {
+        let Some(tile_x) = parse_lateral_coordinate(&self.lateral_jump_x) else {
+            self.status_message = "Invalid Tile X".to_owned();
+            return;
+        };
+        let Some(tile_y) = parse_lateral_coordinate(&self.lateral_jump_y) else {
+            self.status_message = "Invalid Tile Y".to_owned();
+            return;
+        };
+        self.camera.tile_x = tile_x;
+        self.camera.tile_y = tile_y;
+        self.mark_zoom_changed();
+        self.status_message = "Tile position updated".to_owned();
+    }
+
+    fn jump_to_lateral_origin(&mut self) {
+        self.camera.tile_x = 0.into();
+        self.camera.tile_y = 0.into();
+        self.camera.local_x = 0.5;
+        self.camera.local_y = 0.5;
+        self.lateral_jump_x = "0".to_owned();
+        self.lateral_jump_y = "0".to_owned();
+        self.mark_zoom_changed();
+        self.status_message = "Tile origin".to_owned();
+    }
+
     fn mark_zoom_changed(&mut self) {
+        self.depth_jump_target = self.camera.depth;
         self.last_zoom_change = Some(Instant::now());
         self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
         self.tile_scheduler
@@ -1159,7 +1526,7 @@ impl EndlessSketchApp {
     }
 
     fn recreate_tile_scheduler(&mut self) {
-        match TileCache::new(self.document.root()) {
+        match TileCache::with_options(self.document.root(), self.settings.tile_cache_options()) {
             Ok(cache) => {
                 self.tile_scheduler = TileScheduler::new(cache, self.settings.tile_worker_count);
                 self.invalidate_tile_rendering();
@@ -1237,6 +1604,60 @@ impl EndlessSketchApp {
 
 fn tile_generation_is_paused(manual_pause: bool, drawing_pause: bool) -> bool {
     manual_pause || drawing_pause
+}
+
+fn simplify_pos2_render_points(points: &[Pos2], closed: bool) -> Vec<Pos2> {
+    let tuples: Vec<_> = points.iter().map(|point| (point.x, point.y)).collect();
+    simplify_render_points(&tuples, closed)
+        .into_iter()
+        .map(|(x, y)| Pos2::new(x, y))
+        .collect()
+}
+
+fn smooth_pos2_draft(points: &[Pos2], level: usize) -> Vec<Pos2> {
+    let tuples: Vec<_> = points.iter().map(|point| (point.x, point.y)).collect();
+    smooth_stroke_points(&tuples, level)
+        .into_iter()
+        .map(|(x, y)| Pos2::new(x, y))
+        .collect()
+}
+
+fn smooth_pos2_saved_fallback(points: &[Pos2], level: usize, closed: bool) -> Vec<Pos2> {
+    if level == 0 || points.len() > MAX_FALLBACK_SMOOTHING_INPUT_POINTS {
+        return points.to_vec();
+    }
+    let tuples: Vec<_> = points.iter().map(|point| (point.x, point.y)).collect();
+    let smoothed = if closed {
+        smooth_closed_points(&tuples, level)
+    } else {
+        smooth_stroke_points(&tuples, level)
+    };
+    if smoothed.len() > MAX_FALLBACK_SMOOTHING_OUTPUT_POINTS {
+        return points.to_vec();
+    }
+    smoothed.into_iter().map(|(x, y)| Pos2::new(x, y)).collect()
+}
+
+fn clip_pos2_polyline(points: &[Pos2], rect: Rect) -> Vec<Vec<Pos2>> {
+    let tuples: Vec<_> = points.iter().map(|point| (point.x, point.y)).collect();
+    clip_polyline_to_rect(
+        &tuples,
+        GeometryClipRect::new(rect.min.x, rect.min.y, rect.max.x, rect.max.y),
+    )
+    .into_iter()
+    .map(|run| run.into_iter().map(|(x, y)| Pos2::new(x, y)).collect())
+    .collect()
+}
+
+fn clip_pos2_polygon(points: &[Pos2], rect: Rect) -> Vec<Pos2> {
+    let tuples: Vec<_> = points.iter().map(|point| (point.x, point.y)).collect();
+    clip_polygon_to_rect(
+        &tuples,
+        GeometryClipRect::new(rect.min.x, rect.min.y, rect.max.x, rect.max.y),
+    )
+    .into_iter()
+    .map(|(x, y)| Pos2::new(x, y))
+    .collect()
 }
 
 fn should_paint_fill_fallback(
@@ -1331,14 +1752,15 @@ fn fast_stroke_fallback_shapes(points: Vec<Pos2>, width: f32, color: Color32) ->
 }
 
 impl eframe::App for EndlessSketchApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        let window = native_window(frame);
         egui::Panel::top("toolbar").show_inside(ui, |ui| self.toolbar(ui));
         self.bookmark_window(&context);
         self.settings_window(&context);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show_inside(ui, |ui| self.canvas(ui, &context));
+            .show_inside(ui, |ui| self.canvas(ui, &context, window));
         if let Some(interval) = self.repaint_interval() {
             context.request_repaint_after(interval);
         }
@@ -1366,6 +1788,8 @@ impl EndlessSketchApp {
             self.draft.is_some(),
             !self.pending_tiles.is_empty(),
             self.zoom_tile_requests_deferred(),
+            self.tile_rebuild_is_deferred(),
+            self.settings.preview_repaint_interval(),
         )
     }
 }
@@ -1374,14 +1798,20 @@ fn repaint_interval_for_work(
     has_draft: bool,
     has_pending_tiles: bool,
     zoom_requests_deferred: bool,
+    rebuild_requests_deferred: bool,
+    preview_interval: Duration,
 ) -> Option<Duration> {
-    if has_draft || zoom_requests_deferred {
-        Some(ACTIVE_REPAINT_INTERVAL)
+    if has_draft || zoom_requests_deferred || rebuild_requests_deferred {
+        Some(preview_interval)
     } else if has_pending_tiles {
-        Some(TILE_POLL_REPAINT_INTERVAL)
+        Some(preview_interval.max(TILE_POLL_REPAINT_INTERVAL))
     } else {
         None
     }
+}
+
+fn should_paint_live_draft(deferred_drawing_preview: bool) -> bool {
+    !deferred_drawing_preview
 }
 
 fn screen_to_canvas_for_camera(camera: &CameraAddress, position: Pos2, rect: Rect) -> CanvasPoint {
@@ -1427,6 +1857,61 @@ fn zoom_tile_requests_deferred_since(
 ) -> bool {
     last_zoom_change
         .is_some_and(|last_change| now.saturating_duration_since(last_change) < settle_interval)
+}
+
+fn tile_rebuild_deferred_since(
+    last_interaction: Option<Instant>,
+    now: Instant,
+    idle_interval: Duration,
+) -> bool {
+    last_interaction.is_some_and(|last| now.saturating_duration_since(last) < idle_interval)
+}
+
+fn tile_keys_for_view(
+    camera: &CameraAddress,
+    rect: Rect,
+    lod: u8,
+    prefetch_radius: u8,
+) -> Vec<TileKey> {
+    let half_width = rect.width() as f64 / (2.0 * crate::coords::TILE_PIXELS * camera.zoom);
+    let half_height = rect.height() as f64 / (2.0 * crate::coords::TILE_PIXELS * camera.zoom);
+    let min_x = (camera.local_x - half_width).floor() as i64;
+    let max_x = (camera.local_x + half_width).ceil() as i64;
+    let min_y = (camera.local_y - half_height).floor() as i64;
+    let max_y = (camera.local_y + half_height).ceil() as i64;
+    let radius = prefetch_radius.min(MAX_TILE_PREFETCH_RADIUS) as i64;
+    let width = max_x.saturating_sub(min_x).saturating_add(1);
+    let height = max_y.saturating_sub(min_y).saturating_add(1);
+    let expanded_width = width.saturating_add(radius.saturating_mul(2));
+    let expanded_height = height.saturating_add(radius.saturating_mul(2));
+    let capacity = expanded_width.saturating_mul(expanded_height).max(0) as usize;
+    let mut keys = Vec::with_capacity(capacity);
+
+    for ring in 0..=radius {
+        let ring_min_x = min_x.saturating_sub(ring);
+        let ring_max_x = max_x.saturating_add(ring);
+        let ring_min_y = min_y.saturating_sub(ring);
+        let ring_max_y = max_y.saturating_add(ring);
+        for y in ring_min_y..=ring_max_y {
+            for x in ring_min_x..=ring_max_x {
+                if ring > 0
+                    && x != ring_min_x
+                    && x != ring_max_x
+                    && y != ring_min_y
+                    && y != ring_max_y
+                {
+                    continue;
+                }
+                keys.push(TileKey {
+                    depth: camera.depth,
+                    x: &camera.tile_x + x,
+                    y: &camera.tile_y + y,
+                    lod,
+                });
+            }
+        }
+    }
+    keys
 }
 
 fn tile_display_rects(position: Pos2, zoom: f32, lod: u8) -> (Rect, Rect) {
@@ -1555,7 +2040,7 @@ fn append_interpolated_points(
     };
     let previous = Pos2::new(rect.left() + last_x as f32, rect.top() + last_y as f32);
     let distance = previous.distance(position);
-    if !distance.is_finite() || distance <= configured_point_spacing_px(draft.kind, settings) {
+    if !distance.is_finite() || distance <= max_interpolation_gap_px(draft.kind) {
         append_draft_point(
             draft,
             screen_to_canvas_for_camera(camera, position, rect),
@@ -1588,6 +2073,14 @@ fn prepare_draft_for_commit(draft: &mut EditOperation) {
     }
 }
 
+fn draft_is_committable(draft: &EditOperation) -> bool {
+    if draft.kind == EditKind::Fill {
+        draft.points.len() >= 4
+    } else {
+        draft.points.len() >= 2
+    }
+}
+
 fn straight_line_requested(kind: EditKind, shift_down: bool) -> bool {
     shift_down && matches!(kind, EditKind::Paint | EditKind::Erase)
 }
@@ -1608,7 +2101,7 @@ fn should_update_straight_endpoint(
         return true;
     };
     let start = Pos2::new(rect.left() + start_x as f32, rect.top() + start_y as f32);
-    start.distance(position) >= point_spacing_px(draft.kind, settings)
+    start.distance(position) >= input_spacing_px(draft.kind, settings)
 }
 
 fn set_straight_draft_endpoint(draft: &mut EditOperation, endpoint: CanvasPoint) {
@@ -1628,15 +2121,81 @@ fn adjusted_brush_size(current: f32, delta: f32) -> f32 {
     (current + delta).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE)
 }
 
+fn clamp_quick_depth(depth: i64) -> i64 {
+    depth.clamp(MIN_QUICK_DEPTH, MAX_QUICK_DEPTH)
+}
+
+fn parse_lateral_coordinate(input: &str) -> Option<BigInt> {
+    let input = input.trim();
+    if input.is_empty() || input.len() > MAX_LATERAL_COORDINATE_DIGITS + 8 {
+        return None;
+    }
+
+    let exponent_marker = input.find(['e', 'E']);
+    let Some(marker) = exponent_marker else {
+        let digits = input.trim_start_matches(['+', '-']);
+        if digits.is_empty()
+            || digits.len() > MAX_LATERAL_COORDINATE_DIGITS
+            || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        return input.parse().ok();
+    };
+    if input[marker + 1..].contains(['e', 'E']) {
+        return None;
+    }
+
+    let mantissa_text = &input[..marker];
+    let exponent_text = input[marker + 1..]
+        .strip_prefix('+')
+        .unwrap_or(&input[marker + 1..]);
+    let mantissa_digits = mantissa_text.trim_start_matches(['+', '-']);
+    if mantissa_digits.is_empty()
+        || !mantissa_digits.bytes().all(|byte| byte.is_ascii_digit())
+        || exponent_text.is_empty()
+        || !exponent_text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let exponent: u32 = exponent_text.parse().ok()?;
+    let expanded_digits = mantissa_digits.len().checked_add(exponent as usize)?;
+    if expanded_digits > MAX_LATERAL_COORDINATE_DIGITS {
+        return None;
+    }
+    let mantissa: BigInt = mantissa_text.parse().ok()?;
+    if mantissa == BigInt::from(0u8) {
+        return Some(mantissa);
+    }
+    Some(mantissa * BigInt::from(10u8).pow(exponent))
+}
+
+fn format_overlay_coordinate(value: &BigInt) -> String {
+    let text = value.to_string();
+    let (sign, digits) = text
+        .strip_prefix('-')
+        .map_or(("", text.as_str()), |digits| ("-", digits));
+    if digits.len() <= MAX_EXACT_OVERLAY_COORDINATE_DIGITS {
+        return text;
+    }
+    if digits.starts_with('1') && digits[1..].bytes().all(|byte| byte == b'0') {
+        return format!("{sign}1e{}", digits.len() - 1);
+    }
+
+    let leading = &digits[..OVERLAY_COORDINATE_EDGE_DIGITS];
+    let trailing = &digits[digits.len() - OVERLAY_COORDINATE_EDGE_DIGITS..];
+    format!("{sign}{leading}...{trailing} ({}d)", digits.len())
+}
+
 fn point_append_decision(
     kind: EditKind,
     distance: f32,
     settings: &AppSettings,
 ) -> PointAppendDecision {
-    if distance < point_spacing_px(kind, settings) {
+    if distance < input_spacing_px(kind, settings) {
         return PointAppendDecision::Skip;
     }
-    if distance > configured_point_spacing_px(kind, settings) {
+    if distance > max_interpolation_gap_px(kind) {
         if matches!(kind, EditKind::Paint | EditKind::Erase | EditKind::Fill) {
             PointAppendDecision::Interpolate
         } else {
@@ -1664,9 +2223,7 @@ fn interpolation_step_count(
     distance: f32,
     settings: &AppSettings,
 ) -> usize {
-    let desired = (distance / configured_point_spacing_px(kind, settings))
-        .ceil()
-        .max(1.0) as usize;
+    let desired = (distance / max_interpolation_gap_px(kind)).ceil().max(1.0) as usize;
     if kind == EditKind::Fill {
         let remaining = settings
             .fill_draft_max_points()
@@ -1677,19 +2234,19 @@ fn interpolation_step_count(
     }
 }
 
-fn point_spacing_px(kind: EditKind, settings: &AppSettings) -> f32 {
+fn input_spacing_px(kind: EditKind, settings: &AppSettings) -> f32 {
     if kind == EditKind::Fill {
-        (settings.fill_point_spacing_px * 0.25).max(MIN_FILL_INPUT_SPACING_PX)
+        settings.fill_input_spacing_px
     } else {
-        (settings.brush_point_spacing_px * 0.25).max(MIN_BRUSH_INPUT_SPACING_PX)
+        settings.brush_input_spacing_px
     }
 }
 
-fn configured_point_spacing_px(kind: EditKind, settings: &AppSettings) -> f32 {
+fn max_interpolation_gap_px(kind: EditKind) -> f32 {
     if kind == EditKind::Fill {
-        settings.fill_point_spacing_px
+        MAX_FILL_INTERPOLATION_GAP_PX
     } else {
-        settings.brush_point_spacing_px
+        MAX_BRUSH_INTERPOLATION_GAP_PX
     }
 }
 
@@ -1711,22 +2268,28 @@ fn bookmark_edit_names(bookmarks: &[Bookmark]) -> HashMap<Uuid, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_REPAINT_INTERVAL, FRAME_TIME_EMA_ALPHA, FrameRateTracker, MAX_BRUSH_SIZE,
-        MIN_BRUSH_SIZE, PointAppendDecision, TILE_POLL_REPAINT_INTERVAL, TileFallbackMode,
-        adjusted_brush_size, color_from_srgb, fast_stroke_fallback_shapes,
-        incremental_paint_operations, interpolation_step_count, point_append_decision,
-        prepare_draft_for_commit, primary_pointer_positions, repaint_interval_for_work,
-        set_straight_draft_endpoint, should_paint_fill_fallback, space_pan_requested,
+        FRAME_TIME_EMA_ALPHA, FrameRateTracker, MAX_BRUSH_SIZE,
+        MAX_FALLBACK_SMOOTHING_INPUT_POINTS, MIN_BRUSH_SIZE, PointAppendDecision,
+        TILE_POLL_REPAINT_INTERVAL, TileFallbackMode, adjusted_brush_size,
+        append_interpolated_points, clamp_quick_depth, clip_pos2_polygon, clip_pos2_polyline,
+        color_from_srgb, draft_is_committable, fast_stroke_fallback_shapes,
+        format_overlay_coordinate, incremental_paint_operations, interpolation_step_count,
+        parse_lateral_coordinate, point_append_decision, prepare_draft_for_commit,
+        primary_pointer_positions, repaint_interval_for_work, set_straight_draft_endpoint,
+        should_paint_fill_fallback, should_paint_live_draft, simplify_pos2_render_points,
+        smooth_pos2_draft, smooth_pos2_saved_fallback, space_pan_requested,
         straight_line_requested, tile_display_rects, tile_fallback_mode, tile_generation_is_paused,
-        z_drag_zoom_factor, z_zoom_requested, zoom_tile_requests_deferred_since,
+        tile_keys_for_view, tile_rebuild_deferred_since, z_drag_zoom_factor, z_zoom_requested,
+        zoom_tile_requests_deferred_since,
     };
-    use crate::coords::CanvasPoint;
+    use crate::coords::{CameraAddress, CanvasPoint};
     use crate::model::EditKind;
     use crate::model::{Color, EditOperation};
     use crate::settings::AppSettings;
     use crate::tile_cache::{TILE_BLEED, TILE_SIZE, tile_lod_for_resolution, tile_resolution};
-    use eframe::egui::{Color32, Event, Modifiers, PointerButton, Pos2, Shape};
+    use eframe::egui::{Color32, Event, Modifiers, PointerButton, Pos2, Rect, Shape};
     use num_bigint::BigInt;
+    use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1851,6 +2414,12 @@ mod tests {
     }
 
     #[test]
+    fn deferred_drawing_preview_skips_only_live_draft_painting() {
+        assert!(should_paint_live_draft(false));
+        assert!(!should_paint_live_draft(true));
+    }
+
+    #[test]
     fn primary_pointer_positions_preserve_all_drag_events_in_order() {
         let events = vec![
             Event::PointerMoved(Pos2::new(0.0, 0.0)),
@@ -1911,19 +2480,23 @@ mod tests {
             PointAppendDecision::Skip
         );
         assert_eq!(
-            point_append_decision(EditKind::Paint, 64.0, &settings),
+            point_append_decision(EditKind::Paint, 4.0, &settings),
+            PointAppendDecision::Append
+        );
+        assert_eq!(
+            point_append_decision(EditKind::Paint, 9.0, &settings),
             PointAppendDecision::Interpolate
         );
         assert_eq!(
-            point_append_decision(EditKind::Fill, 1.0, &settings),
+            point_append_decision(EditKind::Fill, 1.5, &settings),
             PointAppendDecision::Skip
         );
         assert_eq!(
-            point_append_decision(EditKind::Fill, 0.5, &settings),
-            PointAppendDecision::Skip
+            point_append_decision(EditKind::Fill, 3.0, &settings),
+            PointAppendDecision::Append
         );
         assert_eq!(
-            point_append_decision(EditKind::Fill, 64.0, &settings),
+            point_append_decision(EditKind::Fill, 5.0, &settings),
             PointAppendDecision::Interpolate
         );
     }
@@ -1935,7 +2508,7 @@ mod tests {
 
         assert_eq!(
             interpolation_step_count(EditKind::Fill, 10, 128.0, &settings),
-            11
+            32
         );
         assert_eq!(
             interpolation_step_count(
@@ -1957,22 +2530,16 @@ mod tests {
     }
 
     #[test]
-    fn drawing_settings_change_spacing_and_fill_limits() {
+    fn input_density_is_independent_from_interpolation_and_fill_limits() {
         let dense_settings = AppSettings {
-            brush_point_spacing_px: 4.0,
-            fill_point_spacing_px: 4.0,
+            brush_input_spacing_px: 0.75,
+            fill_input_spacing_px: 1.0,
             ..AppSettings::default()
         }
         .normalized();
         let sparse_settings = AppSettings {
-            brush_point_spacing_px: 64.0,
-            fill_point_spacing_px: 64.0,
-            ..AppSettings::default()
-        }
-        .normalized();
-        let very_sparse_settings = AppSettings {
-            brush_point_spacing_px: 1024.0,
-            fill_point_spacing_px: 1024.0,
+            brush_input_spacing_px: 8.0,
+            fill_input_spacing_px: 4.0,
             ..AppSettings::default()
         }
         .normalized();
@@ -1996,35 +2563,35 @@ mod tests {
         );
 
         assert_eq!(
-            point_append_decision(EditKind::Paint, 3.5, &dense_settings),
+            point_append_decision(EditKind::Paint, 1.0, &dense_settings),
             PointAppendDecision::Append
         );
         assert_eq!(
-            point_append_decision(EditKind::Paint, 32.0, &dense_settings),
+            point_append_decision(EditKind::Paint, 1.0, &sparse_settings),
+            PointAppendDecision::Skip
+        );
+        assert_eq!(
+            point_append_decision(EditKind::Paint, 10.0, &dense_settings),
             PointAppendDecision::Interpolate
         );
         assert_eq!(
-            point_append_decision(EditKind::Paint, 32.0, &sparse_settings),
-            PointAppendDecision::Append
-        );
-        assert!(
-            interpolation_step_count(EditKind::Paint, 0, 128.0, &dense_settings)
-                > interpolation_step_count(EditKind::Paint, 0, 128.0, &sparse_settings)
+            point_append_decision(EditKind::Paint, 10.0, &sparse_settings),
+            PointAppendDecision::Interpolate
         );
         assert_eq!(
-            point_append_decision(EditKind::Paint, 0.5, &dense_settings),
-            PointAppendDecision::Skip
+            interpolation_step_count(EditKind::Paint, 0, 128.0, &dense_settings),
+            interpolation_step_count(EditKind::Paint, 0, 128.0, &sparse_settings)
         );
         assert_eq!(
-            point_append_decision(EditKind::Paint, 120.0, &very_sparse_settings),
-            PointAppendDecision::Skip
-        );
-        assert_eq!(
-            point_append_decision(EditKind::Paint, 300.0, &very_sparse_settings),
+            point_append_decision(EditKind::Fill, 3.0, &dense_settings),
             PointAppendDecision::Append
         );
         assert_eq!(
-            point_append_decision(EditKind::Paint, 2048.0, &very_sparse_settings),
+            point_append_decision(EditKind::Fill, 3.0, &sparse_settings),
+            PointAppendDecision::Skip
+        );
+        assert_eq!(
+            point_append_decision(EditKind::Fill, 5.0, &sparse_settings),
             PointAppendDecision::Interpolate
         );
         assert!(!should_paint_fill_fallback(
@@ -2033,6 +2600,34 @@ mod tests {
             129,
             &fill_limited_settings
         ));
+    }
+
+    #[test]
+    fn final_endpoint_bypasses_sparse_input_threshold() {
+        let camera = CameraAddress::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(512.0, 512.0));
+        let start = camera.screen_to_canvas(256.0, 256.0, 512.0, 512.0);
+        let mut draft =
+            EditOperation::draft(EditKind::Paint, 0, 1.0, vec![start], Color::BLACK, 8.0);
+        let settings = AppSettings {
+            brush_input_spacing_px: 8.0,
+            ..AppSettings::default()
+        };
+
+        append_interpolated_points(
+            &mut draft,
+            &camera,
+            Pos2::new(261.0, 256.0),
+            rect,
+            &settings,
+        );
+
+        assert_eq!(draft.points.len(), 2);
+        let (x, y) = camera
+            .canvas_to_screen(&draft.points[1], 512.0, 512.0)
+            .expect("endpoint projects");
+        assert!((x - 261.0).abs() <= f64::EPSILON);
+        assert!((y - 256.0).abs() <= f64::EPSILON);
     }
 
     #[test]
@@ -2074,6 +2669,34 @@ mod tests {
 
         assert_eq!(erase.points.len(), 1);
         assert_eq!(fill.points.len(), 1);
+        assert!(!draft_is_committable(&erase));
+        assert!(!draft_is_committable(&fill));
+    }
+
+    #[test]
+    fn fill_requires_three_distinct_points_before_closure() {
+        let points = [
+            CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.1, 0.1),
+            CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.2, 0.1),
+            CanvasPoint::new(0, BigInt::from(0), BigInt::from(0), 0.2, 0.2),
+        ];
+        let mut too_short = EditOperation::draft(
+            EditKind::Fill,
+            0,
+            1.0,
+            points[..2].to_vec(),
+            Color::BLACK,
+            8.0,
+        );
+        let mut valid =
+            EditOperation::draft(EditKind::Fill, 0, 1.0, points.to_vec(), Color::BLACK, 8.0);
+
+        prepare_draft_for_commit(&mut too_short);
+        prepare_draft_for_commit(&mut valid);
+
+        assert!(!draft_is_committable(&too_short));
+        assert!(draft_is_committable(&valid));
+        assert_eq!(valid.points.first(), valid.points.last());
     }
 
     #[test]
@@ -2112,6 +2735,53 @@ mod tests {
     }
 
     #[test]
+    fn quick_depth_target_is_bounded_for_interactive_navigation() {
+        assert_eq!(clamp_quick_depth(i64::MIN), -10_000);
+        assert_eq!(clamp_quick_depth(-100), -100);
+        assert_eq!(clamp_quick_depth(100), 100);
+        assert_eq!(clamp_quick_depth(i64::MAX), 10_000);
+    }
+
+    #[test]
+    fn lateral_coordinate_parser_accepts_bounded_decimal_and_scientific_integers() {
+        assert_eq!(parse_lateral_coordinate("0"), Some(BigInt::from(0)));
+        assert_eq!(parse_lateral_coordinate("-123"), Some(BigInt::from(-123)));
+        assert_eq!(
+            parse_lateral_coordinate("1e100"),
+            Some(BigInt::from(10u8).pow(100))
+        );
+        assert_eq!(
+            parse_lateral_coordinate("-25E+3"),
+            Some(BigInt::from(-25_000))
+        );
+        assert!(parse_lateral_coordinate("1.5e3").is_none());
+        assert!(parse_lateral_coordinate("1e-3").is_none());
+        assert!(parse_lateral_coordinate("1e10000").is_none());
+        assert!(parse_lateral_coordinate("1e2e3").is_none());
+    }
+
+    #[test]
+    fn overlay_coordinate_formatter_bounds_extreme_bigints() {
+        assert_eq!(
+            format_overlay_coordinate(&BigInt::from(-123_456)),
+            "-123456"
+        );
+        assert_eq!(
+            format_overlay_coordinate(&BigInt::from(10u8).pow(100)),
+            "1e100"
+        );
+        assert_eq!(
+            format_overlay_coordinate(&-BigInt::from(10u8).pow(100)),
+            "-1e100"
+        );
+        let arbitrary = "123456789012345678901234567890".parse::<BigInt>().unwrap();
+        assert_eq!(
+            format_overlay_coordinate(&arbitrary),
+            "12345678...34567890 (30d)"
+        );
+    }
+
+    #[test]
     fn rgb_color_edit_produces_opaque_drawing_color() {
         assert_eq!(
             color_from_srgb([250, 240, 40]),
@@ -2135,6 +2805,71 @@ mod tests {
         assert_eq!(path.points, expected_points);
         assert!(matches!(shapes[1], Shape::Circle(_)));
         assert!(matches!(shapes[2], Shape::Circle(_)));
+    }
+
+    #[test]
+    fn saved_fallback_geometry_is_simplified_and_clipped() {
+        let dense: Vec<_> = (0..1000)
+            .map(|index| Pos2::new(index as f32 * 0.1, 5.0))
+            .collect();
+        let simplified = simplify_pos2_render_points(&dense, false);
+        assert_eq!(simplified.first(), dense.first());
+        assert_eq!(simplified.last(), dense.last());
+        assert!(simplified.len() < 10, "points={}", simplified.len());
+
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(10.0, 10.0));
+        let line = [
+            Pos2::new(-10.0, 5.0),
+            Pos2::new(5.0, 5.0),
+            Pos2::new(20.0, 5.0),
+        ];
+        let runs = clip_pos2_polyline(&line, rect);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].first(), Some(&Pos2::new(0.0, 5.0)));
+        assert_eq!(runs[0].last(), Some(&Pos2::new(10.0, 5.0)));
+
+        let polygon = [
+            Pos2::new(-5.0, -5.0),
+            Pos2::new(15.0, -5.0),
+            Pos2::new(15.0, 15.0),
+            Pos2::new(-5.0, 15.0),
+        ];
+        assert_eq!(clip_pos2_polygon(&polygon, rect).len(), 4);
+    }
+
+    #[test]
+    fn live_draft_smoothing_curves_sparse_mouse_corners() {
+        let points = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(10.0, 10.0),
+            Pos2::new(20.0, 0.0),
+        ];
+        let smoothed = smooth_pos2_draft(&points, 2);
+
+        assert_eq!(smoothed.first(), points.first());
+        assert_eq!(smoothed.last(), points.last());
+        assert!(smoothed.len() > points.len());
+        assert!(!smoothed.contains(&points[1]));
+        assert_eq!(smooth_pos2_draft(&points, 0), points);
+    }
+
+    #[test]
+    fn saved_fallback_smoothing_is_curved_and_bounded() {
+        let points = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(10.0, 10.0),
+            Pos2::new(20.0, 0.0),
+        ];
+        let smoothed = smooth_pos2_saved_fallback(&points, 2, false);
+
+        assert!(smoothed.len() > points.len());
+        assert!(!smoothed.contains(&points[1]));
+        assert_eq!(smooth_pos2_saved_fallback(&points, 0, false), points);
+
+        let oversized: Vec<_> = (0..=MAX_FALLBACK_SMOOTHING_INPUT_POINTS)
+            .map(|index| Pos2::new(index as f32, (index % 2) as f32))
+            .collect();
+        assert_eq!(smooth_pos2_saved_fallback(&oversized, 3, false), oversized);
     }
 
     #[test]
@@ -2196,23 +2931,91 @@ mod tests {
 
     #[test]
     fn repaint_interval_prioritizes_interaction_over_tile_polling() {
-        assert_eq!(repaint_interval_for_work(false, false, false), None);
+        let preview_interval = Duration::from_millis(33);
         assert_eq!(
-            repaint_interval_for_work(true, false, false),
-            Some(ACTIVE_REPAINT_INTERVAL)
+            repaint_interval_for_work(false, false, false, false, preview_interval),
+            None
         );
         assert_eq!(
-            repaint_interval_for_work(false, true, false),
+            repaint_interval_for_work(true, false, false, false, preview_interval),
+            Some(preview_interval)
+        );
+        assert_eq!(
+            repaint_interval_for_work(false, true, false, false, preview_interval),
             Some(TILE_POLL_REPAINT_INTERVAL)
         );
         assert_eq!(
-            repaint_interval_for_work(false, false, true),
-            Some(ACTIVE_REPAINT_INTERVAL)
+            repaint_interval_for_work(false, false, true, false, preview_interval),
+            Some(preview_interval)
         );
         assert_eq!(
-            repaint_interval_for_work(true, true, false),
-            Some(ACTIVE_REPAINT_INTERVAL)
+            repaint_interval_for_work(true, true, false, false, preview_interval),
+            Some(preview_interval)
         );
+        assert_eq!(
+            repaint_interval_for_work(false, false, false, true, preview_interval),
+            Some(preview_interval)
+        );
+        let slow_preview = Duration::from_millis(66);
+        assert_eq!(
+            repaint_interval_for_work(false, true, false, false, slow_preview),
+            Some(slow_preview)
+        );
+    }
+
+    #[test]
+    fn rebuild_deferral_expires_after_idle_interval() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(180);
+        let recent = now
+            .checked_sub(interval - Duration::from_millis(1))
+            .expect("test interval should be representable");
+        let settled = now
+            .checked_sub(interval + Duration::from_millis(1))
+            .expect("test interval should be representable");
+
+        assert!(tile_rebuild_deferred_since(Some(recent), now, interval));
+        assert!(!tile_rebuild_deferred_since(Some(settled), now, interval));
+        assert!(!tile_rebuild_deferred_since(None, now, interval));
+    }
+
+    #[test]
+    fn tile_requests_prioritize_visible_tiles_before_prefetch_rings() {
+        let camera = CameraAddress::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(512.0, 512.0));
+        let lod = tile_lod_for_resolution(64);
+
+        let visible = tile_keys_for_view(&camera, rect, lod, 0);
+        let radius_one = tile_keys_for_view(&camera, rect, lod, 1);
+        let radius_two = tile_keys_for_view(&camera, rect, lod, 2);
+
+        assert_eq!(visible.len(), 4);
+        assert_eq!(radius_one.len(), 16);
+        assert_eq!(radius_two.len(), 36);
+        assert_eq!(&radius_one[..visible.len()], visible.as_slice());
+        assert_eq!(&radius_two[..visible.len()], visible.as_slice());
+        assert_eq!(&radius_two[..radius_one.len()], radius_one.as_slice());
+    }
+
+    #[test]
+    fn visible_tile_keys_preserve_extreme_camera_depths() {
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let lod = tile_lod_for_resolution(512);
+
+        for depth in [-1000, -100, 100, 1000] {
+            let camera = CameraAddress {
+                depth,
+                ..CameraAddress::default()
+            };
+            let keys = tile_keys_for_view(&camera, rect, lod, 2);
+            assert!(!keys.is_empty());
+            assert!(keys.iter().all(|key| key.depth == depth));
+            assert_eq!(
+                keys.iter().collect::<HashSet<_>>().len(),
+                keys.len(),
+                "depth={depth}"
+            );
+        }
     }
 
     #[test]

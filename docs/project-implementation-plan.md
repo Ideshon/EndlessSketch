@@ -1,6 +1,6 @@
 # План EndlessSketch
 
-Обновлено: 2026-06-27
+Обновлено: 2026-06-29
 
 ## Выполнено
 
@@ -17,11 +17,11 @@
 - [x] Исправлены швы тайлов на depth 25.
 - [x] Ограничены tile queue и GPU textures для защиты от wgpu Out of Memory.
 - [x] Fast zoom: отмена устаревших задач и задержка качественных тайлов до завершения zoom.
-- [x] Settings с сохранением Brush/Fill spacing, Fill limits, zoom settle и tile workers.
+- [x] Settings с сохранением Brush/Fill input density, Fill limits, zoom settle и tile workers.
 - [x] Сглаживание Brush/Eraser и ускоренная scanline-растеризация Fill.
 - [x] Адаптивный repaint без постоянного idle-цикла 60 FPS.
 - [x] Opaque Performance Mode: точная прозрачность отключена, исходная alpha остаётся в документе.
-- [x] Быстрый прямой opaque raster path; текущая версия raster cache 5.
+- [x] Быстрый прямой opaque raster path; текущая версия raster cache 7.
 - [x] Разрешения тайлов `64/128/256/512/1024/2048 px` с сохранением выбора.
 
 ## Текущий приоритет: FPS на насыщенном холсте
@@ -43,19 +43,24 @@
 - [x] Добавить профили `Performance`, `Balanced`, `Quality` и автоматически определяемый `Custom`. Ручная проверка пройдена.
 - [x] Добавить инкрементальное обновление тайлов для непрозрачного Paint; Fill, Eraser и недоступный base PNG используют полный rebuild. Ручная проверка пройдена.
 - [x] Добавить `Pause tile generation while drawing` с автоматическим возобновлением после завершения штриха. Ручная проверка пройдена: отсутствие визуальной разницы при уже готовых тайлах ожидаемо, постоянная ручная пауза остаётся независимой.
-- [ ] Добавить настройки rebuild policy и prefetch.
-- [ ] Добавить независимые edge quality и smoothing.
-- [ ] Добавить cache size, PNG compression и preview FPS.
-- [ ] Добавить render-time clipping и упрощение плотной геометрии без изменения сохранённых операций.
-- [ ] Переработать Brush/Fill quality settings:
-  разделить плотность входных точек и силу сглаживания. Текущий spacing `4..1024 px` не подходит как настройка качества: большие значения сглаживают сильнее, но ломают малые объекты и плавные повороты.
+- [x] Добавить настройки rebuild policy и prefetch: `Immediate`/`After interaction`, ожидание 180 мс и радиус `0..2` с приоритетом видимых тайлов. Ручная проверка пройдена.
+- [x] Добавить независимые edge quality и smoothing с отдельными cache namespaces и без изменения input density/сохранённых точек. Ручная проверка пройдена.
+- [x] Добавить cache size `128..8192 MiB`, PNG compression `Fast/Balanced/Small` и preview `15..120 FPS`. Ручная проверка пройдена.
+- [x] Добавить render-time clipping и упрощение плотной геометрии с допуском `0.25 px` без изменения сохранённых операций. Ручная проверка пройдена.
+- [x] Переработать Brush/Fill quality settings: Brush input `0.75..8 px`, Fill input `1..4 px`, фиксированные interpolation gaps `8/4 px`, независимый Smoothing и обязательный release endpoint. Ручная проверка подтвердила независимость input, но мышь сохраняет угловатые кривые.
+- [x] Добавить адаптивное quadratic curve smoothing для разреженного mouse-ввода в live draft и cached tiles, почти не меняя плотный stylus-ввод. Ручная проверка показала, что после отпускания saved fallback оставался raw.
+- [x] Применить bounded adaptive Smoothing к сохранённому full/retained fallback до готовности тайла: Brush обрезается до экрана перед сглаживанием, Fill сглаживается до polygon clipping, обработка отключается свыше `4096` входных или `8192` выходных точек. Нужна ручная проверка мышью с паузой тайлов.
+- [x] На Windows восстанавливать до `64` промежуточных mouse samples через системную историю `GetMouseMovePointsEx` для активного draft. Использовать существующие egui events при недоступной истории или потерянном маркере; не менять сглаживание, тайлы или формат сохранения. Ручная проверка: траектория мыши стала намного лучше; в активном vector draft при `Smoothing: Off` остаются мелкие ступени между целочисленными screen-coordinate samples.
+- [x] Перед adaptive curve smoothing удалять малый mouse-history jitter с допуском `0.45/0.9/1.5 px` для `Light/Balanced/Strong`. `Off` сохраняет исходные точки; error-bounded RDP работает окнами максимум `64` точки или `32 px`, не увеличивает геометрию и не меняет сохранённые операции. Raster cache version `8`. Ручная проверка: сглаживание заметно улучшает контур, высокий Input также устраняет артефакт; минимальный Input с `Off` ожидаемо показывает острые raw vector joins.
+- [x] Добавить persisted `Deferred drawing preview` для слабых CPU: во время активного Brush/Eraser/Fill собирать и autosave-ить input без проекции, Smoothing и тесселяции растущего draft; показать обработанную операцию после release. Settings version `10`, по умолчанию выключено. Функциональная ручная проверка пройдена; замер производительности на слабом ПК отложен.
 
 ## Следующий этап
 
-- [ ] Проверить и оптимизировать depth `-100..+100`.
-- [ ] Проверить и оптимизировать depth `-1000..+1000`.
-- [ ] Проверить большие боковые смещения от origin.
-- [ ] Повторить на экстремальных координатах рисование, Fill, undo/redo, bookmarks и восстановление после перезапуска.
+- [x] Проверить и оптимизировать depth `-100..+100`: camera/tile projection, spatial index, Brush width, SQLite operation/bookmark round-trip и ручные Brush, Fill, undo/redo, bookmark/reopen прошли. Spatial query переиспользует BigInt scale по target/source depth; на stress `1M/201 bands` три viewport queries ускорились примерно с `2.41 s` до `1.72 s`. Toolbar jump `-10000..10000` также вручную проверен на depth `1000` и `10000`.
+- [x] Проверить и оптимизировать depth `-1000..+1000`: stress `1M/2001 bands` прошёл (`1.33 s` index, `1.65 s` на три viewport query). Same-depth camera/tile/spatial/raster/SQLite coverage на ±1000, projection-cache reset/cull через 2000 уровней и ручные Brush, Fill, undo/redo, bookmark/reopen на обоих краях прошли.
+- [x] Проверить большие боковые смещения от origin: toolbar jump по абсолютным BigInt tile X/Y с decimal/`1eN`, быстрый возврат к origin и автоматические projection-cache/spatial/SQLite проверки на `10^1000` готовы; `113/113` тестов и ручная проверка прошли.
+- [x] Повторить на экстремальных координатах рисование, Fill, undo/redo, bookmarks и восстановление после перезапуска. Ручная проверка пройдена.
+- [x] Добавить постоянно обновляемое отображение текущих tile X/Y и local X/Y в canvas overlay с компактным форматом огромных BigInt. Ручная проверка пройдена.
 
 ## Позже
 
@@ -69,7 +74,8 @@
 - [ ] Импорт изображений.
 - [ ] GPU-native tile rasterization.
 - [ ] Installer, signing и финальная release packaging.
+- [ ] Добавить лёгкую визуальную trailing-линию во время `Deferred drawing preview`, не запуская обработку и тесселяцию полного растущего draft.
 
 ## Ближайший пункт
 
-Добавить настройки rebuild policy и prefetch.
+Начать возврат точной прозрачности с отдельного профилирования CPU/GPU-пути и определить вариант композитинга без прежних штрихов и падения FPS.

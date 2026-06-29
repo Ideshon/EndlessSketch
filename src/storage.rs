@@ -510,6 +510,71 @@ mod tests {
     }
 
     #[test]
+    fn extreme_depth_operations_and_bookmarks_survive_reopen() -> Result<()> {
+        let temporary = TempDir::new()?;
+        let root = temporary.path().join("test.esketch");
+        {
+            let mut store = CanvasStore::open(&root)?;
+            for depth in [-1000, -100, 100, 1000] {
+                let mut operation = EditOperation::draft(
+                    EditKind::Paint,
+                    depth,
+                    1.0,
+                    vec![
+                        CanvasPoint::new(
+                            depth,
+                            BigInt::from(10u8).pow(1000),
+                            -BigInt::from(10u8).pow(1000),
+                            0.1,
+                            0.2,
+                        ),
+                        CanvasPoint::new(
+                            depth,
+                            BigInt::from(10u8).pow(1000),
+                            -BigInt::from(10u8).pow(1000),
+                            0.3,
+                            0.4,
+                        ),
+                    ],
+                    Color::BLACK,
+                    5.0,
+                );
+                store.commit(&mut operation)?;
+                store.save_bookmark(
+                    &format!("Depth {depth}"),
+                    &CameraAddress {
+                        depth,
+                        tile_x: BigInt::from(10u8).pow(1000),
+                        tile_y: -BigInt::from(10u8).pow(1000),
+                        ..CameraAddress::default()
+                    },
+                )?;
+            }
+            store.checkpoint()?;
+        }
+
+        let store = CanvasStore::open(&root)?;
+        let operations = store.load_active_operations()?;
+        let bookmarks = store.load_bookmarks()?;
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| operation.native_depth)
+                .collect::<Vec<_>>(),
+            vec![-1000, -100, 100, 1000]
+        );
+        assert_eq!(
+            bookmarks
+                .iter()
+                .map(|bookmark| bookmark.camera.depth)
+                .collect::<Vec<_>>(),
+            vec![-1000, -100, 100, 1000]
+        );
+        store.integrity_check()?;
+        Ok(())
+    }
+
+    #[test]
     fn content_revision_is_monotonic_across_reopen_and_undo() -> Result<()> {
         let temporary = TempDir::new()?;
         let root = temporary.path().join("test.esketch");

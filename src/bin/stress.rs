@@ -10,11 +10,19 @@ fn main() {
         .nth(1)
         .and_then(|argument| argument.parse::<usize>().ok())
         .unwrap_or(1_000_000);
-    println!("generating {operation_count} operations across 12 depth bands");
+    let depth_radius = std::env::args()
+        .nth(2)
+        .and_then(|argument| argument.parse::<i64>().ok())
+        .unwrap_or(6)
+        .clamp(0, 10_000);
+    let depth_band_count = depth_radius.saturating_mul(2).saturating_add(1);
+    println!(
+        "generating {operation_count} operations across {depth_band_count} depth bands (-{depth_radius}..+{depth_radius})"
+    );
 
     let generation_started = Instant::now();
     let operations: Vec<_> = (0..operation_count)
-        .map(|index| synthetic_operation(index as u64))
+        .map(|index| synthetic_operation(index as u64, depth_radius))
         .collect();
     let generation_time = generation_started.elapsed();
 
@@ -24,27 +32,48 @@ fn main() {
 
     let query_started = Instant::now();
     let mut total_matches = 0usize;
-    for y in -3..=3 {
-        for x in -3..=3 {
-            total_matches += index
-                .query(&TileKey {
-                    depth: 0,
-                    x: BigInt::from(x),
-                    y: BigInt::from(y),
-                    lod: 0,
-                })
-                .len();
+    let query_groups: Vec<Vec<_>> = [-depth_radius, 0, depth_radius]
+        .into_iter()
+        .map(|depth| {
+            let mut keys = Vec::with_capacity(49);
+            for y in -3..=3 {
+                for x in -3..=3 {
+                    keys.push(TileKey {
+                        depth,
+                        x: BigInt::from(x),
+                        y: BigInt::from(y),
+                        lod: 0,
+                    });
+                }
+            }
+            keys
+        })
+        .collect();
+    for keys in &query_groups {
+        for key in keys {
+            total_matches += index.query(key).len();
         }
     }
     let query_time = query_started.elapsed();
 
-    println!("generation: {generation_time:.2?}");
-    println!("indexing:   {indexing_time:.2?}");
-    println!("49 queries: {query_time:.2?} ({total_matches} total matches)");
+    let batched_query_started = Instant::now();
+    let mut batched_total_matches = 0usize;
+    for keys in &query_groups {
+        batched_total_matches += index.query_many(keys).len();
+    }
+    let batched_query_time = batched_query_started.elapsed();
+
+    println!("generation:          {generation_time:.2?}");
+    println!("indexing:            {indexing_time:.2?}");
+    println!("147 tile queries:    {query_time:.2?} ({total_matches} total matches)");
+    println!(
+        "3 viewport queries:  {batched_query_time:.2?} ({batched_total_matches} unique matches)"
+    );
 }
 
-fn synthetic_operation(index: u64) -> EditOperation {
-    let depth = (index % 12) as i64;
+fn synthetic_operation(index: u64, depth_radius: i64) -> EditOperation {
+    let depth_band_count = depth_radius.saturating_mul(2).saturating_add(1) as u64;
+    let depth = (index % depth_band_count) as i64 - depth_radius;
     let pseudo_x = mix(index) as i64 % 20_000 - 10_000;
     let pseudo_y = mix(index ^ 0x9e37_79b9_7f4a_7c15) as i64 % 20_000 - 10_000;
     EditOperation::draft(

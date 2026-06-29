@@ -66,6 +66,25 @@
     "Completed checkpoint manually confirmed: derived Performance, Balanced, Quality, and Custom profiles manage only tile resolution, worker count, and zoom settle timing.",
     "Completed checkpoint manually confirmed: opaque Paint-only tile deltas update from retained PNG bases, with automatic full-rebuild fallback for Fill, Eraser, history changes, and unavailable bases.",
     "Completed checkpoint manually confirmed: persisted automatic tile-generation pause cancels queued work during Brush/Eraser/Fill drafts and resumes current-view eligibility afterward without changing manual pause; no visual difference is expected when tiles are already complete.",
+    "Completed checkpoint manually confirmed: settings version 6 adds Immediate/After interaction rebuild policy, a backward-compatible prefetch radius 0..2, visible-first ring ordering, and core-visible fallback independent from missing off-screen prefetch tiles.",
+    "Completed checkpoint manually confirmed: settings version 7 adds independent Performance/Balanced/Quality edge coverage and Off/Light/Balanced/Strong smoothing, with render-quality-specific PNG cache namespaces.",
+    "Completed documentation checkpoint: docs/settings-reference.md explains every current setting, default, range, performance tradeoff, persistence behavior, and planned setting.",
+    "Completed checkpoint manually confirmed: settings version 8 adds a 128..8192 MiB cache budget, Fast/Balanced/Small PNG encoding, and 15..120 Preview FPS with bounded tile polling.",
+    "Completed checkpoint manually confirmed: saved geometry above 256 projected points is simplified with a 0.25 px render-only tolerance and clipped to screen/tile bounds; live drafts and stored operations remain unchanged, and raster cache version is 6.",
+    "Completed checkpoint pending manual confirmation: settings version 9 replaces legacy 4..1024 spacing with independent Brush input 0.75..8 px and Fill input 1..4 px, fixed 8/4 px interpolation gaps, preserved release endpoints, and minimum valid Fill geometry.",
+    "Completed corrective checkpoint pending manual confirmation: adaptive quadratic Smoothing curves sparse mouse corners in live drafts and cached tiles, skips straight/gentle dense stylus changes, and uses raster cache version 7.",
+    "Completed saved-fallback correction pending manual confirmation: full/retained fallback now receives bounded adaptive Smoothing after release; Brush clips visible runs first, Fill smooths before polygon clipping, and geometry above 4096 input or 8192 output points stays raw.",
+    "Completed Windows mouse-history checkpoint manually confirmed: active drafts recover up to 64 system mouse samples between UI frames, the mouse trajectory is much better, and normal egui events remain the fallback.",
+    "Completed smoothing jitter-prefilter checkpoint manually confirmed: enabled smoothing visibly improves the mouse contour, higher Input is also clean, and minimum Input plus Off intentionally exposes sharp raw vector joins.",
+    "Completed settings-v10 Deferred drawing preview checkpoint manually confirmed functionally: optional weak-CPU mode captures/autosaves the full draft but skips active projection, smoothing, and tessellation until release; weak-PC performance measurement remains pending.",
+    "Depth -100..+100 automated checkpoint passed pending manual validation: six cross-module regressions pass and grouped spatial queries reuse BigInt depth scales, improving the 1M/201-band three-viewport stress from about 2.41s to 1.72s.",
+    "Completed direct depth-jump checkpoint manually confirmed at depths 1000 and 10000: the second toolbar row accepts -10000..10000 and Go/Enter, preserves the visible center at the target, and invalidates stale tile work.",
+    "Completed depth -100..+100 checkpoint manually confirmed: navigation, Brush, Fill, undo/redo, bookmark return, and reopen work after automated cross-module coverage and grouped spatial-query optimization.",
+    "Depth -1000..+1000 automated checkpoint passed pending manual validation: same-depth camera/tile/spatial/raster/storage behavior works, cross-depth projection resets/culls safely, and 1M/2001-band viewport stress is 1.65s for three queries.",
+    "Completed depth -1000..+1000 checkpoint manually confirmed: Brush, Fill, undo/redo, bookmark return, and reopen work at both edges after automated and stress validation.",
+    "Large lateral displacement implementation is ready for manual validation: the third toolbar row accepts absolute BigInt tile X/Y in decimal or integer scientific notation, Origin returns to tile 0/0, and projection/spatial/storage regressions pass around 10^1000.",
+    "Completed large lateral displacement checkpoint manually confirmed: direct BigInt tile X/Y navigation and return to origin work at practical extreme coordinates.",
+    "Completed current-coordinate overlay checkpoint manually confirmed: tile X/Y and local X/Y update correctly during navigation, with cached bounded formatting for extreme BigInt values.",
     "Priority 1: stabilize interaction FPS on stroke-dense depth 0 before implementing any remaining settings; presets and other controls are blocked until drawing/navigation is responsive.",
     "Priority 2: optimize and test very large depths and distances from origin, including -100..+100, -1000..+1000, and large lateral offsets.",
     "Priority 10: lower-priority backlog group includes Save As, Selection tools, selected-content delete/edit, configurable hotkeys, eraser fill mode, optional manual layers, image import, GPU-native tile tessellation, installer/signing, release packaging, profiling, and extended manual testing.",
@@ -92,7 +111,8 @@
     "Priority 10: Optional named manual layers in addition to automatic depth levels.",
     "Priority 10: Image import and asset placement.",
     "Priority 10: GPU-native tile tessellation for faster cold cache generation.",
-    "Priority 10: Windows installer packaging and signing."
+    "Priority 10: Windows installer packaging and signing.",
+    "Priority 10 final: Add a lightweight trailing guide line during Deferred drawing preview without projecting, smoothing, or tessellating the complete growing draft."
   ],
   "rules": [
     {
@@ -133,8 +153,8 @@
     }
   ],
   "request_analysis": {
-    "updated_at_utc": "2026-06-27T18:05:00Z",
-    "request": "User confirmed automatic drawing pause behavior, requested recording status, updating the plan document, and publishing the latest Rust branch to GitHub.",
+    "updated_at_utc": "2026-06-29T00:35:00Z",
+    "request": "User manually confirmed the coordinate overlay and asks for the next plan item.",
     "analysis": [
       "Retained last-complete tiles with newer-operation overlay are manually confirmed as working.",
       "Visible-tile spatial culling is now manually confirmed as working.",
@@ -560,56 +580,235 @@
       "Future planning: after performance/quality settings, add optimization and test passes for very large depths and lateral distances from origin, including -100..+100 and -1000..+1000 style ranges.",
       "Future low-priority items after the settings menu: configurable hotkeys and eraser fill mode.",
       "New known rendering defect: at depth 25 and zoom around 1.x, intermittent thin vertical seams appear between large filled/tiled regions; changing zoom usually hides them.",
-      "Workflow update: future implementation should be split into smaller checkpoints and stop after each meaningful interaction change for user feedback."
+      "Workflow update: future implementation should be split into smaller checkpoints and stop after each meaningful interaction change for user feedback.",
+      "Current checkpoint: add persisted Immediate and After interaction tile rebuild policies without changing authoritative vector storage or cache safety.",
+      "Expose the existing implicit one-tile prefetch margin as a persisted 0..2 tile radius, defaulting to 1 for backward-compatible behavior.",
+      "Separate core visible tiles from prefetch requests so missing off-screen prefetched tiles cannot force full vector fallback.",
+      "Queue visible tiles before prefetch rings and cancel queued rebuilds once when interaction deferral starts.",
+      "Implemented settings version 6 with TileRebuildPolicy and tile_prefetch_radius; legacy files default to Immediate and radius 1.",
+      "After interaction cancels queued generations once at input start, keeps retained tiles visible, and resumes tile requests after 180 ms of idle time.",
+      "Visible tiles are requested first, followed by prefetch rings 1 and 2; drawing and fallback completeness use only the core visible set.",
+      "Passed 76 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release.",
+      "Refreshed the portable executable and verified its SHA-256 matches target/release.",
+      "User manually confirmed rebuild policy and prefetch appear to work; that checkpoint is closed.",
+      "Current checkpoint: document every current and planned setting, then add independent edge quality and smoothing controls.",
+      "Preserve current raster behavior as the Balanced defaults: analytic stroke edges, 4x4 Fill coverage, and two Chaikin passes.",
+      "Use separate cache namespaces for edge quality and smoothing so switching either setting cannot load incompatible PNG tiles.",
+      "Created docs/settings-reference.md with current profiles, input geometry, fallback, tile generation, raster quality, and planned controls.",
+      "Implemented settings version 7 with EdgeQuality and SmoothingLevel defaults that preserve previous Balanced raster behavior.",
+      "Performance edges use binary stroke and 1x Fill coverage; Balanced uses analytic stroke and 4x4 Fill coverage; Quality uses 2x2 stroke and 8x8 Fill supersampling.",
+      "Smoothing now independently maps Off/Light/Balanced/Strong to 0/1/2/3 Chaikin passes without changing spacing or stored points.",
+      "TileCache paths include stable edge/smoothing tags, and incremental rendering uses the same configured RasterOptions as full rebuild.",
+      "Passed 79 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release.",
+      "Refreshed the portable executable and verified its SHA-256 matches target/release.",
+      "User manually confirmed independent edge quality and smoothing work; that checkpoint is closed.",
+      "Current checkpoint: add persisted cache size, PNG compression, and preview FPS controls.",
+      "Cache size uses a logarithmic 128..8192 MiB range with the existing 2048 MiB default.",
+      "PNG compression uses Fast, Balanced, and Small modes; Fast remains the default to preserve current encoder behavior.",
+      "Preview FPS uses 15..120 with default 60; active fallback follows it while completed-tile polling remains capped at the existing 50 ms minimum interval.",
+      "Implemented settings version 8 with backward-compatible 2048 MiB, Fast PNG, and 60 FPS defaults.",
+      "TileCache now receives an explicit byte budget and PNG encoder mode; periodic cleanup applies the configured budget and all modes round-trip identical pixels.",
+      "Active draft/zoom/rebuild-wait repaint uses Preview FPS, while pending tile polling uses the slower of Preview FPS and the existing 50 ms interval.",
+      "Updated docs/settings-reference.md, README, portable notes, and the implementation plan.",
+      "Passed 81 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release.",
+      "Refreshed the portable executable and verified its SHA-256 matches target/release.",
+      "User manually confirmed cache size, PNG compression, and Preview FPS appear to work; that checkpoint is closed.",
+      "The next implementation checkpoint is render-time clipping and dense geometry simplification without changing stored operations.",
+      "Use a fixed 0.25 px render-only tolerance and apply simplification only to dense saved geometry, never drafts or stored operations.",
+      "Clip smoothed raster polygons and polylines to tile bounds, and clip simplified vector fallback geometry to the visible screen bounds.",
+      "Bump the tile renderer cache version because fixed render geometry behavior changes cached pixels.",
+      "Added shared dense geometry simplification, Liang-Barsky polyline clipping, and Sutherland-Hodgman polygon clipping helpers.",
+      "Cached raster simplifies dense projected points before smoothing, clips smoothed Fill to image bounds, and clips stroke centerlines to width-expanded image bounds.",
+      "Saved full and retained vector fallback simplifies dense geometry and clips it to the viewport; live drafts stay unsimplified.",
+      "Sparse geometry at or below 256 points is returned unchanged, and all optimization uses temporary f32 render coordinates only.",
+      "Bumped TILE_RENDERER_CACHE_VERSION to 6 and updated README, settings reference, portable notes, status, and plan.",
+      "Passed 86 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release.",
+      "Refreshed the portable executable and verified its SHA-256 matches target/release.",
+      "User manually confirmed clipping and simplification appear normal; that checkpoint is closed.",
+      "The next implementation checkpoint is redesigning Brush/Fill quality settings so input point density is independent from visual smoothing.",
+      "Settings version 9 replaces the old 4..1024 point spacing semantics with Brush input spacing 0.75..8 px and Fill input spacing 1..4 px.",
+      "Legacy spacing values reset to safe 3 px Brush and 2 px Fill defaults because their former interpolation/smoothing semantics are incompatible.",
+      "Maximum interpolation gaps become fixed at 8 px for Brush/Eraser and 4 px for Fill, independent from input density and tile Smoothing.",
+      "Always preserve the final release endpoint so short strokes remain possible at the least dense input setting.",
+      "Implemented settings version 9 with serde aliases for legacy spacing keys and safe 3 px Brush / 2 px Fill migration defaults.",
+      "Brush/Fill input controls now affect only pointer sample acceptance; interpolation step counts use fixed 8 px and 4 px limits independent from density and Smoothing.",
+      "Pointer release preserves the final endpoint and interpolates a large final gap; Fill with fewer than three distinct points is discarded.",
+      "Updated Settings labels, README, settings reference, portable notes, status, and plan.",
+      "Passed 88 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release.",
+      "Refreshed the portable executable and verified its SHA-256 matches target/release.",
+      "Manual result: input density is now visually independent as intended, but linear interpolation cannot reconstruct curvature between sparse mouse samples.",
+      "Stylus input already supplies dense points and therefore appears smooth; device type is not required if smoothing adapts to projected segment spacing.",
+      "Corrective checkpoint: replace repeated corner-cutting with bounded adaptive quadratic corner curves for cached Brush/Fill and live drafts.",
+      "The prior correction targeted active live draft, but the visible defect is the saved full/retained fallback immediately after release.",
+      "Apply bounded adaptive smoothing to saved fallback: clip Brush runs before smoothing, smooth Fill before polygon clipping, and cap output at 8192 points.",
+      "Keep saved vector points unchanged and fall back to raw rendering when the smoothing budget is exceeded.",
+      "Replaced repeated Chaikin corner cutting with bounded adaptive quadratic corners controlled by Light/Balanced/Strong.",
+      "Turn thresholds avoid processing straight and gentle dense input; each detected corner is capped at 16 tessellation samples.",
+      "Applied adaptive smoothing to the single active Brush/Eraser/Fill draft and cached raster, while saved full/retained fallback remains raw.",
+      "Bumped raster cache version to 7 and updated README, settings reference, portable notes, status, and plan.",
+      "Passed 92 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release.",
+      "Refreshed the portable executable and verified its SHA-256 matches target/release.",
+      "Applied the same adaptive Smoothing to saved full/retained fallback shown after pointer release and before replacement tiles are ready.",
+      "Brush fallback is clipped to visible runs before smoothing; Fill is smoothed before polygon clipping to preserve closure.",
+      "Saved vector operations remain unchanged, and fallback smoothing returns raw geometry above 4096 input or 8192 generated points.",
+      "Added focused saved-fallback curvature, Off-mode identity, and input-budget tests.",
+      "Passed 93 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release.",
+      "Refreshed the portable executable and verified SHA-256 1884A0D10B1E898C267AFA2C7F89C3324B2566799C36B0B7E3FED66B1C82EE59 matches target/release."
+      ,"The remaining defect is input capture, not curve rendering: mouse events are sparse, while the tablet supplies dense samples."
+      ,"Linear interpolation inserts points only along the known chord and therefore cannot reconstruct curvature that occurred between two mouse events."
+      ,"Use the Windows GetMouseMovePointsEx history to recover up to 64 display-coordinate samples between UI frames, with existing egui events as a fallback."
+      ,"Keep the change limited to active primary-button drafts; do not alter Smoothing, tile rasterization, stored operations, or stylus-specific behavior."
+      ,"Added a Windows-only MouseHistory adapter backed by GetMouseMovePointsEx in display-coordinate mode and DPI-aware client/screen conversion."
+      ,"A press-time sample becomes the history marker; each frame consumes only newer samples in chronological order, and a missing marker falls back to egui without replaying old global input."
+      ,"Recovered history replaces egui drag positions only when it contains more samples, preserving existing input behavior when the API provides no benefit."
+      ,"Added tests for signed multi-monitor display coordinates and newest-first history extraction."
+      ,"Updated README, settings reference, portable notes, plan, and status for the separate pre-interpolation mouse capture stage."
+      ,"Passed 95 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable and verified SHA-256 F77027701D69FD354EECC1D4EF22CD778DE233296E83B4A232507EB8C9FC86A8 matches target/release."
+      ,"Manual result: fast mouse circles retain their trajectory much better after history capture."
+      ,"Correction: tile generation was disabled and does not contribute to the remaining artifact."
+      ,"The remaining fine staircase is vector geometry connecting integer display-coordinate mouse-history samples in the active draft with Smoothing Off."
+      ,"Do not add another quality setting yet: existing Smoothing controls visual curve filtering, and Brush input px already bounds retained sample density."
+      ,"Next manual check is Balanced smoothing with mouse history active; revisit a separate history-quality toggle only if measured FPS or document-size growth becomes material."
+      ,"Strong manual comparison confirms the adaptive corner curve follows the quantized staircase instead of filtering its small deviations."
+      ,"Add a bounded prefilter before adaptive curves: remove points whose deviation from the local path is below a level-specific screen-space tolerance."
+      ,"Keep Off byte-for-byte raw, preserve open endpoints and closed Fill topology, never increase prefilter point count, and leave stored operations unchanged."
+      ,"Apply the prefilter through the shared smoothing functions so live draft, saved fallback, and cached tiles remain visually consistent; bump the raster cache version."
+      ,"User asked whether unprocessed mouse drawing can be both smooth and faithful; it cannot because the recovered mouse source is a sequence of integer display coordinates. The alternatives are raw stair steps, sparse angular chords, or bounded filtering/curve fitting."
+      ,"Implemented level-specific 0.45/0.9/1.5 px jitter tolerances before adaptive curves; Off bypasses both filtering and curve generation."
+      ,"Used exact Ramer-Douglas-Peucker within bounded windows of at most 64 points or 32 px path length, capped at 8192 source points, so pathological long zigzags cannot cause unbounded quadratic work."
+      ,"Open endpoints and closed Fill topology are preserved; stored operations remain unchanged and the prefilter never increases source point count."
+      ,"Added tests for integer diagonal staircase removal, bounded dense stylus deviation, closed-ring validity, Off identity, and output limits."
+      ,"Bumped raster cache version to 8 and updated README, settings reference, portable notes, plan, and status."
+      ,"Passed 97 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable and verified SHA-256 A696E0BD361CDB148E0310C2AF0290DFDA8249A391E23CB9E30828444112E02D matches target/release."
+      ,"Final manual result: enabled Smoothing visibly improves the recovered mouse contour, and increasing Input also produces a clean line."
+      ,"Minimum 0.75 px Input plus Off remains an intentional raw diagnostic combination: every integer mouse sample and sharp vector join is retained."
+      ,"Close the mouse-history and jitter-filter block without another Settings control; the next fresh-context plan item is depth -100..+100 validation."
+      ,"Insert a bounded weak-PC checkpoint before extreme-depth work: persisted Deferred drawing preview, default false."
+      ,"When enabled, continue normal pointer history recovery, spacing, interpolation, draft autosave, release endpoint preservation, and commit, but skip active draft smoothing/tessellation until pointer release."
+      ,"After release, the committed operation appears through the normal saved fallback/tile path, so final quality and document format remain unchanged."
+      ,"This targets live-draft CPU contention and 64-sample history overflow; it cannot eliminate stalls caused by full-scene fallback or SQLite draft autosave."
+      ,"Implemented settings version 10 with deferred_drawing_preview default false, serde-default migration, JSON round-trip, normalization, and performance-profile preservation."
+      ,"Added the Deferred drawing preview checkbox without tile scheduler or cache invalidation because it changes only active draft painting."
+      ,"When enabled, paint_draft exits before point projection, jitter filtering, adaptive curves, and egui tessellation; input collection, interpolation, autosave, release commit, fallback, and tiles remain unchanged."
+      ,"Added a focused paint-gate test and updated README, settings reference, portable notes, plan, and status."
+      ,"Passed 98 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable and verified SHA-256 B1D20F463D0DA6C2A01261D3D217E6880E1B84299CEFDA78CFC8BFCD8C020511 matches target/release."
+      ,"Manual functional validation passed: Deferred drawing preview captures the gesture and displays the result after release."
+      ,"Weak-PC performance validation remains deferred because the user cannot measure it now."
+      ,"Added a final low-priority plan item for a lightweight trailing guide line during deferred drawing that must not tessellate the complete growing draft."
+      ,"Start the depth -100..+100 checkpoint with automated camera/tile projection, spatial-index, raster-width, and SQLite operation/bookmark round-trip coverage."
+      ,"Extend the stress tool with a configurable symmetric depth radius and measure queries at the negative edge, zero, and positive edge."
+      ,"Only change runtime behavior if validation exposes overflow, incorrect visibility, or a measured hot path; existing coordinate property tests already cover raw screen round-trip beyond this range."
+      ,"Added exact -100/+100 zoom and same-depth screen round-trip coverage, plus projection-cache reanchor validation across a 200-level transition."
+      ,"Added extreme tile-key identity, finite/clamped stroke width, bidirectional spatial visibility, and SQLite operation/bookmark checkpoint/reopen coverage."
+      ,"Extended the stress binary with an optional symmetric depth radius and separate 147 individual-tile versus three batched-viewport measurements."
+      ,"Initial 1M/201-band stress measured about 2.41s for three viewport queries and exposed repeated BigInt 8^delta computation per tile/source-depth pair."
+      ,"OperationIndex::query_many now groups target tiles by depth and computes each target/source BigInt factor once while preserving sorted deduplicated results."
+      ,"Post-fix 1M/201-band stress: 278ms generation, 1.45s indexing, 2.38s for 147 individual tile queries, and 1.72s for three viewport queries with 1,455,859 unique matches."
+      ,"Post-fix 100k/201-band stress: 27ms generation, 101ms indexing, 218ms for 147 tile queries, and 133ms for three viewport queries."
+      ,"Passed 104 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable and verified SHA-256 FFB0E60BE02AEF35BF4A99E2EECAB30BA7E48AE9FF74B0055F06890FA3BC2B3E matches target/release."
+      ,"Add a compact toolbar depth target plus Go command so extreme-depth validation does not require repeated wheel/Z gestures."
+      ,"The jump must preserve the current world-space center by applying the same per-level axis promote/demote transformations as normalized zoom."
+      ,"Clamp the toolbar target to -10000..10000 to prevent accidental pathological loops, keep current zoom unchanged, cancel stale tile generations, and reuse normal zoom-settle behavior."
+      ,"Added CameraAddress::jump_to_depth using exact per-level BigInt promote/demote transforms while keeping zoom unchanged."
+      ,"Added a compact second toolbar row with current depth, bounded target DragValue, Go button, and Enter submission."
+      ,"Normal zoom, bookmark opening, and document replacement synchronize the jump target; jumps use mark_zoom_changed to cancel stale tile generations and defer replacements during settle."
+      ,"Documented the representational limit that an arbitrary fine position cannot return bit-for-bit after crossing a very coarse negative depth because camera local coordinates are f64; bookmarks preserve exact return locations."
+      ,"Added direct target-center preservation and interactive range-clamp tests."
+      ,"Passed 106 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable and verified SHA-256 B97721C39F560CA4754FBA05ECF73BCA5F0FFB80A8568766C8CB1D1151669D0E matches target/release."
+      ,"Manual validation confirms direct toolbar jumps work at depth 1000 and at the configured maximum depth 10000."
+      ,"Do not infer Brush, Fill, undo/redo, bookmark return, or reopen validation from the navigation-only confirmation; those cases remain explicit."
+      ,"Manual confirmation now closes Brush, Fill, undo/redo, bookmark return, and reopen at the first extreme-depth checkpoint."
+      ,"The next fresh-context checkpoint is automated and stress validation across depth -1000..+1000."
+      ,"Baseline 100k/2001-band stress passed: about 28ms generation, 87ms indexing, 614ms for 147 tile queries, and 236ms for three viewport queries."
+      ,"Baseline 1M/2001-band stress passed: about 275ms generation, 1.33s indexing, 3.02s for 147 tile queries, and 1.65s for three viewport queries with 1,495,320 unique matches."
+      ,"The wider depth range does not regress batched viewport time relative to the prior 201-band stress, so no additional spatial runtime optimization is justified."
+      ,"Extend same-depth camera/tile/spatial/raster/storage coverage to +/-1000 and verify projection cache resets plus cross-depth culling beyond the f64 representable scale."
+      ,"Added same-depth screen round-trip and visible tile-key tests at +/-1000, plus finite clamped stroke-width assertions."
+      ,"Added bidirectional spatial visibility across 2000 levels and expanded SQLite operation/bookmark checkpoint/reopen coverage to +/-1000."
+      ,"Added projection-cache reset validation across a 2000-level transition and explicit rejection tests for cross-depth projection beyond the representable f64 scale."
+      ,"Passed 110 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable and verified SHA-256 333CD36C73F9191DD485DE195BF2BB27223017D55FD16E594303DAD9BC9C16D4 matches target/release."
+      ,"Manual confirmation closes Brush, Fill, undo/redo, bookmark return, and reopen at depth -1000 and +1000."
+      ,"The next fresh-context checkpoint is large positive and negative lateral displacement from origin."
+      ,"Add a third toolbar row for absolute BigInt tile X/Y targets at the current depth, with Go XY and Origin commands."
+      ,"Accept bounded decimal input and compact scientific integer notation such as 1e100/-1e100; cap expanded coordinates at 10000 digits."
+      ,"Go XY preserves depth, zoom, and local offset while invalidating stale tile work; Origin returns tile X/Y to zero and local X/Y to 0.5."
+      ,"Add parser, projection-cache re-anchor, spatial query, and persistence coverage at coordinates around 10^1000 before manual checks at +/-1e100."
+      ,"Implemented the third toolbar row with absolute X/Y, Go XY/Enter, and Origin while preserving depth, zoom, and local offset."
+      ,"Passed 113 all-target tests, including parser bounds and projection-cache, spatial-index, and SQLite coverage around 10^1000."
+      ,"Manual confirmation closes direct BigInt lateral navigation and return to origin."
+      ,"Add an always-visible camera-center coordinate readout to the canvas overlay: current tile X/Y plus normalized local X/Y."
+      ,"Keep small BigInt values exact, display signed powers of ten as compact 1eN, and abbreviate other very large integers with leading/trailing digits and total digit count so the overlay remains bounded."
+      ,"Cache formatted tile X/Y until the camera crosses a tile boundary; ordinary movement updates only the inexpensive local X/Y text."
+      ,"Passed 114 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Manual confirmation closes the current-coordinate overlay checkpoint."
+      ,"The next listed item is accurate transparency; begin with a bounded profiling/design checkpoint before changing the opaque rendering path."
     ],
     "planned_scope": [
-      "Add pause_tile_generation_while_drawing to AppSettings with migration defaults, persistence tests, and no profile coupling.",
-      "Add a Settings checkbox adjacent to the manual pause.",
-      "Add an automatic runtime pause flag and shared effective-pause helper.",
-      "Cancel queued generations at draft start and suppress new TileJob submission while drawing.",
-      "Resume current-viewport eligibility on all draft completion paths without changing manual pause.",
-      "Update overlay text, tests, README, release notes, status, and the current plan.",
-      "Run full validation, refresh the portable build, and launch manual Brush/Eraser/Fill pause validation.",
+      "Replace tile smoothing with adaptive quadratic corner curves controlled by Off/Light/Balanced/Strong.",
+      "Use wider corner radius and finer tessellation at stronger levels, bounded per corner.",
+      "Apply adaptive smoothing to saved fallback with clipping-first Brush runs and bounded output.",
+      "Bump raster cache version and update README, settings reference, portable notes, status, and plan.",
+      "Add focused sparse mouse, dense stylus, closed Fill, endpoint, and bounded-output tests.",
+      "Run full validation, refresh the portable build, and launch mouse/stylus manual comparison.",
       "Preserve existing user-owned untracked files and avoid changing current document data unless explicitly requested."
+      ,"Add a Windows-only mouse-history adapter with pure ordering/deduplication tests and no-op fallback on unsupported platforms."
+      ,"Feed recovered chronological positions into the existing spacing/interpolation pipeline before painting the live draft."
+      ,"Add level-specific jitter tolerances before adaptive curve generation without adding another Settings control."
+      ,"Test diagonal integer staircases, endpoint preservation, closed rings, dense stylus deviation, and bounded output."
+      ,"Add persisted Deferred drawing preview without changing performance profiles or document storage."
+      ,"Add focused -100/0/+100 regression tests and a configurable extreme-depth stress mode."
     ],
     "validation_plan": [
-      "Test settings normalization and JSON migration/default behavior for the new field.",
-      "Test effective pause truth table for manual and automatic states.",
-      "Test profiles leave both pause controls unchanged.",
+      "Test Off returns exact raw points and all enabled levels preserve open endpoints.",
+      "Test sparse corners generate genuinely curved intermediate points rather than only straight subdivisions.",
+      "Test dense stylus-like input has bounded point growth and negligible displacement.",
+      "Test settings v10 migration/default/round-trip/profile preservation and the deferred-live-preview paint gate.",
+      "Run stress indexing/query measurements across 201 depth bands and compare edge/center behavior.",
+      "Test closed Fill smoothing has no open seam, saved fallback is smoothed, and output growth is capped.",
       "Run cargo fmt --all -- --check, cargo test --all-targets, cargo clippy --all-targets -- -D warnings, and cargo build --release.",
-      "Manually draw Brush, Eraser, and Fill with the option enabled; verify paused overlay during drawing, current-view resume after release, and independence from manual pause.",
+      "Manually compare mouse and stylus Brush/Fill at Off, Balanced, and Strong on small and fast curves.",
       "Preserve all user-owned untracked files and do not revert unrelated dirty worktree changes."
     ],
-    "execution_result": "Implemented and manually confirmed persisted automatic tile-generation pause during Brush/Eraser/Fill drafts, independent manual pause semantics, overlay state, tests, docs, full validation, and a refreshed portable executable. Documentation is ready for publication."
+    "execution_result": "Current coordinate overlay is complete and manually confirmed; accurate-transparency profiling is next."
   },
   "recommended_next_action": {
     "type": "implementation",
-    "target": "Rebuild policy and prefetch settings",
-    "intent": "Define bounded rebuild and viewport-prefetch controls, persist them, connect them to tile scheduling, and validate their performance impact."
+    "target": "Accurate transparency profiling",
+    "intent": "Measure the current opaque and historical alpha paths, then select a GPU-oriented compositing design that avoids the former stroke artifacts and CPU/FPS regression."
   },
   "latest_check": {
-    "checked_at_utc": "2026-06-27T17:34:09Z",
+    "checked_at_utc": "2026-06-29T00:25:00Z",
     "branch": "Rust",
     "tracking": "origin/Rust",
     "ahead": 0,
     "behind": 0,
     "rust_toolchain": "rustc 1.96.0 stable x86_64-pc-windows-msvc",
     "release_executable": "release/EndlessSketch-Rust/endless-sketch.exe",
-    "release_executable_bytes": 17426944,
+    "release_executable_bytes": 17499648,
     "million_stroke_generation_ms": 320,
     "million_stroke_index_ms": 1410,
     "million_stroke_49_queries_ms": 665,
+    "extreme_depth_1m_201_band_index_ms": 1450,
+    "extreme_depth_1m_201_band_three_viewports_ms": 1720,
+    "extreme_depth_1m_2001_band_index_ms": 1330,
+    "extreme_depth_1m_2001_band_three_viewports_ms": 1650,
     "github_repository": "Ideshon/EndlessSketch",
     "github_default_branch": "master",
     "local_https_push_ready": true
   },
   "test_file_statuses": {
     "cargo_fmt": "Passed cargo fmt --all and cargo fmt --all -- --check.",
-    "cargo_clippy_all_targets_deny_warnings": "Passed.",
-    "cargo_test_debug": "74 passed, 0 failed, including manual/automatic pause independence, settings-v5 migration, incremental tiles, profiles, projection caching, retained tiles, storage recovery, and deep zoom behavior.",
+    "cargo_clippy_all_targets_deny_warnings": "Passed after adding cached current-coordinate overlay formatting.",
+    "cargo_test_debug": "114 passed, 0 failed, including bounded exact/power/abbreviated BigInt coordinate formatting.",
     "cargo_test_release": "Not run in the latest session; debug all-target tests passed.",
-    "release_build": "Passed cargo build --release; release/EndlessSketch-Rust/endless-sketch.exe was refreshed and hash-matched after automatic drawing pause implementation.",
-    "gui_smoke": "Automatic drawing pause was manually accepted after behavior clarification; incremental Paint, profiles, and projection-cache FPS improvement remain manually confirmed.",
-    "million_stroke_stress": "Passed after spatial broad-operation fallback; latest measured run was about 320ms generation, 1.41s indexing, and 665ms for 49 queries."
+    "release_build": "Passed cargo build --release; portable executable refreshed at 17,499,648 bytes and SHA-256 4AD62A35E6F2D6D4B88B4D2B50649D04220B98388DBACCC2BFE1B4B06C0B2829 matches target/release.",
+    "gui_smoke": "Launched target/release/endless-sketch.exe with manual-depth-check.esketch as PID 93140 for current-coordinate overlay validation.",
+    "million_stroke_stress": "Passed at radius 1000 across 2001 depth bands: about 275ms generation, 1.33s indexing, 3.02s for 147 individual tile queries, and 1.65s for three batched viewport queries."
   }
 }

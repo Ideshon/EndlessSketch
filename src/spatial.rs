@@ -62,12 +62,22 @@ impl OperationIndex {
 
     pub fn query_many(&self, tiles: &[TileKey]) -> Vec<usize> {
         let mut matches: HashSet<_> = self.broad_operations.iter().copied().collect();
+        let mut tiles_by_depth: HashMap<i64, Vec<&TileKey>> = HashMap::new();
         for tile in tiles {
+            tiles_by_depth.entry(tile.depth).or_default().push(tile);
+        }
+        for (target_depth, target_tiles) in tiles_by_depth {
             for (&source_depth, bucket) in &self.depths {
-                if source_depth <= tile.depth {
-                    query_coarse_or_equal_depth(tile, source_depth, bucket, &mut matches);
-                } else {
-                    query_finer_depth(tile, source_depth, bucket, &mut matches);
+                let levels = target_depth.abs_diff(source_depth);
+                let Some(factor) = depth_factor_unsigned(levels) else {
+                    continue;
+                };
+                for tile in &target_tiles {
+                    if source_depth <= target_depth {
+                        query_coarse_or_equal_depth(tile, &factor, bucket, &mut matches);
+                    } else {
+                        query_finer_depth(tile, &factor, bucket, &mut matches);
+                    }
                 }
             }
         }
@@ -79,16 +89,12 @@ impl OperationIndex {
 
 fn query_coarse_or_equal_depth(
     tile: &TileKey,
-    source_depth: i64,
+    factor: &BigInt,
     bucket: &DepthBucket,
     matches: &mut HashSet<usize>,
 ) {
-    let levels = tile.depth.saturating_sub(source_depth);
-    let Some(factor) = depth_factor(levels) else {
-        return;
-    };
-    let source_x = tile.x.div_euclid(&factor);
-    let source_y = tile.y.div_euclid(&factor);
+    let source_x = tile.x.div_euclid(factor);
+    let source_y = tile.y.div_euclid(factor);
     for offset_x in -1..=1 {
         let x = &source_x + offset_x;
         let Some(column) = bucket.columns.get(&x) else {
@@ -104,18 +110,14 @@ fn query_coarse_or_equal_depth(
 
 fn query_finer_depth(
     tile: &TileKey,
-    source_depth: i64,
+    factor: &BigInt,
     bucket: &DepthBucket,
     matches: &mut HashSet<usize>,
 ) {
-    let levels = source_depth.saturating_sub(tile.depth);
-    let Some(factor) = depth_factor(levels) else {
-        return;
-    };
-    let min_x: BigInt = &tile.x * &factor - 1;
-    let max_x: BigInt = (&tile.x + 1) * &factor;
-    let min_y: BigInt = &tile.y * &factor - 1;
-    let max_y: BigInt = (&tile.y + 1) * &factor;
+    let min_x: BigInt = &tile.x * factor - 1;
+    let max_x: BigInt = (&tile.x + 1) * factor;
+    let min_y: BigInt = &tile.y * factor - 1;
+    let max_y: BigInt = (&tile.y + 1) * factor;
     for (_, column) in bucket.columns.range(min_x..=max_x) {
         for (_, indices) in column.range(min_y.clone()..=max_y.clone()) {
             matches.extend(indices.iter().copied());
@@ -123,8 +125,8 @@ fn query_finer_depth(
     }
 }
 
-fn depth_factor(levels: i64) -> Option<BigInt> {
-    if !(0..=u32::MAX as i64).contains(&levels) {
+fn depth_factor_unsigned(levels: u64) -> Option<BigInt> {
+    if levels > u64::from(u32::MAX) {
         return None;
     }
     Some(BigInt::from(DEPTH_RATIO).pow(levels as u32))
@@ -309,6 +311,63 @@ mod tests {
             y: 5000.into(),
             lod: 0,
         };
+        assert_eq!(index.query(&key), vec![0]);
+    }
+
+    #[test]
+    fn queries_find_content_across_two_hundred_depth_levels() {
+        let operations = vec![operation(-100, 0, 0), operation(100, 0, 0)];
+        let index = OperationIndex::build(&operations);
+
+        for depth in [-100, 0, 100] {
+            let key = TileKey {
+                depth,
+                x: 0.into(),
+                y: 0.into(),
+                lod: 0,
+            };
+            assert_eq!(index.query(&key), vec![0, 1], "depth={depth}");
+        }
+    }
+
+    #[test]
+    fn queries_find_content_across_two_thousand_depth_levels() {
+        let operations = vec![operation(-1000, 0, 0), operation(1000, 0, 0)];
+        let index = OperationIndex::build(&operations);
+
+        for depth in [-1000, 0, 1000] {
+            let key = TileKey {
+                depth,
+                x: 0.into(),
+                y: 0.into(),
+                lod: 0,
+            };
+            assert_eq!(index.query(&key), vec![0, 1], "depth={depth}");
+        }
+    }
+
+    #[test]
+    fn query_finds_content_at_thousand_digit_lateral_offset() {
+        let huge = BigInt::from(10u8).pow(1000);
+        let operation = EditOperation::draft(
+            EditKind::Paint,
+            0,
+            1.0,
+            vec![
+                CanvasPoint::new(0, huge.clone(), -huge.clone(), 0.1, 0.1),
+                CanvasPoint::new(0, huge.clone(), -huge.clone(), 0.9, 0.9),
+            ],
+            Color::BLACK,
+            5.0,
+        );
+        let index = OperationIndex::build(&[operation]);
+        let key = TileKey {
+            depth: 0,
+            x: huge.clone(),
+            y: -huge,
+            lod: 0,
+        };
+
         assert_eq!(index.query(&key), vec![0]);
     }
 }

@@ -3,6 +3,7 @@ pub mod coords;
 pub mod document;
 pub mod local_paths;
 pub mod model;
+pub mod mouse_history;
 pub mod projection_cache;
 pub mod raster;
 pub mod settings;
