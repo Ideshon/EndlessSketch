@@ -4,6 +4,7 @@ use crate::tile_cache::TileKey;
 use num_bigint::BigInt;
 use num_traits::{Euclid, ToPrimitive};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use uuid::Uuid;
 
 const MAX_INDEXED_TILES_PER_OPERATION: u64 = 4096;
 
@@ -11,6 +12,8 @@ const MAX_INDEXED_TILES_PER_OPERATION: u64 = 4096;
 pub struct OperationIndex {
     depths: HashMap<i64, DepthBucket>,
     broad_operations: Vec<usize>,
+    operation_ids: HashMap<usize, Uuid>,
+    operation_layers: HashMap<usize, Uuid>,
 }
 
 #[derive(Default)]
@@ -28,6 +31,9 @@ impl OperationIndex {
     }
 
     pub fn insert(&mut self, operation_index: usize, operation: &EditOperation) {
+        self.operation_ids.insert(operation_index, operation.id);
+        self.operation_layers
+            .insert(operation_index, operation.layer_id);
         let Some(bounds) = operation_bounds(operation) else {
             return;
         };
@@ -85,6 +91,51 @@ impl OperationIndex {
         matches.sort_unstable();
         matches
     }
+
+    pub fn query_many_ids(&self, tiles: &[TileKey]) -> Vec<Uuid> {
+        self.query_many(tiles)
+            .into_iter()
+            .filter_map(|index| self.operation_ids.get(&index).copied())
+            .collect()
+    }
+
+    pub fn query_many_ids_in_layers(
+        &self,
+        tiles: &[TileKey],
+        eligible_layers: &HashSet<Uuid>,
+    ) -> Vec<Uuid> {
+        self.query_many(tiles)
+            .into_iter()
+            .filter(|index| {
+                self.operation_layers
+                    .get(index)
+                    .is_some_and(|layer_id| eligible_layers.contains(layer_id))
+            })
+            .filter_map(|index| self.operation_ids.get(&index).copied())
+            .collect()
+    }
+
+    pub fn remove_indices(&mut self, removed: &HashSet<usize>) {
+        if removed.is_empty() {
+            return;
+        }
+        self.broad_operations
+            .retain(|index| !removed.contains(index));
+        self.operation_ids
+            .retain(|index, _| !removed.contains(index));
+        self.operation_layers
+            .retain(|index, _| !removed.contains(index));
+        self.depths.retain(|_, bucket| {
+            bucket.columns.retain(|_, column| {
+                column.retain(|_, indices| {
+                    indices.retain(|index| !removed.contains(index));
+                    !indices.is_empty()
+                });
+                !column.is_empty()
+            });
+            !bucket.columns.is_empty()
+        });
+    }
 }
 
 fn query_coarse_or_equal_depth(
@@ -132,13 +183,13 @@ fn depth_factor_unsigned(levels: u64) -> Option<BigInt> {
     Some(BigInt::from(DEPTH_RATIO).pow(levels as u32))
 }
 
-#[derive(Debug)]
-struct OperationBounds {
-    depth: i64,
-    min_x: BigInt,
-    max_x: BigInt,
-    min_y: BigInt,
-    max_y: BigInt,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationBounds {
+    pub depth: i64,
+    pub min_x: BigInt,
+    pub max_x: BigInt,
+    pub min_y: BigInt,
+    pub max_y: BigInt,
 }
 
 impl OperationBounds {
@@ -152,7 +203,13 @@ impl OperationBounds {
     }
 }
 
-fn operation_bounds(operation: &EditOperation) -> Option<OperationBounds> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AffectedTiles {
+    Bounded(Vec<TileKey>),
+    Broad,
+}
+
+pub fn operation_bounds(operation: &EditOperation) -> Option<OperationBounds> {
     let first = operation.points.first()?;
     let mut min_x = first.tile_x.clone();
     let mut max_x = first.tile_x.clone();
@@ -181,6 +238,40 @@ fn operation_bounds(operation: &EditOperation) -> Option<OperationBounds> {
         min_y,
         max_y,
     })
+}
+
+pub fn affected_tiles(operation: &EditOperation, lod: u8) -> AffectedTiles {
+    let Some(bounds) = operation_bounds(operation) else {
+        return AffectedTiles::Bounded(Vec::new());
+    };
+    let expanded = OperationBounds {
+        depth: bounds.depth,
+        min_x: bounds.min_x - 1,
+        max_x: bounds.max_x + 1,
+        min_y: bounds.min_y - 1,
+        max_y: bounds.max_y + 1,
+    };
+    if !expanded.indexable_within(MAX_INDEXED_TILES_PER_OPERATION) {
+        return AffectedTiles::Broad;
+    }
+
+    let mut keys = Vec::new();
+    let one = BigInt::from(1u8);
+    let mut x = expanded.min_x;
+    while x <= expanded.max_x {
+        let mut y = expanded.min_y.clone();
+        while y <= expanded.max_y {
+            keys.push(TileKey {
+                depth: expanded.depth,
+                x: x.clone(),
+                y: y.clone(),
+                lod,
+            });
+            y += &one;
+        }
+        x += &one;
+    }
+    AffectedTiles::Bounded(keys)
 }
 
 #[cfg(test)]
@@ -289,6 +380,90 @@ mod tests {
         ];
 
         assert_eq!(index.query_many(&visible), vec![0, 1]);
+    }
+
+    #[test]
+    fn uuid_queries_preserve_sequence_order_and_filter_layers() {
+        let mut first = operation(0, 0, 0);
+        let first_id = first.id;
+        first.layer_id = Uuid::from_u128(10);
+        let mut second = operation(0, 1, 0);
+        let second_id = second.id;
+        second.layer_id = Uuid::from_u128(20);
+        let operations = vec![first, second];
+        let index = OperationIndex::build(&operations);
+        let visible = vec![
+            TileKey {
+                depth: 0,
+                x: 0.into(),
+                y: 0.into(),
+                lod: 0,
+            },
+            TileKey {
+                depth: 0,
+                x: 1.into(),
+                y: 0.into(),
+                lod: 0,
+            },
+        ];
+
+        assert_eq!(index.query_many_ids(&visible), vec![first_id, second_id]);
+        assert_eq!(
+            index.query_many_ids_in_layers(&visible, &HashSet::from([Uuid::from_u128(20)])),
+            vec![second_id]
+        );
+    }
+
+    #[test]
+    fn affected_tiles_adds_stroke_margin_and_bounds_enumeration() {
+        let operation = operation(4, 10, -20);
+        let AffectedTiles::Bounded(keys) = affected_tiles(&operation, 3) else {
+            panic!("small operation should have bounded coverage");
+        };
+
+        assert_eq!(keys.len(), 9);
+        assert!(keys.contains(&TileKey {
+            depth: 4,
+            x: 9.into(),
+            y: (-21).into(),
+            lod: 3,
+        }));
+        assert!(keys.contains(&TileKey {
+            depth: 4,
+            x: 11.into(),
+            y: (-19).into(),
+            lod: 3,
+        }));
+    }
+
+    #[test]
+    fn removing_tail_indices_preserves_remaining_uuid_queries() {
+        let operations = vec![operation(0, 0, 0), operation(0, 1, 0), operation(0, 2, 0)];
+        let first_id = operations[0].id;
+        let mut index = OperationIndex::build(&operations);
+        index.remove_indices(&HashSet::from([1, 2]));
+        let keys = [
+            TileKey {
+                depth: 0,
+                x: 0.into(),
+                y: 0.into(),
+                lod: 0,
+            },
+            TileKey {
+                depth: 0,
+                x: 1.into(),
+                y: 0.into(),
+                lod: 0,
+            },
+            TileKey {
+                depth: 0,
+                x: 2.into(),
+                y: 0.into(),
+                lod: 0,
+            },
+        ];
+
+        assert_eq!(index.query_many_ids(&keys), vec![first_id]);
     }
 
     #[test]

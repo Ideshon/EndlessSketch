@@ -76,7 +76,7 @@
     "Completed saved-fallback correction pending manual confirmation: full/retained fallback now receives bounded adaptive Smoothing after release; Brush clips visible runs first, Fill smooths before polygon clipping, and geometry above 4096 input or 8192 output points stays raw.",
     "Completed Windows mouse-history checkpoint manually confirmed: active drafts recover up to 64 system mouse samples between UI frames, the mouse trajectory is much better, and normal egui events remain the fallback.",
     "Completed smoothing jitter-prefilter checkpoint manually confirmed: enabled smoothing visibly improves the mouse contour, higher Input is also clean, and minimum Input plus Off intentionally exposes sharp raw vector joins.",
-    "Completed settings-v10 Deferred drawing preview checkpoint manually confirmed functionally: optional weak-CPU mode captures/autosaves the full draft but skips active projection, smoothing, and tessellation until release; weak-PC performance measurement remains pending.",
+    "Completed settings-v10 Deferred drawing preview checkpoint manually confirmed: it reduces live-draft load, but rapid press/release cycles can still merge when a loaded UI frame contains multiple strokes.",
     "Depth -100..+100 automated checkpoint passed pending manual validation: six cross-module regressions pass and grouped spatial queries reuse BigInt depth scales, improving the 1M/201-band three-viewport stress from about 2.41s to 1.72s.",
     "Completed direct depth-jump checkpoint manually confirmed at depths 1000 and 10000: the second toolbar row accepts -10000..10000 and Go/Enter, preserves the visible center at the target, and invalidates stale tile work.",
     "Completed depth -100..+100 checkpoint manually confirmed: navigation, Brush, Fill, undo/redo, bookmark return, and reopen work after automated cross-module coverage and grouped spatial-query optimization.",
@@ -85,34 +85,51 @@
     "Large lateral displacement implementation is ready for manual validation: the third toolbar row accepts absolute BigInt tile X/Y in decimal or integer scientific notation, Origin returns to tile 0/0, and projection/spatial/storage regressions pass around 10^1000.",
     "Completed large lateral displacement checkpoint manually confirmed: direct BigInt tile X/Y navigation and return to origin work at practical extreme coordinates.",
     "Completed current-coordinate overlay checkpoint manually confirmed: tile X/Y and local X/Y update correctly during navigation, with cached bounded formatting for extreme BigInt values.",
-    "Priority 1: stabilize interaction FPS on stroke-dense depth 0 before implementing any remaining settings; presets and other controls are blocked until drawing/navigation is responsive.",
-    "Priority 2: optimize and test very large depths and distances from origin, including -100..+100, -1000..+1000, and large lateral offsets.",
-    "Priority 10: lower-priority backlog group includes Save As, Selection tools, selected-content delete/edit, configurable hotkeys, eraser fill mode, optional manual layers, image import, GPU-native tile tessellation, installer/signing, release packaging, profiling, and extended manual testing.",
+    "Completed M1 manually confirmed: schema-v2 migration, backup, drawing, Fill, and corrected incremental grouped undo/redo work normally.",
+    "Completed redo shortcut manually confirmed: Ctrl+Shift+Z and Ctrl+Y both perform redo while Ctrl+Z remains undo.",
+    "M2 manually confirmed: rectangle Selection and Eraser Lasso previews track viewport movement correctly, and the read-only Layers panel works.",
+    "M3 checkpoint 1 manually confirmed: Delete selected persists an append-only UUID tombstone and round-trips through reopen, undo, and redo without rewriting source operations.",
+    "M3 checkpoint 2 manually confirmed: selected operations drag with a live overlay and persist as one atomic tombstone/replacement transaction.",
+    "Dense-selection corrective checkpoint manually confirmed: click selects one ranked object, Alt cycles overlaps, modifiers edit the set, and rectangle supports Inside/Crossing.",
+    "Selection follow-up complete pending manual validation: Alt+wheel cycles overlaps bidirectionally without zoom, and the completed rectangle frame is cleared.",
+    "Selection/lasso correction complete pending manual validation: one continuous Alt+wheel gesture advances once, and Eraser Lasso clears its contour on release.",
+    "Selection/Move correction manually confirmed: raw wheel detents advance one overlap candidate each without time throttling, and moved vector replacements retain their original paint order through reopen and undo/redo.",
+    "M3 checkpoint 3 manually confirmed: Eraser Lasso commits one closed EraseArea vector operation, renders in fallback and tiles, ignores degenerate contours, and survives reopen/undo/redo.",
+    "M3 checkpoint 4.1 manually confirmed: Layers can create, rename, select, and move up/down; new drawing uses the active layer and render order survives reopen.",
+    "Active-layer Selection correction manually confirmed: click, rectangle, modifiers, and Alt cycling see only the active visible unlocked layer; switching layers clears transient selection.",
+    "M3 checkpoint 4.2 manually confirmed: schema v3 unified history, visibility/lock, hidden-layer rendering, edit guards, undo/redo, and reopen work.",
+    "M3 checkpoint 4.3 manually confirmed: Duplicate/Delete, confirmation, undo/redo, and reopen work.",
+    "M4 checkpoint 4.4 manually confirmed: toolbar and Ctrl+C/Ctrl+X/Ctrl+V/Ctrl+Shift+V work with Object selection.",
+    "M4 checkpoint 4.5 manually confirmed: Ctrl+wheel changes selected-object paint order one step per raw detent within the active layer without replacing object UUIDs or geometry.",
+    "M4 checkpoint 4.6a manually confirmed: Layers can move the current Object selection to another visible unlocked layer as one persisted tombstone/replacement history step.",
+    "M4 checkpoint 4.6b manually confirmed: Merge Down combines the active layer with its immediate lower visible unlocked layer in one compound history step.",
+    "M5.0a manually confirmed: Selection modes and edit commands moved into one popover, and Add bookmark moved into Bookmarks with a name field.",
+    "M5.0b manually confirmed: New/Open moved into File; F1 opens clear Russian/English Help loaded from extensible external catalogs with built-in fallback.",
+    "Observed under High Quality load: UI stalls can merge rapid press/release cycles into check-mark strokes, misclassify Z+LMB as drawing, drop/reverse navigation deltas, and make wheel/pan intermittently unresponsive. A bounded input/FPS stabilization block is planned after the nearest Layers work and before export.",
+    "Former FPS and extreme-navigation priorities are complete at the current validated baseline.",
+    "Current main task: selection/editing, polygon Eraser Lasso, and Photoshop-like layers developed as three parallel workstreams over shared geometry, grouped history, layer scope, spatial filtering, and tile invalidation.",
+    "Current Priority 2: shared offscreen renderer, still-image export, camera-path recording, and offline animated GIF export.",
+    "Current Priority 3: stylus pressure capture, persistence, brush dynamics, and variable-width rendering.",
     "Keep README, docs/project-implementation-plan.md, and this status aligned with behavior, commands, validation, and known limits."
   ],
   "backlog": [
-    "Priority 1.1 manual result: former transparent objects are now opaque as designed; dense depth 0 still has a noticeable FPS drop during any interaction.",
-    "Priority 1.2 manual result: configurable physical tile bitmap resolutions 64..2048 px work.",
-    "Priority 1.3 manual result: Pause tile generation works, but interaction FPS still drops on stroke-dense depth 0 even with tile generation paused.",
-    "Priority 1.4: Process every queued pointer movement in order so fast Fill gestures retain their curved path instead of collapsing to a few straight chords.",
-    "Priority 1.5: Expand Brush/Fill spacing controls from 4..128 px to 4..1024 px with logarithmic sliders.",
-    "Priority 1.6: Add Performance, Balanced, Quality, and Custom presets.",
-    "Priority 1.7: Retain the last complete tile revision and overlay only newer operations while replacement tiles build.",
-    "Priority 1.8: Add incremental opaque Paint tile updates; destructive operations continue to request full rebuilds.",
-    "Priority 1.9: Add advanced edge quality, smoothing, rebuild, prefetch, cache budget, PNG compression, preview refresh controls, render-time clipping, and geometry simplification.",
-    "Priority 1.10: After adding the new performance settings, profile and fix interaction FPS on stroke-dense depth 0 across pan, zoom, drawing, Fill, and Settings actions; tile generation speed alone is not sufficient.",
-    "Priority 2: stress optimize extreme navigation across very large depth and distance ranges, such as -100..+100, -1000..+1000, and large side offsets from the origin.",
-    "Priority 10: Add Save As for writing the active document to a chosen .esketch path, including storage/cache handling and UI status feedback.",
-    "Priority 10: Add Selection tool modes: rectangular marquee selection and freeform lasso selection.",
-    "Priority 10: Add editing and deletion for selected content, including clear behavior for how vector operations are modified or masked.",
-    "Priority 10: Later polish: reduce angularity of very fast Brush/Eraser jerks, likely through configurable point density or curve smoothing.",
-    "Priority 10: Configurable hotkeys.",
-    "Priority 10: Eraser fill mode.",
-    "Priority 10: Optional named manual layers in addition to automatic depth levels.",
-    "Priority 10: Image import and asset placement.",
-    "Priority 10: GPU-native tile tessellation for faster cold cache generation.",
-    "Priority 10: Windows installer packaging and signing.",
-    "Priority 10 final: Add a lightweight trailing guide line during Deferred drawing preview without projecting, smoothing, or tessellating the complete growing draft."
+    "Main task: implement the Navigation and Display/overlay M5.0 checkpoints before Object transform, persistent Area selection, opaque Gradient, and layer folders.",
+    "Area selection block: Rectangle/Lasso remains in canvas coordinates as a temporary clipping mask for Brush/Eraser/Fill/Gradient, with Fill, Erase, Stroke boundary, Invert, and export-bounds actions.",
+    "UI cleanup block: Selection commands move to a popover, Add bookmark moves into Bookmarks, File/Help and Navigation become separate windows, and Settings controls optional overlay fields.",
+    "Multi-layer selection block: keep one active drawing layer plus a Ctrl/Shift selected layer set for atomic bulk visibility, lock, reorder, delete, duplicate, grouping, and contiguous Merge Selected.",
+    "Stylus accessibility contract: every wheel-bound command must also provide a latched key-plus-pointer-drag gesture and a button/menu fallback; future wheel features cannot ship wheel-only.",
+    "Selection performance follow-up: profile hover hit testing, projected selection overlays, and egui tessellation on active layers with many objects; cache and spatially cull before changing visual behavior.",
+    "Deferred transparency block: exact palette/stroke alpha, Normal layer opacity, and layer masks share a future compositing path; blend modes are outside the current scope.",
+    "Input/FPS stabilization before export: ordered multi-stroke event processing, latched gesture modes, raw wheel accumulation, artificial-stall regressions, subsystem frame timing, and interaction-time work budgets.",
+    "Post-profiling compaction: reversible manual Freeze/Compact selected/layer, then optional idle auto-compact thresholds without irreversible bitmap flattening.",
+    "Priority 2: shared offscreen renderer, PNG/JPEG export, camera-path recording with button/hotkey/timed modes, and offline animated GIF encoding.",
+    "Priority 3: Windows stylus pressure capture, per-point persistence, pressure curves, and variable-width Brush rendering.",
+    "Priority 4: Save As with safe SQLite/WAL and asset handling.",
+    "Priority 5: image import and asset placement.",
+    "Priority 6: configurable command hotkeys beyond the recording commands.",
+    "Priority 7: lightweight Deferred drawing preview trailing guide.",
+    "Priority 8: installer, signing, version metadata, and release packaging."
+    ,"Priority 9: secondary UI polish, including a movable color palette, Shift+N new layer, repeated tool-shortcut mode cycling, a compact tool-sensitive right-click menu, and F1 controls/settings help."
   ],
   "rules": [
     {
@@ -153,8 +170,8 @@
     }
   ],
   "request_analysis": {
-    "updated_at_utc": "2026-06-29T00:35:00Z",
-    "request": "User manually confirmed the coordinate overlay and asks for the next plan item.",
+    "updated_at_utc": "2026-07-01T11:12:52Z",
+    "request": "Make Help instructions clearer, add Russian/English tabs, and store translations in extensible files next to the executable.",
     "analysis": [
       "Retained last-complete tiles with newer-operation overlay are manually confirmed as working.",
       "Visible-tile spatial culling is now manually confirmed as working.",
@@ -748,49 +765,275 @@
       ,"Passed 114 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
       ,"Manual confirmation closes the current-coordinate overlay checkpoint."
       ,"The next listed item is accurate transparency; begin with a bounded profiling/design checkpoint before changing the opaque rendering path."
+      ,"Replaced the former future list with a detailed dependency-aware roadmap and complexity ratings."
+      ,"Selection/editing is now Priority 1, Eraser Lasso Priority 2, layers Priority 3, export Priority 4, and stylus pressure Priority 5."
+      ,"Selection and Eraser Lasso share capture, polygon, clipping, and hit-test geometry."
+      ,"Selected editing and layers share grouped transaction history plus replacement/tombstone semantics."
+      ,"Layer opacity, accurate transparency, and GPU-native compositing are grouped to avoid rebuilding alpha twice."
+      ,"Still export and animated GIF share one deterministic offscreen renderer; GIF records camera states/timestamps and renders frames offline."
+      ,"Recording includes UI Start/Stop, command hotkeys, and a keyboard-free delay/duration auto-stop mode."
+      ,"Stylus pressure requires Windows pen capture, backward-compatible per-point storage, brush dynamics, and matching variable-width live/tile/export rendering."
+      ,"Combined selection/editing, Eraser Lasso, and Layers into one main task with shared foundation plus parallel workstreams A, B, and C."
+      ,"Shared foundation owns grouped transaction metadata, append-only replacement/tombstone semantics, default-layer migration, reusable rectangle/lasso geometry, UUID spatial results, layer filters, and targeted tile invalidation."
+      ,"Milestones M1-M5 integrate the three workstreams incrementally instead of completing one feature in isolation."
+      ,"Implement M1 as schema version 2 with a deterministic default layer and per-operation transaction IDs; legacy rows migrate without changing rendered geometry."
+      ,"New single operations use their own UUID as transaction ID so current undo/redo behavior remains unchanged while future grouped commits can share an ID."
+      ,"Add a reusable projected selection-geometry module for rectangle/lasso containment and intersection tests without coupling it to current app UI."
+      ,"Add UUID-returning spatial query APIs alongside existing index-returning APIs so rendering remains stable while selection can use durable identifiers."
+      ,"Expose operation bounds and affected TileKey calculation as the foundation for targeted invalidation in later editing milestones."
+      ,"Implemented schema version 2 with default Layer 1, layer_id and transaction_id columns, manifest synchronization, and verified pre-migration backups under backups/migrations."
+      ,"Undo/redo now applies to all operations sharing a transaction ID; current single-operation behavior remains unchanged because new drafts use their operation UUID as transaction ID."
+      ,"Added reusable f64 rectangle/lasso geometry for containment, crossing strokes with radius, and polygon intersection."
+      ,"Added UUID spatial results, eligible-layer filtering, public operation bounds, and bounded/broad affected-tile coverage without changing the current renderer index path."
+      ,"CanvasDocument now exposes loaded layers and durable operation-ID queries for future M2 UI work."
+      ,"Passed 126 library tests including schema v1 migration, grouped undo/redo, geometry intersections, UUID layer filtering, and affected-tile coverage."
+      ,"Passed full all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Real manual-depth-check.esketch migration changed manifest schema 1 to 2, created a verified 6,238,208-byte pre-schema backup, and opened successfully."
+      ,"Refreshed the portable executable; SHA-256 000054ECD37D95A5D41E1D85817286EFEE887F05B858260AD07A33F843DEFF61 matches target/release."
+      ,"Manual result: Brush/Fill and migrated document behavior are normal, but undo/redo has a strong delay."
+      ,"The current document has 2,638 operations and about 5.1 MB of compressed payload; SQLite uses the transaction index for the grouped update."
+      ,"The synchronous bottleneck is CanvasDocument undo/redo reloading and decompressing every active payload, then rebuilding the full spatial index after a one-transaction change."
+      ,"Change Storage history results to return only the affected transaction group; remove that group from memory on undo and append it incrementally on redo."
+      ,"Keep conservative full tile/projection invalidation unchanged in this corrective checkpoint."
+      ,"Storage undo/redo now returns only the affected transaction group, with an operations_history index for latest active/undone lookup."
+      ,"CanvasDocument removes tail transaction indices incrementally on undo and appends/indexes returned operations on redo; a defensive full rebuild remains for a malformed non-tail group."
+      ,"Passed 128 all-target tests including incremental grouped document history and spatial tail removal."
+      ,"Passed cargo fmt check, Clippy with warnings denied, and cargo build --release after the undo/redo latency correction."
+      ,"Refreshed portable executable to SHA-256 E5F53E04BE722F1FF9556C54586504DF3FD571BAC606B37EC387EFD37AA1063E."
+      ,"Manual confirmation closes M1 migration and incremental undo/redo latency correction."
+      ,"Add Ctrl+Shift+Z as a second redo shortcut while keeping Ctrl+Y; consume the more specific shortcut before Ctrl+Z because egui logical matching ignores extra Shift."
+      ,"Plan undo history length under grouped history as a limit on undoable transaction groups, not active vector operations, because active operations remain authoritative document content."
+      ,"Implemented redo shortcut matching in specific-first order: Ctrl+Shift+Z, then Ctrl+Y, then Ctrl+Z undo."
+      ,"Documented planned Undo history length presets under grouped history and Settings reference, explicitly separating undo depth from future document compaction."
+      ,"Passed 129 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Manual confirmation closes the Ctrl+Shift+Z shortcut checkpoint."
+      ,"Do not start M2 until the user explicitly asks to continue."
+      ,"User explicitly resumed work; start M2 as three transient UI paths over the M1 foundation."
+      ,"Add rectangle Selection with UUID broad-phase candidates and projected narrow-phase geometry; selection state remains in memory only."
+      ,"Add Eraser Lasso capture and preview using the same shared point/polygon path, but do not commit destructive operations in M2."
+      ,"Add a read-only Layers panel showing schema-v2 layer order, active/default state, visibility, lock state, and operation counts."
+      ,"M2 must not change document revision, SQLite operations, or tile request generation merely from selection/lasso/layer preview interaction."
+      ,"Export is now Priority 2, stylus pressure Priority 3, and the remaining backlog is renumbered after the combined main task."
+      ,"Implemented Selection (`S`) with a transient rectangle overlay, visible/unlocked layer filtering, UUID spatial broad phase, and exact projected stroke/fill hit testing."
+      ,"Implemented Eraser Lasso (`X`) as a bounded-density transient closed preview; it intentionally does not create a destructive operation in M2."
+      ,"Implemented a read-only Layers window showing active/default state, visibility, lock state, and per-layer operation counts."
+      ,"Escape, undo/redo, and document replacement clear transient selection/lasso state; transient drags are excluded from tile rebuild interaction tracking."
+      ,"Added three focused M2 helper tests; 132 all-target tests pass."
+      ,"Passed cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable; SHA-256 3A825023BCBEF8B154FE6127B6DF13F462F2949A5FEA580461241E38AE53BDDD matches target/release."
+      ,"Manual validation closes M2: selection, viewport-relative preview movement, Eraser Lasso, and Layers work."
+      ,"Partial geometry selection is a separate Area selection mode, not a small change to current whole-operation Object selection."
+      ,"Area editing must split Brush/Eraser polylines at selection boundaries, polygon-clip Fill, and persist replacements as one grouped transaction so undo restores the original operation."
+      ,"Start M3 with a bounded persisted Delete selected checkpoint before move, polygon erase, or layer mutation."
+      ,"Represent deletion as an append-only tombstone operation containing target UUIDs; original operation payloads remain authoritative and are not rewritten."
+      ,"Keep the tombstone field backward compatible through serde defaults, so this checkpoint does not require a schema migration."
+      ,"Resolve active tombstones when opening a document; undo restores only their target operations and redo removes those targets again."
+      ,"Use the same tombstone/replacement transaction path later for Area selection splits."
+      ,"Implemented backward-compatible tombstone_targets metadata and effective-operation resolution without a schema bump."
+      ,"CanvasDocument tracks active command sequence separately from effective visible operations, removes selected UUIDs, and restores only targeted payloads on undo."
+      ,"Added Delete selected toolbar command and Delete key; successful deletion clears transient selection and starts the normal document revision/tile refresh path."
+      ,"Added a document regression covering non-contiguous targets, unknown UUIDs, reopen, undo, redo, and replacement of the redo branch by a new commit."
+      ,"Passed 133 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable; SHA-256 5E8077D1353A4D52E07044753CF1296AE2E96AD64D24FADE25B3879F97B9AEFC matches target/release."
+      ,"Manual validation closes M3 checkpoint 1 Delete selected."
+      ,"Plan the selection context menu after Delete, Duplicate, and Move commands stabilize; menu actions must reuse the same command/history implementations."
+      ,"Implement Move selected as drag-preview followed by one persisted tombstone/replacement transaction on release."
+      ,"Add CanvasPoint screen-delta translation at each point's own depth, preserving BigInt tile coordinates and rejecting non-finite/unrepresentable movement before persistence."
+      ,"Add CanvasStore commit_group so tombstone plus all replacement operations share one SQLite transaction, transaction ID, revision increment, undo step, and redo step."
+      ,"Keep movement limited to current whole-operation Object selection; numeric movement and Area selection remain later checkpoints."
+      ,"Implemented CanvasPoint screen-delta translation at each source depth with BigInt tile preservation and bounded representability checks."
+      ,"Implemented CanvasStore commit_group with one SQLite transaction, shared transaction ID, contiguous sequences, one revision increment, and atomic redo-branch replacement."
+      ,"Implemented Selection drag detection on selected strokes/Fill, translated live overlay, release commit, retained selection on replacement UUIDs, and full stale-tile invalidation."
+      ,"Added regressions for huge 10^1000 coordinates, adjacent-depth screen displacement, unrepresentable depth rejection, grouped revision count, reopen, undo, and redo."
+      ,"Passed 137 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable; SHA-256 363BB4A9A8CDCB0D62634A4147CFCC9A2879C594DAEB8FD761803BE90CFD50A0 matches target/release."
+      ,"Manual validation closes M3 checkpoint 2 Move selected."
+      ,"Insert a selection-usability corrective checkpoint before persisted Eraser Lasso because dense drawings cannot rely on intersection-only rectangle selection."
+      ,"Recommended default: click selects one whole candidate ranked by geometry distance, smaller screen bounds, then sequence; no vector clipping is required."
+      ,"Add Alt-click overlap cycling, Shift add, Ctrl toggle, hover preview, and separate fully-contained Inside versus intersecting Crossing rectangle behavior."
+      ,"Implement click ranking by effective distance to visible geometry, then smaller projected bounds, then newest sequence."
+      ,"A click-sized gesture selects one object; a larger drag uses the current Inside/Crossing segmented mode."
+      ,"Selection modifiers bypass Move drag detection; unmodified drag on already selected geometry continues to move the current selection."
+      ,"Keep selection UI transient and avoid document revision or tile invalidation."
+      ,"Implemented pointer hover caching so candidate spatial/projection work runs only after cursor or camera movement, not on every tile repaint."
+      ,"Implemented click scoring with stroke width and Fill interior, prioritizing effective distance, smaller projected bounds, visible operations over eraser ties, and newest sequence."
+      ,"Implemented Alt-click cycling, Shift add, Ctrl toggle, and modifier bypass of selected-object Move drag."
+      ,"Implemented toolbar Inside/Crossing segmented modes; Inside requires the full stroke envelope or Fill vertices inside the rectangle."
+      ,"Added focused ranking, Fill hit, and stroke-envelope containment tests."
+      ,"Passed 140 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable; SHA-256 578F76416B50B4DBC69194E2EFA54AB066A72CC0C3AA9209A003AB2A1767F4F7 matches target/release."
+      ,"Manual validation confirms dense click/modifier/Inside/Crossing selection works."
+      ,"Add Alt+wheel down/up to cycle next/previous overlap candidates under the cursor and suppress normal zoom for that gesture."
+      ,"Clear rectangle start/current after completed rectangle selection; selected object highlights remain and continue to track navigation."
+      ,"Implemented shared candidate-cycle state for Alt-click and Alt-wheel, including current-selection-relative first movement and wrapped forward/backward indexing."
+      ,"Alt-wheel returns before normal zoom handling; wheel down advances and wheel up reverses."
+      ,"Completed rectangle selection now clears its drag frame immediately while preserving selected UUID highlights."
+      ,"Added bidirectional cycle-wrap regression coverage."
+      ,"Passed 141 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable; SHA-256 7A2B2066EF951D825FF546A62C9C80C35DAD021682A31127F58757282BB61DB9 matches target/release."
+      ,"Treat wheel events less than 180 ms apart in the same direction as one physical gesture; a direction reversal starts a new cycle immediately."
+      ,"Suppress zoom for every Alt+wheel event, including debounced continuation events."
+      ,"Clear Eraser Lasso preview points immediately after release while retaining only the status result."
+      ,"Implemented a 180 ms same-direction wheel gesture debounce; reverse direction starts a new cycle immediately and all continuation events still suppress zoom."
+      ,"Eraser Lasso now clears captured preview points on every release result."
+      ,"Added focused debounce timing/direction regression coverage."
+      ,"Passed 142 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable; SHA-256 B9DB40DD78DAD387ED3B012128AAC4B2CA7BF5DCEC517BD9DAA86BC289B69BAC matches target/release."
+      ,"The 180 ms Alt+wheel gesture debounce made separate fast detents disappear; replace it with direct processing of current-frame raw MouseWheel events."
+      ,"Windows winit reports vertical wheel detents as Line deltas normalized by WHEEL_DELTA; count each line unit as one selection step and preserve multiple raw detents received in the same frame."
+      ,"Moved replacement operations receive new append-only history sequences, so sequence cannot also remain their visual stacking order."
+      ,"Added backward-compatible optional paint_order metadata inside the existing compressed operation payload; legacy and ordinary operations continue to use sequence."
+      ,"Move replacements inherit each source operation's effective paint order, while storage load, in-memory move, undo, and redo sort visible operations by paint order then sequence."
+      ,"Overlap selection tie-breaking now follows effective visual paint order instead of the replacement history sequence."
+      ,"Keep moved content as original editable vectors; flattening a selection into one bitmap would lose infinite-zoom quality and per-operation editing and is deferred to an explicit future Merge/Flatten command."
+      ,"Added regressions for multiple wheel detents in one frame and middle-stack Move order through reopen, undo, and redo."
+      ,"Passed 143 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable; SHA-256 F977B0D32A704009DF823CF33C32930FE168AF7868171D919E4423BFD9E7EE59 matches target/release."
+      ,"Manual validation confirms one object per physical Alt+wheel detent at practical speeds and stable visual stacking after Move."
+      ,"Introduce EraseArea as a separate backward-compatible EditKind rather than encoding polygon erase as white Fill; this preserves destructive semantics for future transparency and layers."
+      ,"A valid released Eraser Lasso contour is converted from screen positions to closed CanvasPoint geometry at the current camera depth/zoom and committed with the active layer ID."
+      ,"Contours with fewer than three points, non-finite coordinates, or less than one square-pixel doubled area are rejected without changing the document."
+      ,"Vector fallback, tile rasterization, selection hit testing, highlighting, and eraser ranking treat EraseArea as closed polygon geometry."
+      ,"Added regressions for contour conversion/layer metadata, actual tile pixel erasure, and reopen/undo/redo persistence."
+      ,"Passed 146 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable; SHA-256 507E94F03E9E89791D015F49FAC0E334EFAB23C2E43181BBA46C22E2161282ED matches target/release."
+      ,"Manual validation confirms persisted Eraser Lasso behavior."
+      ,"Implement layer create and rename as durable metadata updates and Up/Down as transactional sort-order swaps; only visual reorder increments content_revision."
+      ,"New Brush, Eraser, Fill, and Eraser Lasso operations receive the active layer ID; reopen selects the top layer deterministically."
+      ,"Render tile operations and visible fallback indices by layer sort order, then effective paint order and sequence, without changing authoritative history-vector order."
+      ,"A commit into a non-top layer clears retained tiles and uses a full rebuild; incremental opaque Paint is allowed only when newer operations form a render-order suffix."
+      ,"Normal click selection uses layer order before paint order as the final overlap tie-break."
+      ,"Layer create/rename/reorder persist but are not yet part of Ctrl+Z history; visibility, lock, delete/duplicate, cross-layer move, and layer metadata history remain checkpoint 4.2/M4."
+      ,"Added regressions for create/rename/reorder persistence, layer-controlled render order, content revision, and lower-layer incremental rejection."
+      ,"Passed 147 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable; SHA-256 D1449FB65660D3BAF70D6EBA7CA618D69269CE3E2BF648037702BD274C3AA711 matches target/release."
+      ,"Manual validation confirms layer create/rename/reorder, active-layer drawing, and reopen."
+      ,"Restrict Selection broad-phase eligible layer IDs to exactly the active layer when it is visible and unlocked; all click, rectangle, modifier, hover, and Alt-cycle paths share this candidate source."
+      ,"Centralize active-layer switching and clear selected IDs, hover, rectangle/move state, and overlap cycle whenever the layer changes, preventing stale Move/Delete across layers."
+      ,"Added a focused active/other/hidden/locked selection-layer filter regression."
+      ,"Added movable color palette window to Priority 9 secondary UI polish so it does not block the current layer/history work."
+      ,"Passed 148 all-target tests, cargo fmt check, Clippy with warnings denied, and cargo build --release."
+      ,"Refreshed the portable executable; SHA-256 CFB3A2311EF7894CF3BC6250806AB9E5BDAAE7B096CE5601A352B0A944FCA7C7 matches target/release."
+      ,"Manual validation confirms active-layer-only Selection and selection cleanup on layer switch."
+      ,"Schedule duplicate/delete layer after shared layer-metadata history so each command is one safe undo/redo step and nonempty deletion can offer delete-or-move content."
+      ,"Schedule internal selection Copy/Paste over existing grouped transactions: Copy stores vector snapshots without history, Paste creates new UUIDs in the current active layer as one history step."
+      ,"Cross-layer Paste does not need a separate persistence path; select the destination active layer before Paste. Preserve relative paint order and provide offset Paste plus Paste in place."
+      ,"Keep system clipboard and cross-document exchange separate until internal Copy/Paste is stable."
+      ,"Manual validation closes checkpoint 4.2: visibility, lock, unified layer/drawing undo-redo, and reopen work."
+      ,"The rapid-hatching defect is structurally reproducible: primary_pointer_positions returns one press plus one position list for a frame, while frame-level pressed/released booleans cannot represent multiple complete strokes queued during a stall."
+      ,"Z zoom, Space pan, and wheel currently use final key/button state plus aggregate pointer/smooth-scroll delta, so delayed frames can lose gesture boundaries or displacement."
+      ,"Plan ordered pointer events first, then a press-latched gesture state machine and raw wheel accumulation; add a native WM_INPUT/WM_POINTER queue only if egui events still lose transitions."
+      ,"Profile High Quality tile workers, vector fallback, texture upload, and tessellation separately before changing quality; final tile output must remain unchanged."
+      ,"Duplicate must create a new layer above the source, clone effective source operations with new UUIDs, preserve internal paint order, and undo as one history step."
+      ,"Delete must reject the final active layer, remove empty layers immediately, require confirmation for nonempty layers, and restore content through one undo/redo step."
+      ,"Layer duplication needs a compound layer-history payload that owns its inserted operation transaction without adding another visible undo step."
+      ,"Manual validation closes checkpoint 4.3: layer Duplicate/Delete, confirmation, undo/redo, and reopen work."
+      ,"Implement internal Cut/Copy/Paste before Merge Down so vector snapshotting, new UUID assignment, active-layer destination, and grouped history are reusable."
+      ,"Implement Merge Down after cross-layer Move; preserve operation paint order and make layer removal plus content transfer one undo/redo step."
+      ,"Treat optimization merging as reversible Freeze/Compact with retained compressed vectors and rebuildable multi-depth cache, not irreversible bitmap flattening."
+      ,"Defer Shift+N, a small tool-sensitive right-click menu, and F1 Help to secondary UI work backed by a shared command/description registry."
+      ,"Use one reusable shortcut contract: first invocation activates a tool; repeated invocation while active cycles its finite modes."
+      ,"Plan S to cycle Selection Inside/Crossing without clearing selection, and X to activate/cycle a combined Area Fill/Erase tool."
+      ,"Keep shortcut cycling disabled while text or numeric inputs have focus, and expose current/next mode through the command registry for toolbar, status, context menu, and Help."
+      ,"Internal clipboard is document-local and stores immutable effective operation snapshots ordered by visual paint order."
+      ,"Copy has no history entry; Cut copies then uses one existing tombstone history step; Paste creates new UUIDs in one grouped transaction."
+      ,"Ctrl+V pastes with a cumulative 16 px screen offset; Ctrl+Shift+V pastes in place. Both target the current visible unlocked active layer and select the pasted objects."
+      ,"The shortcut gate uses egui_wants_keyboard_input, which remains true while any TextEdit keeps focus; clicking the non-focusable canvas currently does not surrender that stale focus."
+      ,"On any pointer press over the canvas, explicitly surrender the currently focused widget. Continue suppressing document clipboard shortcuts while a text field is actually focused."
+      ,"egui-winit consumes Ctrl+C/Ctrl+X/Ctrl+V before Event::Key and emits Event::Copy/Event::Cut/Event::Paste instead; consume_shortcut(Key::C/X/V) therefore cannot detect these commands."
+      ,"Handle egui clipboard events directly and add Windows GetAsyncKeyState press-edge fallback so internal Paste still works when the system clipboard is empty and no Event::Paste is emitted."
+      ,"Manual validation closes checkpoint 4.4: clipboard buttons and shortcuts work."
+      ,"Plan Ctrl+wheel to move the selected stable block one paint-order step within the active layer; preserve group order and reuse raw wheel detents plus replacement history."
+      ,"The rapid-stroke check-mark defect is not fixed. Higher Input px discards more intermediate samples and makes the erroneous connection between collapsed press/release cycles more visible."
+      ,"Implemented append-only paint-order metadata commands that preserve selected object UUIDs, geometry, and layer while changing only effective render order."
+      ,"Ctrl+wheel uses raw MouseWheel events: wheel up moves forward, wheel down moves backward, and each raw detent creates at most one history step."
+      ,"Paint-order commands are excluded from rendering and clipboard snapshots; effective operations apply the latest active UUID-to-order overrides."
+      ,"Automated regressions cover modifier isolation, raw detent direction, group order, edge no-op, identity/geometry preservation, reopen, undo, and redo."
+      ,"Manual validation closes checkpoint 4.5: selected-object Ctrl+wheel reorder works."
+      ,"Selection on an active layer with many objects can lower FPS, although the current effect is not yet blocking; profile hover, projection, highlight geometry, and tessellation in S5."
+      ,"Finish cross-layer Move and Merge Down before introducing layer folders so both reuse the current flat grouped-history model."
+      ,"Implement Object selection scale/rotate after Merge Down, with a transform preview and one atomic replacement transaction on release."
+      ,"Layer folders and collapsible list UI follow transforms; initially support one folder level and keep collapse state independent from layer visibility."
+      ,"Layer masks are very high complexity because they require a separate edit target plus consistent fallback, tile, history, invalidation, and export compositing."
+      ,"Defer layer masks together with exact palette/stroke alpha and Normal layer opacity; do not schedule blend modes without a new explicit request."
+      ,"Implemented CanvasDocument cross-layer Move as one tombstone-plus-replacements transaction with new UUIDs, unchanged vector geometry/styles, and stable source order appended above destination content."
+      ,"Layers now exposes Move selection to only when the selection is nonempty and another visible unlocked destination exists."
+      ,"After transfer the destination becomes active and replacement UUIDs remain selected; hidden/locked destinations and stale mixed selections are rejected before commit."
+      ,"Added regressions for geometry/style preservation, target order, reopen, undo, redo, locked rejection, stale selection rejection, and no partial revision change."
+      ,"Manual validation closes checkpoint 4.6a: Move selection to another layer works."
+      ,"Extended the backward-compatible layer-history payload with per-operation active-after changes so Merge Down can restore original source commands and hide generated replacements in one undo."
+      ,"Implemented Merge Down for the active layer and its immediate lower visible unlocked destination; source effective vectors are cloned with new UUIDs above destination content and the source layer is removed."
+      ,"Undo/redo reload layer state and effective operations; replacing the redo branch deletes generated replacement rows while retaining restored source rows."
+      ,"Added regressions for visual order, geometry/style preservation, source UUID restoration, reopen, one-step undo/redo, redo-branch cleanup, empty layers, bottom boundary, and hidden/locked rejection."
+      ,"Keep Object selection for whole vector UUID operations and add a separate Area selection state for persistent Rectangle/Lasso clipping."
+      ,"Area selection is temporary UI state in canvas coordinates, not a layer mask; committed Brush/Eraser/Fill/Gradient geometry is clipped before persistence."
+      ,"Plan opaque linear Gradient first with two stops and vector parameters, radial Gradient second; alpha stops and feather remain in the deferred transparency block."
+      ,"Useful Area actions are Fill selection, Erase inside, Stroke boundary, Invert selection, Copy/Cut Area after reliable clipping, and export using selection bounds."
+      ,"Run UI cleanup before adding transform/gradient controls: move selection commands into a popover, Add bookmark into Bookmarks, file commands into File/Help tabs, and depth/tile jumps into Navigation."
+      ,"Add persistent Display settings for master overlay visibility plus independent depth/zoom, tile, local coordinate, operation count, FPS/frame time, and tile-state toggles."
+      ,"Keep Help as a tab of the File utility window per the requested compact command surface; F1 opens that tab directly."
+      ,"Manual validation closes checkpoint 4.6b: Merge Down works."
+      ,"Separate one active drawing layer from a temporary selected layer set used by bulk Layers commands."
+      ,"Use normal click for one active/selected layer, Ctrl-click to toggle rows, and Shift-click for a contiguous anchor range."
+      ,"Move selected layers as a stable block and make bulk visibility, lock, delete, and duplicate atomic compound history steps."
+      ,"Reject destructive bulk changes before commit when any selected layer is invalid; never allow partial success or deletion of every layer."
+      ,"Schedule multi-layer selection before folders so grouping and drag-and-drop share the same selected-set and stable-block semantics."
+      ,"Adopt a no-wheel-only accessibility contract: every wheel command also has a latched key-plus-pointer-drag gesture and a visible button/menu fallback."
+      ,"Preserve Z+drag zoom and Space+drag pan; proposed defaults are Alt+vertical drag for overlap cycling and Ctrl+Alt+vertical drag for selected paint-order steps."
+      ,"Discrete stylus gestures accumulate signed distance into one step per configurable threshold and reset residual distance on release."
+      ,"Latch the most specific gesture mode at pointer down so modifier release or UI stalls cannot turn navigation/reorder into an accidental stroke."
+      ,"Add Drag step px, invert direction, and command chord rebinding to future input settings; pen barrel mappings remain optional after Windows Ink support."
+      ,"Moved Inside/Crossing and Cut/Copy/Paste/Paste in place/Delete from the always-visible toolbar into one Selection popover shown for the Selection tool."
+      ,"Popover commands and keyboard shortcuts share one clipboard-command dispatcher, preventing behavior drift."
+      ,"Removed Add bookmark from the toolbar and added a 128-character name field plus Add/Enter inside Bookmarks; empty names receive the next default Bookmark number."
+      ,"Opening or creating another document resets the proposed bookmark name from that document's bookmark count."
+      ,"Manual validation closes M5.0a: Selection popover and Bookmarks Add work."
+      ,"Replaced separate New/Open toolbar buttons with one File button and a movable File/Help window."
+      ,"The File tab reuses existing New/Open dialogs and shows the current document path; no nonfunctional Save As/Export/Recent placeholders are exposed."
+      ,"The Help tab shows the application version and opens Settings, Layers, or Bookmarks; F1 opens Help unless a text editor has focus."
+      ,"Manual validation confirms the File window works, but Help must be an informational reference rather than duplicate Settings/Layers/Bookmarks launch buttons."
+      ,"Replaced the duplicate utility-window buttons with eight scrollable Help sections covering implemented tools, drawing, navigation, Object selection, clipboard/history, layers/bookmarks, performance settings, and file recovery."
+      ,"Help explicitly documents the current opaque renderer, deferred drawing, tile pause semantics, and rebuildable cache so settings are not mistaken for document changes."
+      ,"F1 behavior and File New/Open behavior are unchanged."
+      ,"The current English-only prose is still too terse; settings need plain-language effect and tradeoff descriptions such as lower input spacing improving fast-motion fidelity at the cost of document size and processing load."
+      ,"Use structured JSON translation catalogs rather than hardcoded UI strings. Discover additional valid catalog files dynamically so adding a language does not require recompiling."
+      ,"Ship editable ru.json and en.json beside the executable under help/. Keep the same catalogs embedded as fallbacks so missing or malformed external files cannot remove Help."
+      ,"Added validated HelpCatalog/HelpSection/HelpItem JSON loading with a 2 MiB file limit, deterministic ru/en-first ordering, external id replacement, and automatic additional-language tabs."
+      ,"Russian and English catalogs now separate every control or setting name from a plain-language description of behavior, quality, performance, and data-safety tradeoffs."
+      ,"A Cargo build script copies help/ beside debug/release executables; the same files and translation README are included in the portable release."
+      ,"Added four focused tests for built-in validity/order, external override, added-language discovery, malformed-file fallback, and field validation."
+      ,"Manual validation confirms the localized Russian/English Help works and the explanations are acceptable."
     ],
     "planned_scope": [
-      "Replace tile smoothing with adaptive quadratic corner curves controlled by Off/Light/Balanced/Strong.",
-      "Use wider corner radius and finer tessellation at stronger levels, bounded per corner.",
-      "Apply adaptive smoothing to saved fallback with clipping-first Brush runs and bounded output.",
-      "Bump raster cache version and update README, settings reference, portable notes, status, and plan.",
-      "Add focused sparse mouse, dense stylus, closed Fill, endpoint, and bounded-output tests.",
-      "Run full validation, refresh the portable build, and launch mouse/stylus manual comparison.",
-      "Preserve existing user-owned untracked files and avoid changing current document data unless explicitly requested."
-      ,"Add a Windows-only mouse-history adapter with pure ordering/deduplication tests and no-op fallback on unsupported platforms."
-      ,"Feed recovered chronological positions into the existing spacing/interpolation pipeline before painting the live draft."
-      ,"Add level-specific jitter tolerances before adaptive curve generation without adding another Settings control."
-      ,"Test diagonal integer staircases, endpoint preservation, closed rings, dense stylus deviation, and bounded output."
-      ,"Add persisted Deferred drawing preview without changing performance profiles or document storage."
-      ,"Add focused -100/0/+100 regression tests and a configurable extreme-depth stress mode."
+      "Define a validated JSON catalog format with language id, tab label, title, introduction, section titles, item names, and plain-language descriptions.",
+      "Provide complete Russian and English catalogs with clearer descriptions of controls, settings effects, and performance/quality tradeoffs.",
+      "Load help/*.json beside the executable, replace built-in catalogs by matching language id, and add other valid language files as dynamic tabs.",
+      "Embed Russian and English catalogs as safe fallbacks and retain them when external files are absent or invalid.",
+      "Copy help resources beside Cargo-built debug/release executables and into the portable release package.",
+      "Do not change any drawing, navigation, selection, layer, persistence, or setting behavior."
     ],
     "validation_plan": [
-      "Test Off returns exact raw points and all enabled levels preserve open endpoints.",
-      "Test sparse corners generate genuinely curved intermediate points rather than only straight subdivisions.",
-      "Test dense stylus-like input has bounded point growth and negligible displacement.",
-      "Test settings v10 migration/default/round-trip/profile preservation and the deferred-live-preview paint gate.",
-      "Run stress indexing/query measurements across 201 depth bands and compare edge/center behavior.",
-      "Test closed Fill smoothing has no open seam, saved fallback is smoothed, and output growth is capped.",
-      "Run cargo fmt --all -- --check, cargo test --all-targets, cargo clippy --all-targets -- -D warnings, and cargo build --release.",
-      "Manually compare mouse and stylus Brush/Fill at Off, Balanced, and Strong on small and fast curves.",
-      "Preserve all user-owned untracked files and do not revert unrelated dirty worktree changes."
+      "Add focused tests for catalog validation, external override, added-language discovery, malformed-file fallback, and stable Russian/English ordering.",
+      "Run cargo fmt, all-target tests, Clippy with warnings denied, and a release build.",
+      "Verify help/ru.json and help/en.json are copied next to target/release and portable executables, then compare portable and target SHA-256.",
+      "Manually verify Russian/English tabs, readable wrapping/scrolling, and clear setting descriptions."
     ],
-    "execution_result": "Current coordinate overlay is complete and manually confirmed; accurate-transparency profiling is next."
+    "execution_result": "Localized external Help catalogs are implemented and manually confirmed. All 171 tests, formatting, Clippy with warnings denied, and release build passed. Portable executable and Help resources match target/release."
   },
   "recommended_next_action": {
-    "type": "implementation",
-    "target": "Accurate transparency profiling",
-    "intent": "Measure the current opaque and historical alpha paths, then select a GPU-oriented compositing design that avoids the former stroke artifacts and CPU/FPS regression."
+    "type": "development_checkpoint",
+    "target": "M5.0c: Navigation window",
+    "intent": "Move current depth, Depth jump, Tile X/Y jump, Origin, and exact current coordinates from the toolbar/overlay into one movable Navigation utility window without changing camera behavior."
   },
   "latest_check": {
-    "checked_at_utc": "2026-06-29T00:25:00Z",
+    "checked_at_utc": "2026-07-01T11:12:52Z",
     "branch": "Rust",
     "tracking": "origin/Rust",
     "ahead": 0,
     "behind": 0,
     "rust_toolchain": "rustc 1.96.0 stable x86_64-pc-windows-msvc",
     "release_executable": "release/EndlessSketch-Rust/endless-sketch.exe",
-    "release_executable_bytes": 17499648,
+    "release_executable_bytes": 18238464,
     "million_stroke_generation_ms": 320,
     "million_stroke_index_ms": 1410,
     "million_stroke_49_queries_ms": 665,
@@ -804,11 +1047,11 @@
   },
   "test_file_statuses": {
     "cargo_fmt": "Passed cargo fmt --all and cargo fmt --all -- --check.",
-    "cargo_clippy_all_targets_deny_warnings": "Passed after adding cached current-coordinate overlay formatting.",
-    "cargo_test_debug": "114 passed, 0 failed, including bounded exact/power/abbreviated BigInt coordinate formatting.",
+    "cargo_clippy_all_targets_deny_warnings": "Passed with warnings denied after localized external Help catalogs.",
+    "cargo_test_debug": "171 passed, 0 failed, including external translation override, added language discovery, malformed-file fallback, validation, and ru/en ordering.",
     "cargo_test_release": "Not run in the latest session; debug all-target tests passed.",
-    "release_build": "Passed cargo build --release; portable executable refreshed at 17,499,648 bytes and SHA-256 4AD62A35E6F2D6D4B88B4D2B50649D04220B98388DBACCC2BFE1B4B06C0B2829 matches target/release.",
-    "gui_smoke": "Launched target/release/endless-sketch.exe with manual-depth-check.esketch as PID 93140 for current-coordinate overlay validation.",
+    "release_build": "Passed cargo build --release; portable executable refreshed at 18,238,464 bytes and SHA-256 A162F725AFE9919FC8C859BF802F50CC71B17D30B77A9B6721789AA47027ACAC matches target/release. help/ru.json, en.json, and README.txt match the target/release copies.",
+    "gui_smoke": "Localized Russian/English Help is ready for manual validation; rapid-stroke check marks, High Quality input/FPS issues, and Selection FPS on dense active layers remain documented for S2-S5.",
     "million_stroke_stress": "Passed at radius 1000 across 2001 depth bands: about 275ms generation, 1.33s indexing, 3.02s for 147 individual tile queries, and 1.65s for three batched viewport queries."
   }
 }

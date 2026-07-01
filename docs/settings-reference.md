@@ -4,6 +4,8 @@
 
 Настройки Rust-версии хранятся в `local/settings.json` рядом с исполняемым файлом. Изменения применяются сразу и сохраняются автоматически. Кнопка `Reset` возвращает все параметры к значениям по умолчанию.
 
+Встроенная вкладка `File > Help` или `F1` содержит подробные русские и английские объяснения всех текущих параметров. Переводы загружаются из `help/*.json` рядом с `endless-sketch.exe`; файл с новым уникальным `id` добавляет языковую вкладку после перезапуска. Встроенные копии `ru/en` используются как fallback, если внешние файлы отсутствуют или повреждены.
+
 ## Профиль производительности
 
 `Profile` одновременно меняет только разрешение тайлов, число tile workers и задержку после zoom:
@@ -166,6 +168,10 @@
 
 Это не пользовательская настройка. Сохранённые операции плотнее 256 спроецированных точек временно упрощаются с допуском `0.25 px`, затем stroke и Fill обрезаются по границам экрана или тайла. Sparse-геометрия, live draft и точки в `.esketch` не изменяются.
 
+## Внутренний clipboard Selection
+
+`Ctrl+C` копирует выбранные целые операции без history step. `Ctrl+X` копирует и удаляет их одним undoable step. `Ctrl+V` вставляет новые UUID в active layer с нарастающим offset `16 px`; `Ctrl+Shift+V` вставляет in place. Locked/hidden layer отклоняет Paste. Clipboard не сохраняется в `.esketch` и очищается при смене документа.
+
 ## Запланированные настройки
 
 Эти параметры ещё не реализованы; названия и диапазоны могут измениться после профилирования.
@@ -177,11 +183,37 @@
 ### Configurable hotkeys
 
 Назначение клавиш инструментов, undo/redo, навигации и служебных действий.
+Планируемый default для создания нового верхнего слоя — `Shift+N`; `F1` открывает справку.
+Для инструментов с несколькими режимами первое нажатие shortcut активирует инструмент, повторное циклически меняет mode: `S` — Selection `Inside/Crossing`, `X` — общий Area tool `Fill/Erase`. При фокусе в текстовом или числовом поле shortcut не обрабатывается.
+Каждая wheel-команда получает stylus-альтернативу `key + vertical drag` и кнопку/menu fallback. Текущие defaults плана: `Z+drag` zoom, `Space+drag` pan, `Alt+drag` overlap cycle, `Ctrl+Alt+drag` paint-order steps. Будущие настройки: `Drag step px`, invert direction и переназначение modifier/key chord. Gesture фиксируется до release и не может случайно продолжиться как рисование.
 
-### Eraser fill mode
+### Undo history length
 
-Отдельный режим замкнутого стирания области по аналогии с Fill.
+Планируемый лимит количества доступных для undo transaction groups: ориентировочные варианты `100/500/1000/5000/Unlimited`. Настройка не должна удалять активные векторные операции, потому что они являются содержимым рисунка; уменьшение размера файла потребует отдельного безопасного snapshot/compaction механизма.
+
+### Auto-compact old objects
+
+Планируемые варианты после профилирования: `Off/500/1000/5000 operations`. Порог запускает фоновое уплотнение только стабильного старого содержимого во время idle. Исходные векторы должны сохраняться в проверенном compressed snapshot, а объединённый блок использовать rebuildable multi-depth LOD cache; автоматическое необратимое превращение в bitmap запрещено.
+
+### Area Fill/Erase mode
+
+Планируется объединить Lasso Fill и Eraser Lasso в один Area tool с общей геометрией контура. `X` активирует инструмент и при повторном нажатии переключает `Fill/Erase`; toolbar и preview явно показывают destructive режим. Текущий `EraseArea` по-прежнему записывается с active `layer_id`, поддерживает undo/redo и reopen. Переключатель scope `Active layer` / `All unlocked layers` остаётся задачей M4.
+
+### Canvas overlay / Display
+
+Планируется раздел `Settings > Display` с master switch и независимыми флагами: `Depth/Zoom`, `Tile X/Y`, `Local X/Y`, `Operation count`, `FPS/Frame time`, `Tile/Rebuild state`. Presets `Minimal` и `Diagnostics` выставляют проверенные комбинации, любое ручное изменение становится `Custom`. Выбор сохраняется в `local/settings.json` и влияет только на UI, не на документ или тайлы.
+
+### Persistent Area selection
+
+Планируется отдельный временный режим `Area selection` с формами `Rectangle/Lasso`. Контур хранится в canvas coordinates, следует за pan/zoom/depth и ограничивает новые Brush/Eraser/Fill/Gradient operations. Selection не записывается в документ и не меняет revision, пока пользователь не выполнит операцию. В первой версии один Replace-контур; Add/Subtract/Intersect добавляются после устойчивого polygon clipping.
+
+### Gradient
+
+Первая версия: непрозрачный linear gradient с двумя color stops и start/end handles внутри активной Area selection. Затем radial gradient. Alpha stops, feather/soft edge и opacity откладываются до нового compositing path. Gradient сохраняется как векторная operation и должен одинаково выглядеть в fallback, tiles и export.
 
 ### Manual layers
 
 Управление именованными пользовательскими слоями дополнительно к автоматическим уровням глубины.
+Окно `Layers` показывает stack сверху вниз, active layer и количество операций. Первый checkbox управляет visibility, второй — lock. `+` создаёт новый верхний слой, `Duplicate` создаёт копию active layer непосредственно над исходным с новыми UUID операций, `Delete` удаляет active layer, `Rename` меняет имя, `Up`/`Down` меняют порядок. `Move selection to` переносит Object selection в другой visible/unlocked layer. `Merge Down` объединяет active layer с непосредственным нижним. Последний слой удалить нельзя; для непустого слоя требуется подтверждение. Hidden layer исключается из рендера, hidden/locked active layer не принимает инструменты редактирования. Все команды входят в общую с рисованием undo/redo timeline.
+
+Планируется multi-layer selection: обычный клик задаёт единственный active/selected layer, `Ctrl+клик` переключает отдельные слои, `Shift+клик` выбирает диапазон. Рисование всегда остаётся только в active layer. Bulk visibility/lock/reorder/delete/duplicate выполняются для selected layers атомарно; reorder сохраняет внутренний порядок блока. Позднее тот же selected set используется folders и `Merge Selected`.

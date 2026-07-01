@@ -1,5 +1,5 @@
 use num_bigint::BigInt;
-use num_traits::{Euclid, ToPrimitive, Zero};
+use num_traits::{Euclid, FromPrimitive, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 
 pub const DEPTH_RATIO: i64 = 8;
@@ -28,6 +28,43 @@ impl CanvasPoint {
         normalize_axis(&mut point.tile_x, &mut point.local_x);
         normalize_axis(&mut point.tile_y, &mut point.local_y);
         point
+    }
+
+    pub fn translated_by_screen_delta(
+        &self,
+        camera_depth: i64,
+        camera_zoom: f64,
+        delta_x: f64,
+        delta_y: f64,
+    ) -> Option<Self> {
+        if !camera_zoom.is_finite()
+            || camera_zoom <= 0.0
+            || !delta_x.is_finite()
+            || !delta_y.is_finite()
+        {
+            return None;
+        }
+        let screen_scale = TILE_PIXELS * camera_zoom;
+        let depth_delta = self.depth.checked_sub(camera_depth)?;
+        let levels = depth_delta.unsigned_abs();
+        let depth_scale = pow_ratio_f64(i64::try_from(levels).ok()?)?;
+        let convert_delta = |delta: f64| {
+            let camera_delta = delta / screen_scale;
+            if depth_delta >= 0 {
+                camera_delta * depth_scale
+            } else {
+                camera_delta / depth_scale
+            }
+        };
+        let (tile_x, local_x) =
+            translated_axis(&self.tile_x, self.local_x, convert_delta(delta_x))?;
+        let (tile_y, local_y) =
+            translated_axis(&self.tile_y, self.local_y, convert_delta(delta_y))?;
+        let translated = Self::new(self.depth, tile_x, tile_y, local_x, local_y);
+        if (delta_x != 0.0 || delta_y != 0.0) && translated == *self {
+            return None;
+        }
+        Some(translated)
     }
 }
 
@@ -194,6 +231,16 @@ fn normalize_axis(tile: &mut BigInt, local: &mut f64) {
         *tile += 1;
         *local -= 1.0;
     }
+}
+
+fn translated_axis(tile: &BigInt, local: f64, delta: f64) -> Option<(BigInt, f64)> {
+    let translated = local + delta;
+    if !translated.is_finite() {
+        return None;
+    }
+    let whole = translated.floor();
+    let whole = BigInt::from_f64(whole)?;
+    Some((tile + whole, translated - translated.floor()))
 }
 
 fn promote_axis(tile: &mut BigInt, local: &mut f64) {
@@ -421,5 +468,50 @@ mod tests {
             };
             assert!(camera.canvas_to_screen(&point, 1280.0, 720.0).is_none());
         }
+    }
+
+    #[test]
+    fn screen_delta_translation_preserves_extreme_bigint_tiles() {
+        let huge = BigInt::from(10u8).pow(1000);
+        let point = CanvasPoint::new(0, huge.clone(), -huge, 0.25, 0.75);
+
+        let moved = point
+            .translated_by_screen_delta(0, 2.0, 1024.0, -1024.0)
+            .expect("same-depth movement is representable");
+
+        assert_eq!(moved.tile_x, &point.tile_x + 1);
+        assert_eq!(moved.tile_y, &point.tile_y - 1);
+        assert!((moved.local_x - 0.25).abs() < f64::EPSILON);
+        assert!((moved.local_y - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn screen_delta_translation_scales_at_the_point_depth() {
+        let camera = CameraAddress::default();
+        let point = CanvasPoint::new(1, 4.into(), 4.into(), 0.0, 0.0);
+        let before = camera
+            .canvas_to_screen(&point, 1280.0, 720.0)
+            .expect("point projects");
+
+        let moved = point
+            .translated_by_screen_delta(camera.depth, camera.zoom, 64.0, 0.0)
+            .expect("adjacent-depth movement is representable");
+        let after = camera
+            .canvas_to_screen(&moved, 1280.0, 720.0)
+            .expect("moved point projects");
+
+        assert!((after.0 - before.0 - 64.0).abs() < 0.001);
+        assert!((after.1 - before.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn screen_delta_translation_rejects_unrepresentable_depth_scale() {
+        let point = CanvasPoint::new(1000, 0.into(), 0.into(), 0.5, 0.5);
+
+        assert!(
+            point
+                .translated_by_screen_delta(0, 1.0, 10.0, 0.0)
+                .is_none()
+        );
     }
 }

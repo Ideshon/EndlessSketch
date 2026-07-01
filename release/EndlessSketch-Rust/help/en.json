@@ -1,0 +1,283 @@
+{
+  "id": "en",
+  "tab_label": "English",
+  "title": "EndlessSketch Help",
+  "intro": "This reference describes the current tools and settings. Setting changes apply immediately and are saved automatically in local/settings.json beside the application.",
+  "sections": [
+    {
+      "title": "Drawing and tools",
+      "items": [
+        {
+          "name": "Brush (B)",
+          "description": "Draws an opaque line with the selected color and size. A single click creates a dot."
+        },
+        {
+          "name": "Eraser (E)",
+          "description": "Removes older content under the stroke. It uses the same size control as the Brush."
+        },
+        {
+          "name": "Lasso Fill (L)",
+          "description": "Trace an area. On release, the contour closes automatically and is saved as a vector fill."
+        },
+        {
+          "name": "Eyedropper (I)",
+          "description": "Samples the object color under the pointer and makes it the current Brush color."
+        },
+        {
+          "name": "Object Selection (S)",
+          "description": "Selects whole vector objects on the active layer with a click or rectangle."
+        },
+        {
+          "name": "Eraser Lasso (X)",
+          "description": "Trace the area to erase. Press Esc to cancel an unfinished contour."
+        },
+        {
+          "name": "Straight line",
+          "description": "Shift + left-drag draws a straight Brush or Eraser line from the starting point to the pointer."
+        },
+        {
+          "name": "Change size",
+          "description": "Ctrl + left-drag vertically changes the Brush, Eraser, or Fill size without drawing. Size is also available in the top toolbar."
+        },
+        {
+          "name": "Color and transparency",
+          "description": "The current color picker edits RGB only. New objects are opaque. Alpha from older objects remains stored but is flattened over the white background for display."
+        }
+      ]
+    },
+    {
+      "title": "Canvas navigation",
+      "items": [
+        {
+          "name": "Wheel zoom",
+          "description": "The mouse wheel zooms around the pointer position."
+        },
+        {
+          "name": "Pen or mouse zoom",
+          "description": "Hold Z and left-drag vertically. The point under the pointer remains the zoom anchor."
+        },
+        {
+          "name": "Pan",
+          "description": "Space + left-drag or middle-drag moves the view horizontally and vertically."
+        },
+        {
+          "name": "Jump to depth",
+          "description": "Enter a depth from -10000 to 10000 and press Go or Enter. The visible center is preserved at the new depth."
+        },
+        {
+          "name": "Tile X/Y jump",
+          "description": "Moves to absolute tile coordinates at the current depth. Large integers and notation such as 1e100 are accepted. Origin returns to tile 0/0."
+        },
+        {
+          "name": "Exact return",
+          "description": "Create a bookmark before an extreme depth or coordinate jump when you need a reliable return point."
+        }
+      ]
+    },
+    {
+      "title": "Selection and editing",
+      "items": [
+        {
+          "name": "Select one object",
+          "description": "Click an object with S. Only objects on the active visible unlocked layer are eligible."
+        },
+        {
+          "name": "Inside / Crossing",
+          "description": "Inside selects only objects fully enclosed by the rectangle. Crossing also selects lines and fills touched by it."
+        },
+        {
+          "name": "Add or remove",
+          "description": "Shift + click adds an object. Ctrl + click toggles it."
+        },
+        {
+          "name": "Cycle overlapping objects",
+          "description": "Alt + click or Alt + wheel cycles objects under the pointer. One physical wheel detent advances one object."
+        },
+        {
+          "name": "Move",
+          "description": "Drag any selected object. The complete selection moves together and is saved as one undoable command on release."
+        },
+        {
+          "name": "Order within a layer",
+          "description": "Ctrl + wheel moves selected objects one paint-order step relative to neighboring objects on the active layer."
+        },
+        {
+          "name": "Clear selection",
+          "description": "Press Esc. The selection rectangle disappears on release; selected-object highlighting remains."
+        },
+        {
+          "name": "Current selection limit",
+          "description": "The rectangle selects whole vector objects and does not crop them at its boundary."
+        }
+      ]
+    },
+    {
+      "title": "Clipboard and history",
+      "items": [
+        {
+          "name": "Copy / Cut",
+          "description": "Ctrl+C copies selected objects to the document-local clipboard. Ctrl+X copies and removes them as one undoable command."
+        },
+        {
+          "name": "Paste",
+          "description": "Ctrl+V pastes into the active layer with a 16 px offset. Each additional paste increases the offset by another 16 px."
+        },
+        {
+          "name": "Paste in place",
+          "description": "Ctrl+Shift+V pastes at the original coordinates. Pasted objects receive new identifiers and remain selected."
+        },
+        {
+          "name": "Delete",
+          "description": "Delete removes selected objects as one command. Source data remains in history for Undo."
+        },
+        {
+          "name": "Undo",
+          "description": "Ctrl+Z undoes the latest drawing, object edit, or supported layer command."
+        },
+        {
+          "name": "Redo",
+          "description": "Ctrl+Shift+Z or Ctrl+Y redoes an undone command. History remains available after closing and reopening the document."
+        }
+      ]
+    },
+    {
+      "title": "Layers and bookmarks",
+      "items": [
+        {
+          "name": "Active layer",
+          "description": "New objects are created only on the active layer. Object Selection searches only that layer."
+        },
+        {
+          "name": "Visibility and lock",
+          "description": "The first checkbox hides a layer; the second prevents edits. A hidden or locked active layer rejects drawing and selection."
+        },
+        {
+          "name": "Create and reorder",
+          "description": "The + button creates a new top layer. Up and Down change the active layer's render order."
+        },
+        {
+          "name": "Duplicate / Delete / Rename",
+          "description": "Duplicate copies a layer and its objects. Delete removes a layer after confirmation when nonempty. The final layer cannot be deleted. Rename changes its name."
+        },
+        {
+          "name": "Move selection to",
+          "description": "Transfers selected objects to another visible unlocked layer as one command."
+        },
+        {
+          "name": "Merge Down",
+          "description": "Combines the active layer with the nearest lower visible unlocked layer. Undo restores both layers."
+        },
+        {
+          "name": "Bookmarks",
+          "description": "Add stores the current camera under the entered name. Open returns to it, Rename changes the name, and Delete removes it."
+        }
+      ]
+    },
+    {
+      "title": "Input and performance settings",
+      "items": [
+        {
+          "name": "Profile",
+          "description": "Performance, Balanced, and Quality change only Tile resolution, Tile workers, and Zoom settle ms together. Custom appears automatically after one of those three values is edited."
+        },
+        {
+          "name": "Brush input px",
+          "description": "Minimum distance between accepted Brush and Eraser points. A smaller value follows fast movement more accurately but stores more points, increasing document size and processing load. A larger value stores fewer points but can lose small turns. This is not smoothing strength."
+        },
+        {
+          "name": "Fill input px",
+          "description": "Minimum distance between accepted Fill contour points. A smaller value records a fast contour more accurately but creates more points and load. A larger value makes lighter contours but may miss small bends."
+        },
+        {
+          "name": "Fill fallback points",
+          "description": "Maximum point count for showing a saved Fill as temporary vectors while its tile is missing. Lower values improve UI performance, but complex fills may disappear briefly until a tile is ready."
+        },
+        {
+          "name": "Fill fallback depth",
+          "description": "Maximum camera-depth difference for temporary vector Fill display. Lower values reduce distant-view load, but fills wait for tiles more often."
+        },
+        {
+          "name": "Zoom settle ms",
+          "description": "Delay after the last zoom event before high-quality tile work begins. A larger value avoids wasted work during movement but makes sharp tiles appear later."
+        },
+        {
+          "name": "Tile workers",
+          "description": "Number of background tile-rendering threads. More workers rebuild faster on a powerful CPU but compete more strongly with the UI and other applications."
+        },
+        {
+          "name": "Tile resolution",
+          "description": "Physical PNG size of each tile. 64–256 px is faster and smaller but looks more pixelated. 512 px is the normal balance. 1024–2048 px adds detail at higher CPU, memory, disk, and upload cost."
+        },
+        {
+          "name": "Pause tile generation",
+          "description": "Stops all new PNG tile work. Drawing, vector saves, Undo/Redo, and backups continue. The canvas uses vector display and any tiles already available."
+        },
+        {
+          "name": "Pause tile generation while drawing",
+          "description": "Temporarily frees CPU from tile generation only during the current stroke. Work resumes on release and does not override the manual persistent pause."
+        },
+        {
+          "name": "Deferred drawing preview",
+          "description": "A mode for slower CPUs. Pointer points are collected while drawing, but the growing draft is not rendered; the completed stroke appears on release. This reduces current-gesture cost but does not accelerate existing content."
+        },
+        {
+          "name": "Rebuild policy",
+          "description": "Immediate requests missing tiles at once. After interaction waits for a short idle period, reducing competition with the UI but updating tiles later."
+        },
+        {
+          "name": "Prefetch tiles",
+          "description": "Number of tile rings prepared around the screen. 0 reduces background work. 2 can make later panning smoother at higher CPU, disk, and memory cost."
+        },
+        {
+          "name": "Edge quality",
+          "description": "Edge quality in PNG tiles. Performance is faster with more visible steps. Balanced is the normal mode. Quality produces cleaner edges with slower rebuilds. Saved vectors do not change."
+        },
+        {
+          "name": "Smoothing",
+          "description": "Display smoothing for Brush, Eraser, and Fill geometry. Off shows raw points. Light, Balanced, and Strong progressively remove more jitter and round corners. Stored document points do not change."
+        },
+        {
+          "name": "Cache size MiB",
+          "description": "Disk PNG-cache budget for the current document. Older tiles are removed after the limit is exceeded and are rebuilt when needed. Drawing data is never deleted."
+        },
+        {
+          "name": "PNG compression",
+          "description": "Fast uses less CPU and writes larger files. Balanced is a compromise. Small compresses more and writes more slowly. Pixel quality is unchanged."
+        },
+        {
+          "name": "Preview FPS",
+          "description": "Background refresh rate for drafts and tile waiting. Lower values reduce continuous load but may look less smooth. Direct pen and mouse events still request frames immediately."
+        },
+        {
+          "name": "Reset",
+          "description": "Restores all settings to their defaults and saves them immediately."
+        }
+      ]
+    },
+    {
+      "title": "Files and recovery",
+      "items": [
+        {
+          "name": "New / Open",
+          "description": "New creates a directory-based .esketch document. Open selects an existing .esketch directory. File shows the current path."
+        },
+        {
+          "name": "Authoritative data",
+          "description": "Vector operations in canvas.sqlite3 are the original drawing data. PNG files under cache are only acceleration copies and can be rebuilt."
+        },
+        {
+          "name": "Autosave and backups",
+          "description": "A draft is saved during a long stroke. The database is checkpointed periodically, and verified rotating backups are kept inside the document."
+        },
+        {
+          "name": "Translation files",
+          "description": "Help loads help/*.json beside endless-sketch.exe. You can edit a translation or add a JSON file with a unique id; its language tab appears after restarting."
+        },
+        {
+          "name": "F1",
+          "description": "Opens this Help tab unless a text or numeric field is being edited."
+        }
+      ]
+    }
+  ]
+}

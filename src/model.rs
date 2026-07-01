@@ -3,6 +3,12 @@ use crate::coords::CanvasPoint;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub const DEFAULT_LAYER_ID: Uuid = Uuid::from_u128(1);
+
+fn default_layer_id() -> Uuid {
+    DEFAULT_LAYER_ID
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Color {
     pub r: u8,
@@ -50,6 +56,8 @@ pub enum ToolKind {
     Eraser,
     LassoFill,
     Eyedropper,
+    Selection,
+    EraserLasso,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +65,17 @@ pub enum EditKind {
     Paint,
     Erase,
     Fill,
+    EraseArea,
+}
+
+impl EditKind {
+    pub const fn is_area(self) -> bool {
+        matches!(self, Self::Fill | Self::EraseArea)
+    }
+
+    pub const fn is_erase(self) -> bool {
+        matches!(self, Self::Erase | Self::EraseArea)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,10 +85,43 @@ pub struct Bookmark {
     pub camera: CameraAddress,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Layer {
+    pub id: Uuid,
+    pub name: String,
+    pub sort_order: i64,
+    pub visible: bool,
+    pub locked: bool,
+}
+
+impl Layer {
+    pub fn default_layer() -> Self {
+        Self {
+            id: DEFAULT_LAYER_ID,
+            name: "Layer 1".to_owned(),
+            sort_order: 0,
+            visible: true,
+            locked: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaintOrderUpdate {
+    pub operation_id: Uuid,
+    pub paint_order: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditOperation {
     pub id: Uuid,
     pub sequence: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paint_order: Option<i64>,
+    #[serde(default)]
+    pub transaction_id: Uuid,
+    #[serde(default = "default_layer_id")]
+    pub layer_id: Uuid,
     pub kind: EditKind,
     pub native_depth: i64,
     pub native_zoom: f64,
@@ -78,6 +130,10 @@ pub struct EditOperation {
     pub width_px: f32,
     pub destructive: bool,
     pub affects_before_sequence: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstone_targets: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paint_order_updates: Vec<PaintOrderUpdate>,
 }
 
 impl EditOperation {
@@ -89,11 +145,15 @@ impl EditOperation {
         color: Color,
         width_px: f32,
     ) -> Self {
-        let destructive = matches!(kind, EditKind::Erase)
+        let destructive = kind.is_erase()
             || (matches!(kind, EditKind::Paint | EditKind::Fill) && color.is_opaque());
+        let id = Uuid::new_v4();
         Self {
-            id: Uuid::new_v4(),
+            id,
             sequence: 0,
+            paint_order: None,
+            transaction_id: id,
+            layer_id: DEFAULT_LAYER_ID,
             kind,
             native_depth,
             native_zoom,
@@ -102,11 +162,86 @@ impl EditOperation {
             width_px,
             destructive,
             affects_before_sequence: None,
+            tombstone_targets: Vec::new(),
+            paint_order_updates: Vec::new(),
         }
     }
 
+    pub fn tombstone(mut targets: Vec<Uuid>, layer_id: Uuid) -> Self {
+        targets.sort_unstable();
+        targets.dedup();
+        let id = Uuid::new_v4();
+        Self {
+            id,
+            sequence: 0,
+            paint_order: None,
+            transaction_id: id,
+            layer_id,
+            kind: EditKind::Erase,
+            native_depth: 0,
+            native_zoom: 1.0,
+            points: Vec::new(),
+            color: Color::WHITE,
+            width_px: 0.0,
+            destructive: true,
+            affects_before_sequence: None,
+            tombstone_targets: targets,
+            paint_order_updates: Vec::new(),
+        }
+    }
+
+    pub fn paint_order(updates: Vec<PaintOrderUpdate>, layer_id: Uuid) -> Self {
+        let id = Uuid::new_v4();
+        Self {
+            id,
+            sequence: 0,
+            paint_order: None,
+            transaction_id: id,
+            layer_id,
+            kind: EditKind::Paint,
+            native_depth: 0,
+            native_zoom: 1.0,
+            points: Vec::new(),
+            color: Color::WHITE,
+            width_px: 0.0,
+            destructive: false,
+            affects_before_sequence: None,
+            tombstone_targets: Vec::new(),
+            paint_order_updates: updates,
+        }
+    }
+
+    pub fn normalize_metadata(&mut self) {
+        if self.transaction_id.is_nil() {
+            self.transaction_id = self.id;
+        }
+        if self.layer_id.is_nil() {
+            self.layer_id = DEFAULT_LAYER_ID;
+        }
+        self.tombstone_targets
+            .retain(|target_id| *target_id != self.id);
+        self.tombstone_targets.sort_unstable();
+        self.tombstone_targets.dedup();
+    }
+
+    pub fn is_tombstone(&self) -> bool {
+        !self.tombstone_targets.is_empty()
+    }
+
+    pub fn is_paint_order_command(&self) -> bool {
+        !self.paint_order_updates.is_empty()
+    }
+
+    pub fn is_metadata_command(&self) -> bool {
+        self.is_tombstone() || self.is_paint_order_command()
+    }
+
+    pub fn effective_paint_order(&self) -> i64 {
+        self.paint_order.unwrap_or(self.sequence)
+    }
+
     pub fn visible_color(&self, background: Color) -> Color {
-        if self.kind == EditKind::Erase {
+        if self.kind.is_erase() {
             background
         } else {
             self.color
@@ -120,9 +255,10 @@ impl EditOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, EditKind, EditOperation};
+    use super::{Color, DEFAULT_LAYER_ID, EditKind, EditOperation, Layer};
     use crate::coords::CanvasPoint;
     use num_bigint::BigInt;
+    use uuid::Uuid;
 
     #[test]
     fn flattening_preserves_stored_alpha_and_returns_opaque_color() {
@@ -144,5 +280,30 @@ mod tests {
         assert_eq!(operation.color, source);
         assert_eq!(operation.color.a, 128);
         assert_eq!(flattened, Color::rgba(125, 125, 124, 255));
+    }
+
+    #[test]
+    fn new_operations_have_single_operation_transaction_and_default_layer() {
+        let operation =
+            EditOperation::draft(EditKind::Paint, 0, 1.0, Vec::new(), Color::BLACK, 8.0);
+
+        assert_eq!(operation.transaction_id, operation.id);
+        assert_eq!(operation.layer_id, DEFAULT_LAYER_ID);
+        assert_eq!(Layer::default_layer().id, DEFAULT_LAYER_ID);
+    }
+
+    #[test]
+    fn legacy_metadata_is_normalized_without_changing_operation_identity() {
+        let mut operation =
+            EditOperation::draft(EditKind::Paint, 0, 1.0, Vec::new(), Color::BLACK, 8.0);
+        let id = operation.id;
+        operation.transaction_id = Uuid::nil();
+        operation.layer_id = Uuid::nil();
+
+        operation.normalize_metadata();
+
+        assert_eq!(operation.id, id);
+        assert_eq!(operation.transaction_id, id);
+        assert_eq!(operation.layer_id, DEFAULT_LAYER_ID);
     }
 }

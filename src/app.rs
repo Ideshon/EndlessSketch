@@ -1,10 +1,12 @@
 use crate::coords::{CameraAddress, CanvasPoint};
 use crate::document::CanvasDocument;
+use crate::help::HelpLibrary;
 use crate::local_paths::{default_canvas_path, settings_path};
-use crate::model::{Bookmark, Color, EditKind, EditOperation, ToolKind};
+use crate::model::{Bookmark, Color, DEFAULT_LAYER_ID, EditKind, EditOperation, Layer, ToolKind};
 use crate::mouse_history::{MouseHistory, NativeWindow, native_window};
 use crate::projection_cache::{ProjectedGeometryCache, VisibleOperationCache};
 use crate::raster::operation_width;
+use crate::selection_geometry::{Point2 as SelectionPoint, Rect2 as SelectionRect, SelectionShape};
 use crate::settings::{
     AppSettings, EdgeQuality, MAX_BRUSH_INPUT_SPACING_PX, MAX_CACHE_SIZE_MIB,
     MAX_FILL_INPUT_SPACING_PX, MAX_PREVIEW_FPS, MAX_TILE_PREFETCH_RADIUS,
@@ -49,6 +51,10 @@ const MAX_QUICK_DEPTH: i64 = 10_000;
 const MAX_LATERAL_COORDINATE_DIGITS: usize = 10_000;
 const MAX_EXACT_OVERLAY_COORDINATE_DIGITS: usize = 18;
 const OVERLAY_COORDINATE_EDGE_DIGITS: usize = 8;
+const MIN_LASSO_PREVIEW_SPACING_PX: f32 = 2.0;
+const CLICK_SELECTION_DRAG_THRESHOLD_PX: f32 = 4.0;
+const CLICK_SELECTION_TOLERANCE_PX: f64 = 6.0;
+const SELECTION_CYCLE_POSITION_TOLERANCE_PX: f32 = 6.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PointAppendDecision {
@@ -62,6 +68,97 @@ enum TileFallbackMode {
     Current,
     OverlayAfter(i64),
     Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RectangleSelectionMode {
+    Inside,
+    Crossing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileWindowTab {
+    File,
+    Help,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectionModifiers {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SelectionCandidate {
+    id: Uuid,
+    effective_distance: f64,
+    bounds_area: f64,
+    layer_order: i64,
+    paint_order: i64,
+    is_eraser: bool,
+}
+
+#[derive(Default)]
+struct SelectionClipboard {
+    operations: Vec<EditOperation>,
+    paste_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardCommand {
+    Copy,
+    Cut,
+    Paste,
+    PasteInPlace,
+}
+
+#[derive(Default)]
+struct ClipboardShortcutKeys {
+    copy_down: bool,
+    cut_down: bool,
+    paste_down: bool,
+}
+
+impl ClipboardShortcutKeys {
+    fn poll(&mut self) -> Option<ClipboardCommand> {
+        let ctrl = native_key_down(0x11);
+        let shift = native_key_down(0x10);
+        self.update(
+            ctrl,
+            shift,
+            native_key_down(0x43),
+            native_key_down(0x58),
+            native_key_down(0x56),
+        )
+    }
+
+    fn update(
+        &mut self,
+        ctrl: bool,
+        shift: bool,
+        copy_down: bool,
+        cut_down: bool,
+        paste_down: bool,
+    ) -> Option<ClipboardCommand> {
+        let command = if ctrl && paste_down && !self.paste_down {
+            Some(if shift {
+                ClipboardCommand::PasteInPlace
+            } else {
+                ClipboardCommand::Paste
+            })
+        } else if ctrl && cut_down && !self.cut_down {
+            Some(ClipboardCommand::Cut)
+        } else if ctrl && copy_down && !self.copy_down {
+            Some(ClipboardCommand::Copy)
+        } else {
+            None
+        };
+        self.copy_down = copy_down;
+        self.cut_down = cut_down;
+        self.paste_down = paste_down;
+        command
+    }
 }
 
 struct LoadedTileTexture {
@@ -145,8 +242,15 @@ pub struct EndlessSketchApp {
     settings_path: PathBuf,
     bookmarks: Vec<Bookmark>,
     bookmark_edits: HashMap<Uuid, String>,
+    new_bookmark_name: String,
+    show_file: bool,
+    file_window_tab: FileWindowTab,
+    help_library: HelpLibrary,
+    help_language_id: String,
     show_bookmarks: bool,
     show_settings: bool,
+    show_layers: bool,
+    pending_layer_delete: Option<Uuid>,
     brush_sizing_drag_active: bool,
     frame_rate: FrameRateTracker,
     projected_geometry: ProjectedGeometryCache,
@@ -157,6 +261,25 @@ pub struct EndlessSketchApp {
     lateral_jump_x: String,
     lateral_jump_y: String,
     coordinate_overlay: CoordinateOverlayCache,
+    active_layer_id: Uuid,
+    layer_name_edit: String,
+    selection_clipboard: SelectionClipboard,
+    clipboard_shortcut_keys: ClipboardShortcutKeys,
+    selected_operation_ids: HashSet<Uuid>,
+    selection_drag_start: Option<Pos2>,
+    selection_drag_current: Option<Pos2>,
+    selection_drag_active: bool,
+    selection_move_start: Option<Pos2>,
+    selection_move_current: Option<Pos2>,
+    selection_move_active: bool,
+    rectangle_selection_mode: RectangleSelectionMode,
+    hovered_operation_id: Option<Uuid>,
+    selection_hover_position: Option<Pos2>,
+    selection_cycle_position: Option<Pos2>,
+    selection_cycle_candidates: Vec<Uuid>,
+    selection_cycle_index: usize,
+    eraser_lasso_points: Vec<Pos2>,
+    eraser_lasso_active: bool,
 }
 
 impl EndlessSketchApp {
@@ -179,6 +302,19 @@ impl EndlessSketchApp {
         );
         let bookmarks = document.bookmarks()?;
         let bookmark_edits = bookmark_edit_names(&bookmarks);
+        let new_bookmark_name = format!("Bookmark {}", bookmarks.len() + 1);
+        let active_layer = document
+            .layers()
+            .last()
+            .cloned()
+            .unwrap_or_else(crate::model::Layer::default_layer);
+        let active_layer_id = active_layer.id;
+        let layer_name_edit = active_layer.name;
+        let help_library = HelpLibrary::load();
+        for warning in help_library.warnings() {
+            log::warn!("Help translation ignored: {warning}");
+        }
+        let help_language_id = help_library.preferred_language_id().to_owned();
         Ok(Self {
             document,
             camera: CameraAddress::default(),
@@ -200,8 +336,15 @@ impl EndlessSketchApp {
             settings_path,
             bookmarks,
             bookmark_edits,
+            new_bookmark_name,
+            show_file: false,
+            file_window_tab: FileWindowTab::File,
+            help_library,
+            help_language_id,
             show_bookmarks: false,
             show_settings: false,
+            show_layers: false,
+            pending_layer_delete: None,
             brush_sizing_drag_active: false,
             frame_rate: FrameRateTracker::default(),
             projected_geometry: ProjectedGeometryCache::default(),
@@ -212,15 +355,98 @@ impl EndlessSketchApp {
             lateral_jump_x: "0".to_owned(),
             lateral_jump_y: "0".to_owned(),
             coordinate_overlay: CoordinateOverlayCache::default(),
+            active_layer_id,
+            layer_name_edit,
+            selection_clipboard: SelectionClipboard::default(),
+            clipboard_shortcut_keys: ClipboardShortcutKeys::default(),
+            selected_operation_ids: HashSet::new(),
+            selection_drag_start: None,
+            selection_drag_current: None,
+            selection_drag_active: false,
+            selection_move_start: None,
+            selection_move_current: None,
+            selection_move_active: false,
+            rectangle_selection_mode: RectangleSelectionMode::Inside,
+            hovered_operation_id: None,
+            selection_hover_position: None,
+            selection_cycle_position: None,
+            selection_cycle_candidates: Vec::new(),
+            selection_cycle_index: 0,
+            eraser_lasso_points: Vec::new(),
+            eraser_lasso_active: false,
         })
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        let mut selection_command = None;
+        let mut delete_selection_requested = false;
+        ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.tool, ToolKind::Brush, "Brush (B)");
             ui.selectable_value(&mut self.tool, ToolKind::Eraser, "Eraser (E)");
             ui.selectable_value(&mut self.tool, ToolKind::LassoFill, "Fill (L)");
             ui.selectable_value(&mut self.tool, ToolKind::Eyedropper, "Picker (I)");
+            ui.selectable_value(&mut self.tool, ToolKind::Selection, "Select (S)");
+            ui.selectable_value(&mut self.tool, ToolKind::EraserLasso, "Erase lasso (X)");
+            if self.tool == ToolKind::Selection {
+                ui.separator();
+                let mode = match self.rectangle_selection_mode {
+                    RectangleSelectionMode::Inside => "Inside",
+                    RectangleSelectionMode::Crossing => "Crossing",
+                };
+                let has_selection = !self.selected_operation_ids.is_empty();
+                let can_paste = !self.selection_clipboard.operations.is_empty()
+                    && self.document.layer_is_editable(self.active_layer_id);
+                ui.menu_button(format!("Selection: {mode}"), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.rectangle_selection_mode,
+                            RectangleSelectionMode::Inside,
+                            "Inside",
+                        );
+                        ui.selectable_value(
+                            &mut self.rectangle_selection_mode,
+                            RectangleSelectionMode::Crossing,
+                            "Crossing",
+                        );
+                    });
+                    ui.separator();
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new("Cut"))
+                        .clicked()
+                    {
+                        selection_command = Some(ClipboardCommand::Cut);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new("Copy"))
+                        .clicked()
+                    {
+                        selection_command = Some(ClipboardCommand::Copy);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(can_paste, egui::Button::new("Paste"))
+                        .clicked()
+                    {
+                        selection_command = Some(ClipboardCommand::Paste);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(can_paste, egui::Button::new("Paste in place"))
+                        .clicked()
+                    {
+                        selection_command = Some(ClipboardCommand::PasteInPlace);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new("Delete"))
+                        .clicked()
+                    {
+                        delete_selection_requested = true;
+                        ui.close();
+                    }
+                });
+            }
             ui.separator();
             ui.add(
                 egui::Slider::new(&mut self.brush_size, MIN_BRUSH_SIZE..=MAX_BRUSH_SIZE)
@@ -237,23 +463,9 @@ impl EndlessSketchApp {
             if ui.button("Redo").clicked() {
                 self.run_redo();
             }
-            if ui.button("Open").clicked() {
-                self.open_dialog();
-            }
-            if ui.button("New").clicked() {
-                self.new_dialog();
-            }
-            if ui.button("Add bookmark").clicked() {
-                let name = format!("Bookmark {}", self.bookmarks.len() + 1);
-                match self.document.add_bookmark(&name, &self.camera) {
-                    Ok(bookmark) => {
-                        self.bookmark_edits
-                            .insert(bookmark.id, bookmark.name.clone());
-                        self.bookmarks.push(bookmark);
-                        self.status_message = "Bookmark saved".to_owned();
-                    }
-                    Err(error) => self.status_message = format!("Bookmark failed: {error:#}"),
-                }
+            if ui.button("File").clicked() {
+                self.file_window_tab = FileWindowTab::File;
+                self.show_file = true;
             }
             if ui.button("Bookmarks").clicked() {
                 self.show_bookmarks = true;
@@ -261,7 +473,15 @@ impl EndlessSketchApp {
             if ui.button("Settings").clicked() {
                 self.show_settings = true;
             }
+            if ui.button("Layers").clicked() {
+                self.show_layers = true;
+            }
         });
+        if delete_selection_requested {
+            self.delete_selected();
+        } else if let Some(command) = selection_command {
+            self.run_clipboard_command(command);
+        }
         let mut jump_requested = false;
         ui.horizontal(|ui| {
             ui.label(format!("Current depth: {}", self.camera.depth));
@@ -303,6 +523,48 @@ impl EndlessSketchApp {
             self.jump_to_lateral_target();
         } else if origin_requested {
             self.jump_to_lateral_origin();
+        }
+    }
+
+    fn file_window(&mut self, context: &egui::Context) {
+        if !self.show_file {
+            return;
+        }
+
+        let mut open = self.show_file;
+        let mut new_requested = false;
+        let mut open_requested = false;
+        egui::Window::new("File")
+            .open(&mut open)
+            .default_width(680.0)
+            .resizable(true)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.file_window_tab, FileWindowTab::File, "File");
+                    ui.selectable_value(&mut self.file_window_tab, FileWindowTab::Help, "Help");
+                });
+                ui.separator();
+                match self.file_window_tab {
+                    FileWindowTab::File => {
+                        ui.horizontal(|ui| {
+                            new_requested = ui.button("New").clicked();
+                            open_requested = ui.button("Open").clicked();
+                        });
+                        ui.separator();
+                        ui.add(egui::Label::new(self.document.root().display().to_string()).wrap());
+                    }
+                    FileWindowTab::Help => {
+                        help_content(ui, &self.help_library, &mut self.help_language_id);
+                    }
+                }
+            });
+        self.show_file = open;
+        if new_requested {
+            self.show_file = false;
+            self.new_dialog();
+        } else if open_requested {
+            self.show_file = false;
+            self.open_dialog();
         }
     }
 
@@ -568,6 +830,375 @@ impl EndlessSketchApp {
         }
     }
 
+    fn layers_window(&mut self, context: &egui::Context) {
+        if !self.show_layers {
+            return;
+        }
+
+        let layers = self.document.layers().to_vec();
+        let operation_counts = layer_operation_counts(self.document.operations());
+        let active_index = layers
+            .iter()
+            .position(|layer| layer.id == self.active_layer_id);
+        let can_move_up = active_index.is_some_and(|index| index + 1 < layers.len());
+        let can_move_down = active_index.is_some_and(|index| index > 0);
+        let can_merge_down = active_index
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| layers.get(index))
+            .is_some_and(|destination| {
+                self.document.layer_is_editable(self.active_layer_id)
+                    && destination.visible
+                    && !destination.locked
+            });
+        let mut open = self.show_layers;
+        let mut create_requested = false;
+        let mut duplicate_requested = false;
+        let mut delete_requested = false;
+        let mut rename_requested = false;
+        let mut merge_down_requested = false;
+        let mut move_direction = 0;
+        let mut move_selection_target = None;
+        let mut visibility_request = None;
+        let mut lock_request = None;
+        egui::Window::new("Layers")
+            .open(&mut open)
+            .default_width(280.0)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    create_requested = ui.button("+").on_hover_text("New layer").clicked();
+                    duplicate_requested = ui
+                        .add_enabled(active_index.is_some(), egui::Button::new("Duplicate"))
+                        .clicked();
+                    delete_requested = ui
+                        .add_enabled(layers.len() > 1, egui::Button::new("Delete"))
+                        .clicked();
+                    if ui
+                        .add_enabled(can_move_up, egui::Button::new("Up"))
+                        .clicked()
+                    {
+                        move_direction = 1;
+                    }
+                    if ui
+                        .add_enabled(can_move_down, egui::Button::new("Down"))
+                        .clicked()
+                    {
+                        move_direction = -1;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.layer_name_edit);
+                    rename_requested = ui.button("Rename").clicked();
+                });
+                let can_move_selection = !self.selected_operation_ids.is_empty()
+                    && self.document.layer_is_editable(self.active_layer_id)
+                    && layers.iter().any(|layer| {
+                        layer.id != self.active_layer_id && layer.visible && !layer.locked
+                    });
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(can_move_selection, |ui| {
+                        ui.menu_button("Move selection to", |ui| {
+                            for layer in layers.iter().rev() {
+                                if layer.id == self.active_layer_id {
+                                    continue;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        layer.visible && !layer.locked,
+                                        egui::Button::new(&layer.name),
+                                    )
+                                    .clicked()
+                                {
+                                    move_selection_target = Some(layer.id);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
+                    merge_down_requested = ui
+                        .add_enabled(can_merge_down, egui::Button::new("Merge Down"))
+                        .clicked();
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        for layer in layers.iter().rev() {
+                            ui.horizontal(|ui| {
+                                let count = operation_counts.get(&layer.id).copied().unwrap_or(0);
+                                let mut visible = layer.visible;
+                                if ui
+                                    .checkbox(&mut visible, "")
+                                    .on_hover_text("Layer visibility")
+                                    .changed()
+                                {
+                                    visibility_request = Some((layer.id, visible));
+                                }
+                                let mut locked = layer.locked;
+                                if ui
+                                    .checkbox(&mut locked, "")
+                                    .on_hover_text("Lock layer editing")
+                                    .changed()
+                                {
+                                    lock_request = Some((layer.id, locked));
+                                }
+                                if ui
+                                    .selectable_label(self.active_layer_id == layer.id, &layer.name)
+                                    .clicked()
+                                {
+                                    self.activate_layer(layer.id, layer.name.clone());
+                                }
+                                ui.label(format!("{count} ops"));
+                            });
+                        }
+                    });
+            });
+        self.show_layers = open;
+        if create_requested {
+            self.create_layer();
+        } else if duplicate_requested {
+            self.duplicate_active_layer();
+        } else if delete_requested {
+            self.request_delete_active_layer();
+        } else if rename_requested {
+            self.rename_active_layer();
+        } else if merge_down_requested {
+            self.merge_active_layer_down();
+        } else if move_direction != 0 {
+            self.move_active_layer(move_direction);
+        } else if let Some(layer_id) = move_selection_target {
+            self.move_selection_to_layer(layer_id);
+        } else if let Some((layer_id, visible)) = visibility_request {
+            self.set_layer_visibility(layer_id, visible);
+        } else if let Some((layer_id, locked)) = lock_request {
+            self.set_layer_locked(layer_id, locked);
+        }
+    }
+
+    fn create_layer(&mut self) {
+        let name = format!("Layer {}", self.document.layers().len() + 1);
+        match self.document.create_layer(&name) {
+            Ok(layer) => {
+                self.activate_layer(layer.id, layer.name);
+                self.status_message = "Layer created".to_owned();
+            }
+            Err(error) => self.status_message = format!("Layer creation failed: {error:#}"),
+        }
+    }
+
+    fn rename_active_layer(&mut self) {
+        match self
+            .document
+            .rename_layer(self.active_layer_id, &self.layer_name_edit)
+        {
+            Ok(true) => {
+                self.layer_name_edit = self.layer_name_edit.trim().to_owned();
+                self.status_message = "Layer renamed".to_owned();
+            }
+            Ok(false) => self.status_message = "Active layer not found".to_owned(),
+            Err(error) => self.status_message = format!("Layer rename failed: {error:#}"),
+        }
+    }
+
+    fn duplicate_active_layer(&mut self) {
+        match self.document.duplicate_layer(self.active_layer_id) {
+            Ok(Some((layer, operation_count))) => {
+                self.activate_layer(layer.id, layer.name);
+                self.invalidate_tile_rendering();
+                self.status_message = format!("Layer duplicated ({operation_count} objects)");
+            }
+            Ok(None) => self.status_message = "Active layer not found".to_owned(),
+            Err(error) => self.status_message = format!("Layer duplication failed: {error:#}"),
+        }
+    }
+
+    fn request_delete_active_layer(&mut self) {
+        if self.document.layers().len() <= 1 {
+            self.status_message = "The last layer cannot be deleted".to_owned();
+            return;
+        }
+        let operation_count = self
+            .document
+            .operations()
+            .iter()
+            .filter(|operation| operation.layer_id == self.active_layer_id)
+            .count();
+        if operation_count == 0 {
+            self.delete_layer(self.active_layer_id);
+        } else {
+            self.pending_layer_delete = Some(self.active_layer_id);
+        }
+    }
+
+    fn layer_delete_confirmation(&mut self, context: &egui::Context) {
+        let Some(layer_id) = self.pending_layer_delete else {
+            return;
+        };
+        let Some(layer) = self
+            .document
+            .layers()
+            .iter()
+            .find(|layer| layer.id == layer_id)
+        else {
+            self.pending_layer_delete = None;
+            return;
+        };
+        let layer_name = layer.name.clone();
+        let operation_count = self
+            .document
+            .operations()
+            .iter()
+            .filter(|operation| operation.layer_id == layer_id)
+            .count();
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Delete layer?")
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label(format!(
+                    "\"{layer_name}\" contains {operation_count} objects."
+                ));
+                ui.label("The layer and its contents can be restored with Undo.");
+                ui.horizontal(|ui| {
+                    confirm = ui.button("Delete").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if confirm {
+            self.pending_layer_delete = None;
+            self.delete_layer(layer_id);
+        } else if cancel {
+            self.pending_layer_delete = None;
+        }
+    }
+
+    fn delete_layer(&mut self, layer_id: Uuid) {
+        let layers = self.document.layers().to_vec();
+        let Some(index) = layers.iter().position(|layer| layer.id == layer_id) else {
+            self.status_message = "Layer not found".to_owned();
+            return;
+        };
+        let next_active = layers
+            .get(index + 1)
+            .or_else(|| index.checked_sub(1).and_then(|index| layers.get(index)))
+            .map(|layer| (layer.id, layer.name.clone()));
+        match self.document.delete_layer(layer_id) {
+            Ok(true) => {
+                if let Some((id, name)) = next_active {
+                    self.activate_layer(id, name);
+                }
+                self.clear_transient_tools();
+                self.invalidate_tile_rendering();
+                self.status_message = "Layer deleted".to_owned();
+            }
+            Ok(false) => self.status_message = "Layer not found".to_owned(),
+            Err(error) => self.status_message = format!("Layer deletion failed: {error:#}"),
+        }
+    }
+
+    fn move_active_layer(&mut self, direction: i32) {
+        match self.document.move_layer(self.active_layer_id, direction) {
+            Ok(true) => {
+                self.invalidate_tile_rendering();
+                self.status_message = if direction > 0 {
+                    "Layer moved up".to_owned()
+                } else {
+                    "Layer moved down".to_owned()
+                };
+            }
+            Ok(false) => self.status_message = "Layer is already at the edge".to_owned(),
+            Err(error) => self.status_message = format!("Layer reorder failed: {error:#}"),
+        }
+    }
+
+    fn merge_active_layer_down(&mut self) {
+        match self.document.merge_layer_down(self.active_layer_id) {
+            Ok(Some((destination, merged_count))) => {
+                self.activate_layer(destination.id, destination.name);
+                self.invalidate_tile_rendering();
+                self.status_message = format!("Merged {merged_count} objects down");
+            }
+            Ok(None) => self.status_message = "No lower layer to merge into".to_owned(),
+            Err(error) => self.status_message = format!("Merge Down failed: {error:#}"),
+        }
+    }
+
+    fn move_selection_to_layer(&mut self, target_layer_id: Uuid) {
+        let Some(target_name) = self
+            .document
+            .layers()
+            .iter()
+            .find(|layer| layer.id == target_layer_id)
+            .map(|layer| layer.name.clone())
+        else {
+            self.status_message = "Target layer not found".to_owned();
+            return;
+        };
+        let selected = self.selected_operation_ids.clone();
+        match self.document.move_operations_to_layer(
+            &selected,
+            self.active_layer_id,
+            target_layer_id,
+        ) {
+            Ok(ids) if !ids.is_empty() => {
+                self.activate_layer(target_layer_id, target_name.clone());
+                self.selected_operation_ids = ids.into_iter().collect();
+                self.invalidate_tile_rendering();
+                self.status_message = format!(
+                    "Moved {} objects to {target_name}",
+                    self.selected_operation_ids.len()
+                );
+            }
+            Ok(_) => self.status_message = "Nothing moved".to_owned(),
+            Err(error) => self.status_message = format!("Move to layer failed: {error:#}"),
+        }
+    }
+
+    fn set_layer_visibility(&mut self, layer_id: Uuid, visible: bool) {
+        match self.document.set_layer_visibility(layer_id, visible) {
+            Ok(true) => {
+                if layer_id == self.active_layer_id && !visible {
+                    self.clear_transient_tools();
+                }
+                self.invalidate_tile_rendering();
+                self.status_message = if visible {
+                    "Layer shown".to_owned()
+                } else {
+                    "Layer hidden".to_owned()
+                };
+            }
+            Ok(false) => self.status_message = "Layer visibility is unchanged".to_owned(),
+            Err(error) => self.status_message = format!("Layer visibility failed: {error:#}"),
+        }
+    }
+
+    fn set_layer_locked(&mut self, layer_id: Uuid, locked: bool) {
+        match self.document.set_layer_locked(layer_id, locked) {
+            Ok(true) => {
+                if layer_id == self.active_layer_id && locked {
+                    self.clear_transient_tools();
+                }
+                self.status_message = if locked {
+                    "Layer locked".to_owned()
+                } else {
+                    "Layer unlocked".to_owned()
+                };
+            }
+            Ok(false) => self.status_message = "Layer lock is unchanged".to_owned(),
+            Err(error) => self.status_message = format!("Layer lock failed: {error:#}"),
+        }
+    }
+
+    fn activate_layer(&mut self, layer_id: Uuid, name: String) {
+        let changed = self.active_layer_id != layer_id;
+        self.active_layer_id = layer_id;
+        self.layer_name_edit = name;
+        if changed {
+            self.clear_transient_tools();
+            self.status_message = "Active layer changed".to_owned();
+        }
+    }
+
     fn bookmark_window(&mut self, context: &egui::Context) {
         if !self.show_bookmarks {
             return;
@@ -576,6 +1207,7 @@ impl EndlessSketchApp {
         let mut open = self.show_bookmarks;
         let mut close_requested = false;
         let mut selected_camera = None;
+        let mut add_requested = false;
         let mut rename_request = None;
         let mut delete_request = None;
         let bookmarks = self.bookmarks.clone();
@@ -586,34 +1218,44 @@ impl EndlessSketchApp {
             .resizable(true)
             .collapsible(false)
             .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.new_bookmark_name)
+                            .desired_width(300.0)
+                            .char_limit(128),
+                    );
+                    let add_by_enter = response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    add_requested = ui.button("Add").clicked() || add_by_enter;
+                });
+                ui.separator();
                 if bookmarks.is_empty() {
                     ui.label("No bookmarks");
-                    return;
-                }
-
-                for bookmark in bookmarks {
-                    let edit_name = self
-                        .bookmark_edits
-                        .entry(bookmark.id)
-                        .or_insert_with(|| bookmark.name.clone());
-                    ui.horizontal(|ui| {
-                        if ui.button("Open").clicked() {
-                            selected_camera = Some(bookmark.camera.clone());
-                        }
-                        let response = ui.add(
-                            egui::TextEdit::singleline(edit_name)
-                                .desired_width(260.0)
-                                .clip_text(false),
-                        );
-                        let rename_by_enter = response.lost_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                        if ui.button("Rename").clicked() || rename_by_enter {
-                            rename_request = Some((bookmark.id, edit_name.trim().to_owned()));
-                        }
-                        if ui.button("Delete").clicked() {
-                            delete_request = Some(bookmark.id);
-                        }
-                    });
+                } else {
+                    for bookmark in bookmarks {
+                        let edit_name = self
+                            .bookmark_edits
+                            .entry(bookmark.id)
+                            .or_insert_with(|| bookmark.name.clone());
+                        ui.horizontal(|ui| {
+                            if ui.button("Open").clicked() {
+                                selected_camera = Some(bookmark.camera.clone());
+                            }
+                            let response = ui.add(
+                                egui::TextEdit::singleline(edit_name)
+                                    .desired_width(260.0)
+                                    .clip_text(false),
+                            );
+                            let rename_by_enter = response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                            if ui.button("Rename").clicked() || rename_by_enter {
+                                rename_request = Some((bookmark.id, edit_name.trim().to_owned()));
+                            }
+                            if ui.button("Delete").clicked() {
+                                delete_request = Some(bookmark.id);
+                            }
+                        });
+                    }
                 }
 
                 ui.separator();
@@ -622,6 +1264,9 @@ impl EndlessSketchApp {
                 }
             });
 
+        if add_requested {
+            self.add_current_bookmark();
+        }
         if let Some(camera) = selected_camera {
             self.camera = camera;
             self.depth_jump_target = self.camera.depth;
@@ -640,16 +1285,38 @@ impl EndlessSketchApp {
         self.show_bookmarks = open;
     }
 
+    fn add_current_bookmark(&mut self) {
+        let name = if self.new_bookmark_name.trim().is_empty() {
+            format!("Bookmark {}", self.bookmarks.len() + 1)
+        } else {
+            self.new_bookmark_name.trim().to_owned()
+        };
+        match self.document.add_bookmark(&name, &self.camera) {
+            Ok(bookmark) => {
+                self.bookmark_edits
+                    .insert(bookmark.id, bookmark.name.clone());
+                self.bookmarks.push(bookmark);
+                self.new_bookmark_name = format!("Bookmark {}", self.bookmarks.len() + 1);
+                self.status_message = "Bookmark saved".to_owned();
+            }
+            Err(error) => self.status_message = format!("Bookmark failed: {error:#}"),
+        }
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui, context: &egui::Context, window: Option<NativeWindow>) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         painter.rect_filled(response.rect, 0.0, to_color32(BACKGROUND));
         let frame_time = ui.input(|input| input.unstable_dt);
+        let pointer_pressed = context.input(|input| input.pointer.any_pressed());
+        surrender_canvas_keyboard_focus(context, response.hovered(), pointer_pressed);
 
         self.handle_shortcuts(context);
         self.handle_navigation(ui, &response);
         self.handle_drawing(ui, &response, window);
         let pointer_down = ui.input(|input| input.pointer.any_down());
-        let input_active = self.draft.is_some() || pointer_down;
+        let transient_preview_active =
+            self.selection_drag_active || self.selection_move_active || self.eraser_lasso_active;
+        let input_active = self.draft.is_some() || (pointer_down && !transient_preview_active);
         self.update_tile_rebuild_interaction(input_active);
         let interaction_active =
             input_active || self.zoom_tile_requests_deferred() || self.tile_rebuild_is_deferred();
@@ -662,31 +1329,57 @@ impl EndlessSketchApp {
             TileFallbackMode::Full => self.paint_operations(&painter, response.rect),
         }
         self.paint_draft(&painter, response.rect);
+        self.paint_transient_overlays(&painter, response.rect);
         self.paint_overlay(&painter, response.rect);
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
+        if !context.text_edit_focused() && context.input(|input| input.key_pressed(egui::Key::F1)) {
+            self.file_window_tab = FileWindowTab::Help;
+            self.show_file = true;
+        }
+        let native_clipboard_command = self.clipboard_shortcut_keys.poll();
+        if !context.text_edit_focused()
+            && let Some(command) = context
+                .input(|input| clipboard_command_from_events(&input.events, input.modifiers))
+                .or(native_clipboard_command)
+        {
+            self.run_clipboard_command(command);
+        }
         context.input(|input| {
-            if input.key_pressed(egui::Key::B) {
+            let tool_shortcut_allowed = tool_shortcut_allowed(input.modifiers);
+            if tool_shortcut_allowed && input.key_pressed(egui::Key::B) {
                 self.tool = ToolKind::Brush;
-            } else if input.key_pressed(egui::Key::E) {
+            } else if tool_shortcut_allowed && input.key_pressed(egui::Key::E) {
                 self.tool = ToolKind::Eraser;
-            } else if input.key_pressed(egui::Key::L) {
+            } else if tool_shortcut_allowed && input.key_pressed(egui::Key::L) {
                 self.tool = ToolKind::LassoFill;
-            } else if input.key_pressed(egui::Key::I) {
+            } else if tool_shortcut_allowed && input.key_pressed(egui::Key::I) {
                 self.tool = ToolKind::Eyedropper;
+            } else if tool_shortcut_allowed && input.key_pressed(egui::Key::S) {
+                self.tool = ToolKind::Selection;
+            } else if tool_shortcut_allowed && input.key_pressed(egui::Key::X) {
+                self.tool = ToolKind::EraserLasso;
             }
+        });
+        if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.clear_transient_tools();
+            self.status_message = "Selection cleared".to_owned();
+        }
+        if context.input(|input| input.key_pressed(egui::Key::Delete))
+            && !self.selected_operation_ids.is_empty()
+        {
+            self.delete_selected();
+        }
+        let redo = context.input_mut(|input| {
+            redo_shortcuts()
+                .iter()
+                .any(|shortcut| input.consume_shortcut(shortcut))
         });
         let undo = context.input_mut(|input| {
             input.consume_shortcut(&egui::KeyboardShortcut::new(
                 egui::Modifiers::CTRL,
                 egui::Key::Z,
-            ))
-        });
-        let redo = context.input_mut(|input| {
-            input.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::CTRL,
-                egui::Key::Y,
             ))
         });
         if undo {
@@ -697,12 +1390,44 @@ impl EndlessSketchApp {
         }
     }
 
+    fn run_clipboard_command(&mut self, command: ClipboardCommand) {
+        match command {
+            ClipboardCommand::Copy => self.copy_selected(),
+            ClipboardCommand::Cut => self.cut_selected(),
+            ClipboardCommand::Paste => self.paste_selection(false),
+            ClipboardCommand::PasteInPlace => self.paste_selection(true),
+        }
+    }
+
     fn handle_navigation(&mut self, ui: &egui::Ui, response: &egui::Response) {
         if response.hovered() {
+            if self.tool == ToolKind::Selection
+                && let Some(position) = response.hover_pos()
+            {
+                let reorder_steps =
+                    ui.input(|input| paint_order_wheel_steps(input.events.as_slice()));
+                if !reorder_steps.is_empty() {
+                    for step in reorder_steps {
+                        self.reorder_selection(step);
+                    }
+                    return;
+                }
+                let wheel_steps = ui.input(|input| selection_wheel_steps(input.events.as_slice()));
+                if !wheel_steps.is_empty() {
+                    for step in wheel_steps {
+                        self.cycle_selection_with_wheel(position, response.rect, step);
+                    }
+                    return;
+                }
+            }
+
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll.abs() > f32::EPSILON
                 && let Some(position) = response.hover_pos()
             {
+                if self.tool == ToolKind::Selection && ui.input(|input| input.modifiers.alt) {
+                    return;
+                }
                 let factor = (scroll as f64 * 0.002).exp();
                 self.camera.zoom_at(
                     factor,
@@ -719,6 +1444,8 @@ impl EndlessSketchApp {
             let delta = ui.input(|input| input.pointer.delta());
             if delta.x.abs() > f32::EPSILON || delta.y.abs() > f32::EPSILON {
                 self.camera.pan_content_by(delta.x as f64, delta.y as f64);
+                self.hovered_operation_id = None;
+                self.selection_hover_position = None;
             }
             return;
         }
@@ -745,6 +1472,8 @@ impl EndlessSketchApp {
             let delta = ui.input(|input| input.pointer.delta());
             if delta.x.abs() > f32::EPSILON || delta.y.abs() > f32::EPSILON {
                 self.camera.pan_content_by(delta.x as f64, delta.y as f64);
+                self.hovered_operation_id = None;
+                self.selection_hover_position = None;
             }
         }
     }
@@ -769,10 +1498,21 @@ impl EndlessSketchApp {
         let events = ui.input(|input| input.events.clone());
         let (event_press_position, mut drag_positions) =
             primary_pointer_positions(&events, primary_down);
-        let shift_down = ui.input(|input| input.modifiers.shift);
-        let ctrl_down = ui.input(|input| input.modifiers.ctrl);
+        let modifiers = ui.input(|input| SelectionModifiers {
+            shift: input.modifiers.shift,
+            ctrl: input.modifiers.ctrl,
+            alt: input.modifiers.alt,
+        });
+        let shift_down = modifiers.shift;
 
-        if primary_pressed && ctrl_down && response.hovered() {
+        if primary_pressed
+            && modifiers.ctrl
+            && response.hovered()
+            && matches!(
+                self.tool,
+                ToolKind::Brush | ToolKind::Eraser | ToolKind::LassoFill
+            )
+        {
             self.brush_sizing_drag_active = true;
         }
         if self.brush_sizing_drag_active {
@@ -792,10 +1532,34 @@ impl EndlessSketchApp {
             }
         }
 
+        if self.tool != ToolKind::Selection {
+            self.hovered_operation_id = None;
+            self.selection_hover_position = None;
+        }
+        if matches!(self.tool, ToolKind::Selection | ToolKind::EraserLasso) {
+            self.mouse_history.reset();
+            self.handle_transient_tool(
+                response,
+                event_press_position,
+                drag_positions,
+                position,
+                primary_pressed,
+                primary_down,
+                primary_released,
+                modifiers,
+            );
+            self.last_pointer_position = position;
+            return;
+        }
+
         if primary_pressed && response.hovered() {
             let press_position = event_press_position.or(position);
             if self.tool == ToolKind::Eyedropper {
                 self.pick_color_at(press_position, response.rect);
+                return;
+            }
+            if !self.document.layer_is_editable(self.active_layer_id) {
+                self.status_message = "Active layer is hidden or locked".to_owned();
                 return;
             }
             if let Some(position) = press_position {
@@ -804,21 +1568,23 @@ impl EndlessSketchApp {
                     ToolKind::Brush => EditKind::Paint,
                     ToolKind::Eraser => EditKind::Erase,
                     ToolKind::LassoFill => EditKind::Fill,
-                    ToolKind::Eyedropper => return,
+                    ToolKind::Eyedropper | ToolKind::Selection | ToolKind::EraserLasso => return,
                 };
                 let color = if kind == EditKind::Erase {
                     BACKGROUND
                 } else {
                     self.color
                 };
-                self.draft = Some(EditOperation::draft(
+                let mut draft = EditOperation::draft(
                     kind,
                     self.camera.depth,
                     self.camera.zoom,
                     vec![point],
                     color,
                     self.brush_size,
-                ));
+                );
+                draft.layer_id = self.active_layer_id;
+                self.draft = Some(draft);
                 self.mouse_history.begin(window, position, pixels_per_point);
                 self.last_draft_save = Instant::now();
                 self.begin_drawing_tile_pause();
@@ -865,6 +1631,462 @@ impl EndlessSketchApp {
             self.finish_draft();
         }
         self.last_pointer_position = position;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_transient_tool(
+        &mut self,
+        response: &egui::Response,
+        event_press_position: Option<Pos2>,
+        mut drag_positions: Vec<Pos2>,
+        position: Option<Pos2>,
+        primary_pressed: bool,
+        primary_down: bool,
+        primary_released: bool,
+        modifiers: SelectionModifiers,
+    ) {
+        if primary_down
+            && let Some(position) = position
+            && drag_positions.last().is_none_or(|last| *last != position)
+        {
+            drag_positions.push(position);
+        }
+
+        match self.tool {
+            ToolKind::Selection => {
+                if !primary_down
+                    && !self.selection_drag_active
+                    && !self.selection_move_active
+                    && position != self.selection_hover_position
+                {
+                    self.selection_hover_position = position;
+                    self.hovered_operation_id = position
+                        .filter(|position| response.rect.contains(*position))
+                        .and_then(|position| {
+                            self.selection_candidates_at(position, response.rect)
+                                .first()
+                                .map(|candidate| candidate.id)
+                        });
+                }
+                if primary_pressed
+                    && response.hovered()
+                    && let Some(position) = event_press_position.or(position)
+                {
+                    self.hovered_operation_id = None;
+                    self.selection_hover_position = None;
+                    if !modifiers.shift
+                        && !modifiers.ctrl
+                        && !modifiers.alt
+                        && self.position_hits_selected(position, response.rect)
+                    {
+                        self.selection_move_start = Some(position);
+                        self.selection_move_current = Some(position);
+                        self.selection_move_active = true;
+                        self.selection_drag_active = false;
+                    } else {
+                        self.selection_drag_start = Some(position);
+                        self.selection_drag_current = Some(position);
+                        self.selection_drag_active = true;
+                        self.selection_move_active = false;
+                    }
+                }
+                if self.selection_move_active {
+                    for position in drag_positions {
+                        self.selection_move_current = Some(position);
+                    }
+                    if primary_released {
+                        if let Some(position) = position {
+                            self.selection_move_current = Some(position);
+                        }
+                        self.finish_selection_move();
+                    }
+                    return;
+                }
+                if self.selection_drag_active {
+                    for position in drag_positions {
+                        if response.rect.contains(position) {
+                            self.selection_drag_current = Some(position);
+                        }
+                    }
+                }
+                if primary_released && self.selection_drag_active {
+                    if let Some(position) = position
+                        && response.rect.contains(position)
+                    {
+                        self.selection_drag_current = Some(position);
+                    }
+                    self.selection_drag_active = false;
+                    let drag_distance =
+                        match (self.selection_drag_start, self.selection_drag_current) {
+                            (Some(start), Some(end)) => start.distance(end),
+                            _ => 0.0,
+                        };
+                    if drag_distance <= CLICK_SELECTION_DRAG_THRESHOLD_PX {
+                        if let Some(position) = self.selection_drag_current {
+                            self.complete_click_selection(position, response.rect, modifiers);
+                        }
+                        self.selection_drag_start = None;
+                        self.selection_drag_current = None;
+                    } else {
+                        self.complete_rectangle_selection(response.rect, modifiers);
+                    }
+                }
+            }
+            ToolKind::EraserLasso => {
+                self.hovered_operation_id = None;
+                if primary_pressed
+                    && response.hovered()
+                    && let Some(position) = event_press_position.or(position)
+                {
+                    if !self.document.layer_is_editable(self.active_layer_id) {
+                        self.status_message = "Active layer is hidden or locked".to_owned();
+                        return;
+                    }
+                    self.eraser_lasso_points.clear();
+                    self.eraser_lasso_points.push(position);
+                    self.eraser_lasso_active = true;
+                }
+                if self.eraser_lasso_active {
+                    for position in drag_positions {
+                        if response.rect.contains(position) {
+                            append_preview_point(
+                                &mut self.eraser_lasso_points,
+                                position,
+                                MIN_LASSO_PREVIEW_SPACING_PX,
+                            );
+                        }
+                    }
+                }
+                if primary_released && self.eraser_lasso_active {
+                    if let Some(position) = position
+                        && response.rect.contains(position)
+                    {
+                        append_preview_point(
+                            &mut self.eraser_lasso_points,
+                            position,
+                            MIN_LASSO_PREVIEW_SPACING_PX,
+                        );
+                    }
+                    self.eraser_lasso_active = false;
+                    self.commit_eraser_lasso(response.rect);
+                    self.eraser_lasso_points.clear();
+                }
+            }
+            ToolKind::Brush | ToolKind::Eraser | ToolKind::LassoFill | ToolKind::Eyedropper => {}
+        }
+    }
+
+    fn complete_rectangle_selection(&mut self, canvas_rect: Rect, modifiers: SelectionModifiers) {
+        let (Some(start), Some(end)) = (self.selection_drag_start, self.selection_drag_current)
+        else {
+            return;
+        };
+        let selection_rect =
+            SelectionRect::from_points(selection_point(start), selection_point(end));
+        let selection = SelectionShape::Rectangle(selection_rect);
+        let candidates = self.visible_selectable_operation_ids(canvas_rect);
+        let matches: HashSet<_> = self
+            .document
+            .operations()
+            .iter()
+            .filter(|operation| candidates.contains(&operation.id))
+            .filter_map(|operation| {
+                let points: Vec<_> = operation
+                    .points
+                    .iter()
+                    .filter_map(|point| self.point_to_position(point, canvas_rect))
+                    .map(selection_point)
+                    .collect();
+                let width = operation_width(operation, self.camera.depth, self.camera.zoom) as f64;
+                let selected = match self.rectangle_selection_mode {
+                    RectangleSelectionMode::Inside => operation_contained_by_rectangle(
+                        operation.kind,
+                        &points,
+                        width,
+                        selection_rect,
+                    ),
+                    RectangleSelectionMode::Crossing => {
+                        operation_intersects_selection(operation.kind, &points, width, &selection)
+                    }
+                };
+                selected.then_some(operation.id)
+            })
+            .collect();
+        self.apply_selection_ids(matches, modifiers);
+        self.reset_selection_cycle();
+        self.status_message = format!("Selected {} objects", self.selected_operation_ids.len());
+        self.selection_drag_start = None;
+        self.selection_drag_current = None;
+    }
+
+    fn complete_click_selection(
+        &mut self,
+        position: Pos2,
+        canvas_rect: Rect,
+        modifiers: SelectionModifiers,
+    ) {
+        let candidates = self.selection_candidates_at(position, canvas_rect);
+        let candidate_ids: Vec<_> = candidates.iter().map(|candidate| candidate.id).collect();
+        let selected = if modifiers.alt && !candidate_ids.is_empty() {
+            self.cycle_selection_candidate(position, candidate_ids, 1)
+        } else {
+            self.reset_selection_cycle();
+            candidates.first().map(|candidate| candidate.id)
+        };
+
+        if let Some(selected) = selected {
+            if modifiers.ctrl {
+                if !self.selected_operation_ids.remove(&selected) {
+                    self.selected_operation_ids.insert(selected);
+                }
+            } else if modifiers.shift {
+                self.selected_operation_ids.insert(selected);
+            } else {
+                self.selected_operation_ids.clear();
+                self.selected_operation_ids.insert(selected);
+            }
+        } else if !modifiers.shift && !modifiers.ctrl {
+            self.selected_operation_ids.clear();
+        }
+        self.status_message = format!("Selected {} objects", self.selected_operation_ids.len());
+    }
+
+    fn cycle_selection_with_wheel(&mut self, position: Pos2, canvas_rect: Rect, step: isize) {
+        let candidate_ids = self
+            .selection_candidates_at(position, canvas_rect)
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect();
+        let Some(selected) = self.cycle_selection_candidate(position, candidate_ids, step) else {
+            self.status_message = "No object under cursor".to_owned();
+            return;
+        };
+        self.selected_operation_ids.clear();
+        self.selected_operation_ids.insert(selected);
+        self.hovered_operation_id = Some(selected);
+        self.selection_hover_position = Some(position);
+        self.selection_drag_start = None;
+        self.selection_drag_current = None;
+        self.status_message = "Cycled selection".to_owned();
+    }
+
+    fn reorder_selection(&mut self, direction: isize) {
+        if self.selected_operation_ids.is_empty() {
+            self.status_message = "Nothing selected".to_owned();
+            return;
+        }
+        match self.document.reorder_operations(
+            &self.selected_operation_ids,
+            self.active_layer_id,
+            direction,
+        ) {
+            Ok(true) => {
+                self.invalidate_tile_rendering();
+                self.status_message = if direction > 0 {
+                    "Selection moved forward".to_owned()
+                } else {
+                    "Selection moved backward".to_owned()
+                };
+            }
+            Ok(false) => self.status_message = "Selection is already at the edge".to_owned(),
+            Err(error) => self.status_message = format!("Reorder failed: {error:#}"),
+        }
+    }
+
+    fn cycle_selection_candidate(
+        &mut self,
+        position: Pos2,
+        candidate_ids: Vec<Uuid>,
+        step: isize,
+    ) -> Option<Uuid> {
+        if candidate_ids.is_empty() {
+            self.reset_selection_cycle();
+            return None;
+        }
+        let continues_cycle = self.selection_cycle_position.is_some_and(|previous| {
+            previous.distance(position) <= SELECTION_CYCLE_POSITION_TOLERANCE_PX
+        }) && self.selection_cycle_candidates == candidate_ids;
+        self.selection_cycle_index = if continues_cycle {
+            wrapped_cycle_index(self.selection_cycle_index, candidate_ids.len(), step)
+        } else {
+            let current = candidate_ids
+                .iter()
+                .position(|id| self.selected_operation_ids.contains(id));
+            current.map_or_else(
+                || {
+                    if step < 0 { candidate_ids.len() - 1 } else { 0 }
+                },
+                |current| wrapped_cycle_index(current, candidate_ids.len(), step),
+            )
+        };
+        self.selection_cycle_position = Some(position);
+        self.selection_cycle_candidates = candidate_ids;
+        self.selection_cycle_candidates
+            .get(self.selection_cycle_index)
+            .copied()
+    }
+
+    fn visible_selectable_operation_ids(&self, canvas_rect: Rect) -> HashSet<Uuid> {
+        let eligible_layers = selectable_layer_ids(self.document.layers(), self.active_layer_id);
+        let lod = tile_lod_for_resolution(self.settings.tile_resolution_px);
+        let visible_tiles = self.visible_tiles(canvas_rect, lod);
+        self.document
+            .operation_ids_for_tiles_in_layers(&visible_tiles, &eligible_layers)
+            .into_iter()
+            .collect()
+    }
+
+    fn selection_candidates_at(
+        &self,
+        position: Pos2,
+        canvas_rect: Rect,
+    ) -> Vec<SelectionCandidate> {
+        let candidate_ids = self.visible_selectable_operation_ids(canvas_rect);
+        let click = selection_point(position);
+        let mut candidates: Vec<_> = self
+            .document
+            .operations()
+            .iter()
+            .filter(|operation| candidate_ids.contains(&operation.id))
+            .filter_map(|operation| {
+                let points: Vec<_> = operation
+                    .points
+                    .iter()
+                    .filter_map(|point| self.point_to_position(point, canvas_rect))
+                    .map(selection_point)
+                    .collect();
+                let width = operation_width(operation, self.camera.depth, self.camera.zoom) as f64;
+                let (effective_distance, bounds_area) =
+                    operation_click_score(operation.kind, &points, width, click)?;
+                Some(SelectionCandidate {
+                    id: operation.id,
+                    effective_distance,
+                    bounds_area,
+                    layer_order: self.document.layer_sort_order(operation.layer_id),
+                    paint_order: operation.effective_paint_order(),
+                    is_eraser: operation.kind.is_erase(),
+                })
+            })
+            .collect();
+        candidates.sort_by(|left, right| {
+            left.effective_distance
+                .total_cmp(&right.effective_distance)
+                .then_with(|| left.bounds_area.total_cmp(&right.bounds_area))
+                .then_with(|| left.is_eraser.cmp(&right.is_eraser))
+                .then_with(|| right.layer_order.cmp(&left.layer_order))
+                .then_with(|| right.paint_order.cmp(&left.paint_order))
+        });
+        candidates
+    }
+
+    fn apply_selection_ids(&mut self, matches: HashSet<Uuid>, modifiers: SelectionModifiers) {
+        if modifiers.ctrl {
+            for id in matches {
+                if !self.selected_operation_ids.remove(&id) {
+                    self.selected_operation_ids.insert(id);
+                }
+            }
+        } else if modifiers.shift {
+            self.selected_operation_ids.extend(matches);
+        } else {
+            self.selected_operation_ids = matches;
+        }
+    }
+
+    fn reset_selection_cycle(&mut self) {
+        self.selection_cycle_position = None;
+        self.selection_cycle_candidates.clear();
+        self.selection_cycle_index = 0;
+    }
+
+    fn position_hits_selected(&self, position: Pos2, canvas_rect: Rect) -> bool {
+        if self.selected_operation_ids.is_empty() {
+            return false;
+        }
+        let selection = SelectionShape::Rectangle(SelectionRect::from_points(
+            SelectionPoint::new((position.x - 3.0) as f64, (position.y - 3.0) as f64),
+            SelectionPoint::new((position.x + 3.0) as f64, (position.y + 3.0) as f64),
+        ));
+        self.document
+            .operations()
+            .iter()
+            .filter(|operation| self.selected_operation_ids.contains(&operation.id))
+            .any(|operation| {
+                let points: Vec<_> = operation
+                    .points
+                    .iter()
+                    .filter_map(|point| self.point_to_position(point, canvas_rect))
+                    .map(selection_point)
+                    .collect();
+                let width = operation_width(operation, self.camera.depth, self.camera.zoom) as f64;
+                operation_intersects_selection(operation.kind, &points, width, &selection)
+            })
+    }
+
+    fn finish_selection_move(&mut self) {
+        let delta = self.selection_move_delta();
+        self.selection_move_active = false;
+        self.selection_move_start = None;
+        self.selection_move_current = None;
+        if delta.length() < 0.5 {
+            return;
+        }
+
+        let selected = self.selected_operation_ids.clone();
+        match self.document.move_operations(
+            &selected,
+            self.camera.depth,
+            self.camera.zoom,
+            delta.x as f64,
+            delta.y as f64,
+            self.active_layer_id,
+        ) {
+            Ok(replacement_ids) if !replacement_ids.is_empty() => {
+                self.selected_operation_ids = replacement_ids.into_iter().collect();
+                if let Some(start) = self.selection_drag_start.as_mut() {
+                    *start += delta;
+                }
+                if let Some(current) = self.selection_drag_current.as_mut() {
+                    *current += delta;
+                }
+                self.invalidate_tile_rendering();
+                self.status_message =
+                    format!("Moved {} objects", self.selected_operation_ids.len());
+            }
+            Ok(_) => self.status_message = "Nothing moved".to_owned(),
+            Err(error) => self.status_message = format!("Move failed: {error:#}"),
+        }
+    }
+
+    fn commit_eraser_lasso(&mut self, canvas_rect: Rect) {
+        if !self.document.layer_is_editable(self.active_layer_id) {
+            self.status_message = "Active layer is hidden or locked".to_owned();
+            return;
+        }
+        let Some(operation) = eraser_lasso_operation(
+            &self.eraser_lasso_points,
+            &self.camera,
+            canvas_rect,
+            self.active_layer_id,
+        ) else {
+            self.status_message = "Eraser Lasso needs a non-degenerate area".to_owned();
+            return;
+        };
+        let layer_id = operation.layer_id;
+        match self.document.commit(operation) {
+            Ok(()) => {
+                self.begin_new_document_revision_for_layer(layer_id);
+                self.status_message = "Area erased".to_owned();
+            }
+            Err(error) => self.status_message = format!("Eraser Lasso failed: {error:#}"),
+        }
+    }
+
+    fn selection_move_delta(&self) -> egui::Vec2 {
+        match (self.selection_move_start, self.selection_move_current) {
+            (Some(start), Some(current)) => current - start,
+            _ => egui::Vec2::ZERO,
+        }
     }
 
     fn extend_draft_to(&mut self, position: Pos2, rect: Rect, shift_down: bool) {
@@ -950,9 +2172,10 @@ impl EndlessSketchApp {
             self.end_drawing_tile_pause();
             return;
         }
+        let layer_id = draft.layer_id;
         match self.document.commit(draft) {
             Ok(()) => {
-                self.begin_new_document_revision();
+                self.begin_new_document_revision_for_layer(layer_id);
                 self.status_message = "Saved".to_owned();
             }
             Err(error) => self.status_message = format!("Save failed: {error:#}"),
@@ -1050,7 +2273,7 @@ impl EndlessSketchApp {
 
         let width = operation_width(operation, self.camera.depth, self.camera.zoom);
         let color = to_color32(operation.opaque_visible_color(BACKGROUND));
-        if operation.kind == EditKind::Fill {
+        if operation.kind.is_area() {
             if is_draft {
                 let points =
                     smooth_pos2_draft(&points, usize::from(self.settings.smoothing.passes()));
@@ -1087,6 +2310,85 @@ impl EndlessSketchApp {
                 paint_stroke_fallback(painter, run, width, color);
             }
         }
+    }
+
+    fn paint_transient_overlays(&self, painter: &Painter, rect: Rect) {
+        let selection_color = Color32::from_rgba_unmultiplied(20, 120, 220, 180);
+        let selection_fill = Color32::from_rgba_unmultiplied(20, 120, 220, 28);
+        let rectangle_color = match self.rectangle_selection_mode {
+            RectangleSelectionMode::Inside => selection_color,
+            RectangleSelectionMode::Crossing => Color32::from_rgba_unmultiplied(220, 130, 20, 190),
+        };
+        let move_delta = self.selection_move_delta();
+
+        if let (Some(start), Some(end)) = (self.selection_drag_start, self.selection_drag_current) {
+            let selection_rect =
+                Rect::from_two_pos(start + move_delta, end + move_delta).intersect(rect);
+            painter.rect_filled(selection_rect, 0.0, selection_fill);
+            paint_rect_outline(painter, selection_rect, Stroke::new(1.5, rectangle_color));
+        }
+
+        for operation in self
+            .document
+            .operations()
+            .iter()
+            .filter(|operation| self.selected_operation_ids.contains(&operation.id))
+        {
+            let points: Vec<_> = operation
+                .points
+                .iter()
+                .filter_map(|point| self.point_to_position(point, rect))
+                .map(|point| point + move_delta)
+                .collect();
+            let width = operation_width(operation, self.camera.depth, self.camera.zoom);
+            paint_operation_highlight(painter, operation.kind, &points, width, selection_color);
+        }
+
+        if let Some(operation) = self.hovered_operation_id.and_then(|id| {
+            self.document
+                .operations()
+                .iter()
+                .find(|operation| operation.id == id)
+        }) && !self.selected_operation_ids.contains(&operation.id)
+        {
+            let points: Vec<_> = operation
+                .points
+                .iter()
+                .filter_map(|point| self.point_to_position(point, rect))
+                .collect();
+            let width = operation_width(operation, self.camera.depth, self.camera.zoom);
+            paint_operation_highlight(
+                painter,
+                operation.kind,
+                &points,
+                width,
+                Color32::from_rgba_unmultiplied(30, 175, 95, 175),
+            );
+        }
+
+        if self.eraser_lasso_points.len() >= 2 {
+            let stroke = Stroke::new(2.0, Color32::from_rgba_unmultiplied(220, 45, 45, 210));
+            if self.eraser_lasso_active {
+                painter.add(egui::Shape::line(self.eraser_lasso_points.clone(), stroke));
+            } else {
+                paint_closed_outline(painter, &self.eraser_lasso_points, stroke);
+            }
+        }
+    }
+
+    fn clear_transient_tools(&mut self) {
+        self.selected_operation_ids.clear();
+        self.selection_drag_start = None;
+        self.selection_drag_current = None;
+        self.selection_drag_active = false;
+        self.selection_move_start = None;
+        self.selection_move_current = None;
+        self.selection_move_active = false;
+        self.hovered_operation_id = None;
+        self.selection_hover_position = None;
+        self.reset_selection_cycle();
+        self.eraser_lasso_points.clear();
+        self.eraser_lasso_active = false;
     }
 
     fn paint_overlay(&mut self, painter: &Painter, rect: Rect) {
@@ -1356,8 +2658,10 @@ impl EndlessSketchApp {
     }
 
     fn run_undo(&mut self) {
+        self.clear_transient_tools();
         match self.document.undo() {
             Ok(true) => {
+                self.sync_active_layer_after_history();
                 self.invalidate_tile_rendering();
                 self.status_message = "Undone".to_owned();
             }
@@ -1367,13 +2671,160 @@ impl EndlessSketchApp {
     }
 
     fn run_redo(&mut self) {
+        self.clear_transient_tools();
         match self.document.redo() {
             Ok(true) => {
+                self.sync_active_layer_after_history();
                 self.invalidate_tile_rendering();
                 self.status_message = "Redone".to_owned();
             }
             Ok(false) => self.status_message = "Nothing to redo".to_owned(),
             Err(error) => self.status_message = format!("Redo failed: {error:#}"),
+        }
+    }
+
+    fn sync_active_layer_after_history(&mut self) {
+        if let Some(layer) = self
+            .document
+            .layers()
+            .iter()
+            .find(|layer| layer.id == self.active_layer_id)
+        {
+            self.layer_name_edit.clone_from(&layer.name);
+            return;
+        }
+        if let Some(layer) = self.document.layers().last() {
+            self.active_layer_id = layer.id;
+            self.layer_name_edit.clone_from(&layer.name);
+        }
+    }
+
+    fn selected_operation_snapshots(&self) -> Vec<EditOperation> {
+        let mut operations = self
+            .document
+            .operations()
+            .iter()
+            .filter(|operation| self.selected_operation_ids.contains(&operation.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        operations.sort_by_key(|operation| {
+            (
+                operation.effective_paint_order(),
+                operation.sequence,
+                operation.id,
+            )
+        });
+        operations
+    }
+
+    fn copy_selected(&mut self) {
+        let operations = self.selected_operation_snapshots();
+        if operations.is_empty() {
+            self.status_message = "Nothing selected".to_owned();
+            return;
+        }
+        let count = operations.len();
+        self.selection_clipboard = SelectionClipboard {
+            operations,
+            paste_count: 0,
+        };
+        self.status_message = format!("Copied {count} objects");
+    }
+
+    fn cut_selected(&mut self) {
+        if !self.document.layer_is_editable(self.active_layer_id) {
+            self.status_message = "Active layer is hidden or locked".to_owned();
+            return;
+        }
+        let operations = self.selected_operation_snapshots();
+        if operations.is_empty() {
+            self.status_message = "Nothing selected".to_owned();
+            return;
+        }
+        let count = operations.len();
+        self.selection_clipboard = SelectionClipboard {
+            operations,
+            paste_count: 0,
+        };
+        let selected = self.selected_operation_ids.clone();
+        match self
+            .document
+            .delete_operations(&selected, self.active_layer_id)
+        {
+            Ok(deleted) => {
+                self.clear_transient_tools();
+                self.invalidate_tile_rendering();
+                self.status_message = format!("Cut {deleted} objects");
+            }
+            Err(error) => {
+                self.status_message = format!("Cut failed after copying {count} objects: {error:#}")
+            }
+        }
+    }
+
+    fn paste_selection(&mut self, in_place: bool) {
+        if self.selection_clipboard.operations.is_empty() {
+            self.status_message = "Clipboard is empty".to_owned();
+            return;
+        }
+        if !self.document.layer_is_editable(self.active_layer_id) {
+            self.status_message = "Active layer is hidden or locked".to_owned();
+            return;
+        }
+        let operations = self.selection_clipboard.operations.clone();
+        let offset = if in_place {
+            0.0
+        } else {
+            f64::from(
+                self.selection_clipboard
+                    .paste_count
+                    .saturating_add(1)
+                    .min(1024),
+            ) * 16.0
+        };
+        match self.document.paste_operations(
+            &operations,
+            self.active_layer_id,
+            self.camera.depth,
+            self.camera.zoom,
+            offset,
+            offset,
+        ) {
+            Ok(ids) if !ids.is_empty() => {
+                if !in_place {
+                    self.selection_clipboard.paste_count =
+                        self.selection_clipboard.paste_count.saturating_add(1);
+                }
+                self.clear_transient_tools();
+                self.selected_operation_ids = ids.into_iter().collect();
+                self.invalidate_tile_rendering();
+                self.status_message = format!(
+                    "Pasted {} objects{}",
+                    self.selected_operation_ids.len(),
+                    if in_place { " in place" } else { "" }
+                );
+            }
+            Ok(_) => self.status_message = "Clipboard is empty".to_owned(),
+            Err(error) => self.status_message = format!("Paste failed: {error:#}"),
+        }
+    }
+
+    fn delete_selected(&mut self) {
+        let selected = self.selected_operation_ids.clone();
+        match self
+            .document
+            .delete_operations(&selected, self.active_layer_id)
+        {
+            Ok(0) => {
+                self.clear_transient_tools();
+                self.status_message = "Nothing selected".to_owned();
+            }
+            Ok(deleted) => {
+                self.clear_transient_tools();
+                self.invalidate_tile_rendering();
+                self.status_message = format!("Deleted {deleted} objects");
+            }
+            Err(error) => self.status_message = format!("Delete failed: {error:#}"),
         }
     }
 
@@ -1427,6 +2878,19 @@ impl EndlessSketchApp {
         match CanvasDocument::open(path) {
             Ok(document) => {
                 self.document = document;
+                self.pending_layer_delete = None;
+                self.selection_clipboard = SelectionClipboard::default();
+                self.active_layer_id = self
+                    .document
+                    .layers()
+                    .last()
+                    .map_or(DEFAULT_LAYER_ID, |layer| layer.id);
+                self.layer_name_edit = self
+                    .document
+                    .layers()
+                    .last()
+                    .map_or_else(|| "Layer 1".to_owned(), |layer| layer.name.clone());
+                self.clear_transient_tools();
                 match TileCache::with_options(
                     self.document.root(),
                     self.settings.tile_cache_options(),
@@ -1451,6 +2915,7 @@ impl EndlessSketchApp {
                     .set_generation(self.visible_tile_generation);
                 self.bookmarks = self.document.bookmarks().unwrap_or_default();
                 self.bookmark_edits = bookmark_edit_names(&self.bookmarks);
+                self.new_bookmark_name = format!("Bookmark {}", self.bookmarks.len() + 1);
                 self.camera = CameraAddress::default();
                 self.depth_jump_target = self.camera.depth;
                 self.status_message = "Canvas opened".to_owned();
@@ -1503,6 +2968,8 @@ impl EndlessSketchApp {
 
     fn mark_zoom_changed(&mut self) {
         self.depth_jump_target = self.camera.depth;
+        self.hovered_operation_id = None;
+        self.selection_hover_position = None;
         self.last_zoom_change = Some(Instant::now());
         self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
         self.tile_scheduler
@@ -1555,6 +3022,14 @@ impl EndlessSketchApp {
         self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
         self.tile_scheduler
             .set_generation(self.visible_tile_generation);
+    }
+
+    fn begin_new_document_revision_for_layer(&mut self, layer_id: Uuid) {
+        if self.document.is_top_layer(layer_id) {
+            self.begin_new_document_revision();
+        } else {
+            self.invalidate_tile_rendering();
+        }
     }
 
     fn apply_tile_generation_pause(&mut self) {
@@ -1729,6 +3204,63 @@ fn paint_fill_scanlines(painter: &Painter, clip_rect: Rect, points: &[Pos2], col
     }
 }
 
+fn help_content(ui: &mut egui::Ui, library: &HelpLibrary, selected_language_id: &mut String) {
+    if library.catalog(selected_language_id).is_none() {
+        *selected_language_id = library.preferred_language_id().to_owned();
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        for catalog in library.catalogs() {
+            if ui
+                .selectable_label(selected_language_id == &catalog.id, &catalog.tab_label)
+                .clicked()
+            {
+                selected_language_id.clone_from(&catalog.id);
+            }
+        }
+    });
+    ui.separator();
+
+    let Some(catalog) = library.catalog(selected_language_id) else {
+        ui.label("Help is unavailable.");
+        return;
+    };
+    ui.heading(&catalog.title);
+    ui.small(format!("EndlessSketch {}", env!("CARGO_PKG_VERSION")));
+    ui.add(egui::Label::new(&catalog.intro).wrap());
+    if !library.warnings().is_empty() {
+        let warning_title = if selected_language_id == "ru" {
+            "Ошибки файлов перевода"
+        } else {
+            "Translation file warnings"
+        };
+        egui::CollapsingHeader::new(warning_title).show(ui, |ui| {
+            for warning in library.warnings() {
+                ui.colored_label(Color32::YELLOW, warning);
+            }
+        });
+    }
+    ui.add_space(4.0);
+
+    egui::ScrollArea::vertical()
+        .id_salt("file_help_scroll")
+        .max_height(520.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (section_index, section) in catalog.sections.iter().enumerate() {
+                egui::CollapsingHeader::new(&section.title)
+                    .default_open(section_index == 0)
+                    .show(ui, |ui| {
+                        for item in &section.items {
+                            ui.label(egui::RichText::new(&item.name).strong());
+                            ui.add(egui::Label::new(&item.description).wrap());
+                            ui.add_space(6.0);
+                        }
+                    });
+            }
+        });
+}
+
 fn paint_stroke_fallback(painter: &Painter, points: Vec<Pos2>, width: f32, color: Color32) {
     painter.extend(fast_stroke_fallback_shapes(points, width, color));
 }
@@ -1756,8 +3288,11 @@ impl eframe::App for EndlessSketchApp {
         let context = ui.ctx().clone();
         let window = native_window(frame);
         egui::Panel::top("toolbar").show_inside(ui, |ui| self.toolbar(ui));
+        self.file_window(&context);
         self.bookmark_window(&context);
         self.settings_window(&context);
+        self.layers_window(&context);
+        self.layer_delete_confirmation(&context);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show_inside(ui, |ui| self.canvas(ui, &context, window));
@@ -1953,15 +3488,24 @@ fn incremental_paint_operations(
     snapshot_sequence: i64,
     operations: &[EditOperation],
 ) -> Option<Vec<EditOperation>> {
-    let newer: Vec<_> = operations
+    let Some(first_newer) = operations
         .iter()
-        .filter(|operation| operation.sequence > snapshot_sequence)
-        .collect();
+        .position(|operation| operation.sequence > snapshot_sequence)
+    else {
+        return Some(Vec::new());
+    };
+    let newer = &operations[first_newer..];
+    if newer
+        .iter()
+        .any(|operation| operation.sequence <= snapshot_sequence)
+    {
+        return None;
+    }
     if newer
         .iter()
         .all(|operation| operation.kind == EditKind::Paint && operation.color.is_opaque())
     {
-        Some(newer.into_iter().cloned().collect())
+        Some(newer.to_vec())
     } else {
         None
     }
@@ -2121,6 +3665,61 @@ fn adjusted_brush_size(current: f32, delta: f32) -> f32 {
     (current + delta).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE)
 }
 
+fn redo_shortcuts() -> [egui::KeyboardShortcut; 2] {
+    [
+        egui::KeyboardShortcut::new(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z),
+        egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Y),
+    ]
+}
+
+fn tool_shortcut_allowed(modifiers: egui::Modifiers) -> bool {
+    !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.mac_cmd
+}
+
+fn clipboard_command_from_events(
+    events: &[egui::Event],
+    modifiers: egui::Modifiers,
+) -> Option<ClipboardCommand> {
+    events.iter().find_map(|event| match event {
+        egui::Event::Copy => Some(ClipboardCommand::Copy),
+        egui::Event::Cut => Some(ClipboardCommand::Cut),
+        egui::Event::Paste(_) => Some(if modifiers.shift {
+            ClipboardCommand::PasteInPlace
+        } else {
+            ClipboardCommand::Paste
+        }),
+        _ => None,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn native_key_down(virtual_key: i32) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    // SAFETY: GetAsyncKeyState reads process-independent keyboard state and has no pointer inputs.
+    unsafe { GetAsyncKeyState(virtual_key) as u16 & 0x8000 != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn native_key_down(_virtual_key: i32) -> bool {
+    false
+}
+
+fn surrender_canvas_keyboard_focus(
+    context: &egui::Context,
+    canvas_hovered: bool,
+    pointer_pressed: bool,
+) {
+    if !canvas_hovered || !pointer_pressed {
+        return;
+    }
+    context.memory_mut(|memory| {
+        if let Some(focused) = memory.focused() {
+            memory.surrender_focus(focused);
+        }
+    });
+}
+
 fn clamp_quick_depth(depth: i64) -> i64 {
     depth.clamp(MIN_QUICK_DEPTH, MAX_QUICK_DEPTH)
 }
@@ -2265,32 +3864,559 @@ fn bookmark_edit_names(bookmarks: &[Bookmark]) -> HashMap<Uuid, String> {
         .collect()
 }
 
+fn layer_operation_counts(operations: &[EditOperation]) -> HashMap<Uuid, usize> {
+    let mut counts = HashMap::new();
+    for operation in operations {
+        *counts.entry(operation.layer_id).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn selectable_layer_ids(layers: &[Layer], active_layer_id: Uuid) -> HashSet<Uuid> {
+    layers
+        .iter()
+        .filter(|layer| layer.id == active_layer_id && layer.visible && !layer.locked)
+        .map(|layer| layer.id)
+        .collect()
+}
+
+fn selection_point(position: Pos2) -> SelectionPoint {
+    SelectionPoint::new(position.x as f64, position.y as f64)
+}
+
+fn operation_intersects_selection(
+    kind: EditKind,
+    points: &[SelectionPoint],
+    width: f64,
+    selection: &SelectionShape,
+) -> bool {
+    match kind {
+        EditKind::Paint | EditKind::Erase => {
+            selection.intersects_polyline(points, width.max(0.0) * 0.5)
+        }
+        EditKind::Fill | EditKind::EraseArea => selection.intersects_polygon(points),
+    }
+}
+
+fn operation_contained_by_rectangle(
+    kind: EditKind,
+    points: &[SelectionPoint],
+    width: f64,
+    selection: SelectionRect,
+) -> bool {
+    if points.is_empty() {
+        return false;
+    }
+    let radius = if kind.is_area() {
+        0.0
+    } else {
+        width.max(0.0) * 0.5
+    };
+    points.iter().all(|point| {
+        point.x - radius >= selection.min.x
+            && point.x + radius <= selection.max.x
+            && point.y - radius >= selection.min.y
+            && point.y + radius <= selection.max.y
+    })
+}
+
+fn operation_click_score(
+    kind: EditKind,
+    points: &[SelectionPoint],
+    width: f64,
+    click: SelectionPoint,
+) -> Option<(f64, f64)> {
+    let first = *points.first()?;
+    let mut min = first;
+    let mut max = first;
+    for point in &points[1..] {
+        min.x = min.x.min(point.x);
+        min.y = min.y.min(point.y);
+        max.x = max.x.max(point.x);
+        max.y = max.y.max(point.y);
+    }
+
+    let radius = if kind.is_area() {
+        0.0
+    } else {
+        width.max(0.0) * 0.5
+    };
+    let centerline_distance = if kind.is_area() {
+        let polygon = SelectionShape::Lasso(points.to_vec());
+        if polygon.contains_point(click) {
+            0.0
+        } else {
+            closed_polyline_distance(click, points)
+        }
+    } else {
+        polyline_distance(click, points)
+    };
+    let effective_distance = (centerline_distance - radius).max(0.0);
+    if effective_distance > CLICK_SELECTION_TOLERANCE_PX {
+        return None;
+    }
+
+    let width = (max.x - min.x + radius * 2.0).max(1.0);
+    let height = (max.y - min.y + radius * 2.0).max(1.0);
+    Some((effective_distance, width * height))
+}
+
+fn polyline_distance(point: SelectionPoint, points: &[SelectionPoint]) -> f64 {
+    if points.len() == 1 {
+        return point_distance(point, points[0]);
+    }
+    points
+        .windows(2)
+        .map(|segment| point_segment_distance(point, segment[0], segment[1]))
+        .fold(f64::INFINITY, f64::min)
+}
+
+fn closed_polyline_distance(point: SelectionPoint, points: &[SelectionPoint]) -> f64 {
+    let open_distance = polyline_distance(point, points);
+    if points.len() < 2 {
+        return open_distance;
+    }
+    open_distance.min(point_segment_distance(
+        point,
+        *points.last().unwrap(),
+        points[0],
+    ))
+}
+
+fn point_distance(first: SelectionPoint, second: SelectionPoint) -> f64 {
+    ((first.x - second.x).powi(2) + (first.y - second.y).powi(2)).sqrt()
+}
+
+fn point_segment_distance(
+    point: SelectionPoint,
+    start: SelectionPoint,
+    end: SelectionPoint,
+) -> f64 {
+    let delta_x = end.x - start.x;
+    let delta_y = end.y - start.y;
+    let length_squared = delta_x * delta_x + delta_y * delta_y;
+    if length_squared <= f64::EPSILON {
+        return point_distance(point, start);
+    }
+    let projection = (((point.x - start.x) * delta_x + (point.y - start.y) * delta_y)
+        / length_squared)
+        .clamp(0.0, 1.0);
+    point_distance(
+        point,
+        SelectionPoint::new(
+            start.x + projection * delta_x,
+            start.y + projection * delta_y,
+        ),
+    )
+}
+
+fn wrapped_cycle_index(current: usize, length: usize, step: isize) -> usize {
+    debug_assert!(length > 0);
+    (current as isize + step).rem_euclid(length as isize) as usize
+}
+
+fn selection_wheel_steps(events: &[egui::Event]) -> Vec<isize> {
+    let mut steps = Vec::new();
+    for event in events {
+        let egui::Event::MouseWheel {
+            unit,
+            delta,
+            modifiers,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if !modifiers.alt || delta.y.abs() <= f32::EPSILON {
+            continue;
+        }
+        let direction = if delta.y < 0.0 { 1 } else { -1 };
+        let detents = match unit {
+            egui::MouseWheelUnit::Line => delta.y.abs().round().clamp(1.0, 64.0) as usize,
+            egui::MouseWheelUnit::Point | egui::MouseWheelUnit::Page => 1,
+        };
+        steps.extend(std::iter::repeat_n(direction, detents));
+    }
+    steps
+}
+
+fn paint_order_wheel_steps(events: &[egui::Event]) -> Vec<isize> {
+    let mut steps = Vec::new();
+    for event in events {
+        let egui::Event::MouseWheel {
+            unit,
+            delta,
+            modifiers,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if !modifiers.ctrl || modifiers.alt || delta.y.abs() <= f32::EPSILON {
+            continue;
+        }
+        let direction = if delta.y > 0.0 { 1 } else { -1 };
+        let detents = match unit {
+            egui::MouseWheelUnit::Line => delta.y.abs().round().clamp(1.0, 64.0) as usize,
+            egui::MouseWheelUnit::Point | egui::MouseWheelUnit::Page => 1,
+        };
+        steps.extend(std::iter::repeat_n(direction, detents));
+    }
+    steps
+}
+
+fn append_preview_point(points: &mut Vec<Pos2>, point: Pos2, minimum_spacing: f32) {
+    if points
+        .last()
+        .is_none_or(|previous| previous.distance(point) >= minimum_spacing)
+    {
+        points.push(point);
+    }
+}
+
+fn eraser_lasso_operation(
+    points: &[Pos2],
+    camera: &CameraAddress,
+    rect: Rect,
+    layer_id: Uuid,
+) -> Option<EditOperation> {
+    if points.len() < 3
+        || points
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+        || polygon_area_twice(points).abs() < 1.0
+    {
+        return None;
+    }
+    let mut canvas_points: Vec<_> = points
+        .iter()
+        .map(|point| screen_to_canvas_for_camera(camera, *point, rect))
+        .collect();
+    canvas_points.push(canvas_points[0].clone());
+    let mut operation = EditOperation::draft(
+        EditKind::EraseArea,
+        camera.depth,
+        camera.zoom,
+        canvas_points,
+        BACKGROUND,
+        0.0,
+    );
+    operation.layer_id = layer_id;
+    Some(operation)
+}
+
+fn polygon_area_twice(points: &[Pos2]) -> f32 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+    let mut area = 0.0;
+    let mut previous = *points.last().unwrap();
+    for point in points {
+        area += previous.x * point.y - point.x * previous.y;
+        previous = *point;
+    }
+    area
+}
+
+fn paint_rect_outline(painter: &Painter, rect: Rect, stroke: Stroke) {
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    for index in 0..corners.len() {
+        painter.line_segment(
+            [corners[index], corners[(index + 1) % corners.len()]],
+            stroke,
+        );
+    }
+}
+
+fn paint_closed_outline(painter: &Painter, points: &[Pos2], stroke: Stroke) {
+    if points.len() < 2 {
+        return;
+    }
+    painter.add(egui::Shape::line(points.to_vec(), stroke));
+    painter.line_segment([*points.last().unwrap(), points[0]], stroke);
+}
+
+fn paint_operation_highlight(
+    painter: &Painter,
+    kind: EditKind,
+    points: &[Pos2],
+    width: f32,
+    color: Color32,
+) {
+    if kind.is_area() {
+        paint_closed_outline(painter, points, Stroke::new(3.0, color));
+    } else if points.len() == 1 {
+        painter.circle_stroke(points[0], 4.0, Stroke::new(2.0, color));
+    } else if points.len() >= 2 {
+        painter.add(egui::Shape::line(
+            points.to_vec(),
+            Stroke::new(width + 4.0, color),
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        FRAME_TIME_EMA_ALPHA, FrameRateTracker, MAX_BRUSH_SIZE,
-        MAX_FALLBACK_SMOOTHING_INPUT_POINTS, MIN_BRUSH_SIZE, PointAppendDecision,
+        ClipboardCommand, ClipboardShortcutKeys, FRAME_TIME_EMA_ALPHA, FrameRateTracker,
+        MAX_BRUSH_SIZE, MAX_FALLBACK_SMOOTHING_INPUT_POINTS, MIN_BRUSH_SIZE, PointAppendDecision,
         TILE_POLL_REPAINT_INTERVAL, TileFallbackMode, adjusted_brush_size,
-        append_interpolated_points, clamp_quick_depth, clip_pos2_polygon, clip_pos2_polyline,
-        color_from_srgb, draft_is_committable, fast_stroke_fallback_shapes,
-        format_overlay_coordinate, incremental_paint_operations, interpolation_step_count,
-        parse_lateral_coordinate, point_append_decision, prepare_draft_for_commit,
-        primary_pointer_positions, repaint_interval_for_work, set_straight_draft_endpoint,
-        should_paint_fill_fallback, should_paint_live_draft, simplify_pos2_render_points,
-        smooth_pos2_draft, smooth_pos2_saved_fallback, space_pan_requested,
-        straight_line_requested, tile_display_rects, tile_fallback_mode, tile_generation_is_paused,
-        tile_keys_for_view, tile_rebuild_deferred_since, z_drag_zoom_factor, z_zoom_requested,
-        zoom_tile_requests_deferred_since,
+        append_interpolated_points, append_preview_point, clamp_quick_depth, clip_pos2_polygon,
+        clip_pos2_polyline, clipboard_command_from_events, color_from_srgb, draft_is_committable,
+        eraser_lasso_operation, fast_stroke_fallback_shapes, format_overlay_coordinate,
+        incremental_paint_operations, interpolation_step_count, layer_operation_counts,
+        operation_click_score, operation_contained_by_rectangle, operation_intersects_selection,
+        paint_order_wheel_steps, parse_lateral_coordinate, point_append_decision,
+        prepare_draft_for_commit, primary_pointer_positions, redo_shortcuts,
+        repaint_interval_for_work, selectable_layer_ids, selection_wheel_steps,
+        set_straight_draft_endpoint, should_paint_fill_fallback, should_paint_live_draft,
+        simplify_pos2_render_points, smooth_pos2_draft, smooth_pos2_saved_fallback,
+        space_pan_requested, straight_line_requested, surrender_canvas_keyboard_focus,
+        tile_display_rects, tile_fallback_mode, tile_generation_is_paused, tile_keys_for_view,
+        tile_rebuild_deferred_since, tool_shortcut_allowed, wrapped_cycle_index,
+        z_drag_zoom_factor, z_zoom_requested, zoom_tile_requests_deferred_since,
     };
     use crate::coords::{CameraAddress, CanvasPoint};
-    use crate::model::EditKind;
-    use crate::model::{Color, EditOperation};
+    use crate::model::{Color, DEFAULT_LAYER_ID, EditKind, EditOperation, Layer};
+    use crate::selection_geometry::{Point2, Rect2, SelectionShape};
     use crate::settings::AppSettings;
     use crate::tile_cache::{TILE_BLEED, TILE_SIZE, tile_lod_for_resolution, tile_resolution};
-    use eframe::egui::{Color32, Event, Modifiers, PointerButton, Pos2, Rect, Shape};
+    use eframe::egui::{
+        Color32, Event, Modifiers, MouseWheelUnit, PointerButton, Pos2, Rect, Shape, TouchPhase,
+    };
     use num_bigint::BigInt;
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    #[test]
+    fn selection_hit_test_uses_stroke_radius_and_fill_area() {
+        let selection = SelectionShape::Rectangle(Rect2::from_points(
+            Point2::new(5.0, 5.0),
+            Point2::new(15.0, 15.0),
+        ));
+        let nearby_stroke = [Point2::new(0.0, 3.0), Point2::new(20.0, 3.0)];
+        let fill = [
+            Point2::new(8.0, 8.0),
+            Point2::new(12.0, 8.0),
+            Point2::new(10.0, 12.0),
+        ];
+
+        assert!(!operation_intersects_selection(
+            EditKind::Paint,
+            &nearby_stroke,
+            3.0,
+            &selection
+        ));
+        assert!(operation_intersects_selection(
+            EditKind::Paint,
+            &nearby_stroke,
+            4.0,
+            &selection
+        ));
+        assert!(operation_intersects_selection(
+            EditKind::Fill,
+            &fill,
+            0.0,
+            &selection
+        ));
+    }
+
+    #[test]
+    fn click_selection_prefers_the_smaller_overlapping_operation() {
+        let click = Point2::new(5.0, 5.0);
+        let long = [Point2::new(-100.0, 5.0), Point2::new(100.0, 5.0)];
+        let small = [Point2::new(4.0, 5.0), Point2::new(6.0, 5.0)];
+
+        let long_score =
+            operation_click_score(EditKind::Paint, &long, 2.0, click).expect("long line hit");
+        let small_score =
+            operation_click_score(EditKind::Paint, &small, 2.0, click).expect("small line hit");
+
+        assert_eq!(long_score.0, small_score.0);
+        assert!(small_score.1 < long_score.1);
+    }
+
+    #[test]
+    fn click_selection_hits_fill_interior_and_rejects_distant_geometry() {
+        let fill = [
+            Point2::new(0.0, 0.0),
+            Point2::new(10.0, 0.0),
+            Point2::new(10.0, 10.0),
+            Point2::new(0.0, 10.0),
+        ];
+
+        assert!(operation_click_score(EditKind::Fill, &fill, 0.0, Point2::new(5.0, 5.0)).is_some());
+        assert!(
+            operation_click_score(EditKind::Fill, &fill, 0.0, Point2::new(30.0, 30.0)).is_none()
+        );
+    }
+
+    #[test]
+    fn inside_rectangle_rejects_crossing_strokes_and_respects_width() {
+        let rectangle = Rect2::from_points(Point2::new(0.0, 0.0), Point2::new(10.0, 10.0));
+        let inside = [Point2::new(2.0, 5.0), Point2::new(8.0, 5.0)];
+        let crossing = [Point2::new(-1.0, 5.0), Point2::new(8.0, 5.0)];
+        let touches_edge = [Point2::new(0.5, 5.0), Point2::new(8.0, 5.0)];
+
+        assert!(operation_contained_by_rectangle(
+            EditKind::Paint,
+            &inside,
+            2.0,
+            rectangle
+        ));
+        assert!(!operation_contained_by_rectangle(
+            EditKind::Paint,
+            &crossing,
+            2.0,
+            rectangle
+        ));
+        assert!(!operation_contained_by_rectangle(
+            EditKind::Paint,
+            &touches_edge,
+            2.0,
+            rectangle
+        ));
+    }
+
+    #[test]
+    fn overlap_cycle_wraps_in_both_wheel_directions() {
+        assert_eq!(wrapped_cycle_index(0, 3, 1), 1);
+        assert_eq!(wrapped_cycle_index(2, 3, 1), 0);
+        assert_eq!(wrapped_cycle_index(0, 3, -1), 2);
+        assert_eq!(wrapped_cycle_index(2, 3, -1), 1);
+    }
+
+    #[test]
+    fn wheel_cycle_counts_each_raw_detent_once_even_in_one_frame() {
+        let wheel = |delta_y| Event::MouseWheel {
+            unit: MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, delta_y),
+            phase: TouchPhase::Move,
+            modifiers: Modifiers::ALT,
+        };
+        let events = [wheel(-1.0), wheel(-2.0), wheel(1.0)];
+
+        assert_eq!(selection_wheel_steps(&events), vec![1, 1, 1, -1]);
+    }
+
+    #[test]
+    fn paint_order_wheel_counts_ctrl_detents_and_ignores_other_modifiers() {
+        let wheel = |delta_y, modifiers| Event::MouseWheel {
+            unit: MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, delta_y),
+            phase: TouchPhase::Move,
+            modifiers,
+        };
+        let events = [
+            wheel(1.0, Modifiers::CTRL),
+            wheel(-2.0, Modifiers::CTRL),
+            wheel(1.0, Modifiers::ALT),
+            wheel(1.0, Modifiers::CTRL | Modifiers::ALT),
+            wheel(1.0, Modifiers::NONE),
+        ];
+
+        assert_eq!(paint_order_wheel_steps(&events), vec![1, -1, -1]);
+    }
+
+    #[test]
+    fn lasso_preview_skips_points_below_minimum_spacing() {
+        let mut points = vec![Pos2::new(0.0, 0.0)];
+
+        append_preview_point(&mut points, Pos2::new(1.0, 0.0), 2.0);
+        append_preview_point(&mut points, Pos2::new(2.0, 0.0), 2.0);
+
+        assert_eq!(points, vec![Pos2::new(0.0, 0.0), Pos2::new(2.0, 0.0)]);
+    }
+
+    #[test]
+    fn eraser_lasso_builds_one_closed_area_operation_on_the_active_layer() {
+        let camera = CameraAddress::default();
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+        let layer_id = Uuid::new_v4();
+        let points = [
+            Pos2::new(100.0, 100.0),
+            Pos2::new(300.0, 100.0),
+            Pos2::new(200.0, 300.0),
+        ];
+
+        let operation =
+            eraser_lasso_operation(&points, &camera, rect, layer_id).expect("valid lasso");
+
+        assert_eq!(operation.kind, EditKind::EraseArea);
+        assert_eq!(operation.layer_id, layer_id);
+        assert!(operation.destructive);
+        assert_eq!(operation.points.len(), 4);
+        assert_eq!(operation.points.first(), operation.points.last());
+        assert!(
+            eraser_lasso_operation(
+                &[
+                    Pos2::new(10.0, 10.0),
+                    Pos2::new(20.0, 20.0),
+                    Pos2::new(30.0, 30.0)
+                ],
+                &camera,
+                rect,
+                layer_id
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn layer_panel_counts_operations_by_layer() {
+        let point = CanvasPoint::new(0, 0.into(), 0.into(), 0.5, 0.5);
+        let mut first = EditOperation::draft(
+            EditKind::Paint,
+            0,
+            1.0,
+            vec![point.clone(), point.clone()],
+            Color::BLACK,
+            5.0,
+        );
+        let mut second = first.clone();
+        let other_layer = Uuid::from_u128(2);
+        first.layer_id = DEFAULT_LAYER_ID;
+        second.layer_id = other_layer;
+
+        let counts = layer_operation_counts(&[first, second]);
+
+        assert_eq!(counts.get(&DEFAULT_LAYER_ID), Some(&1));
+        assert_eq!(counts.get(&other_layer), Some(&1));
+    }
+
+    #[test]
+    fn selection_layer_filter_includes_only_the_visible_unlocked_active_layer() {
+        let mut default_layer = Layer::default_layer();
+        let other_layer = Layer {
+            id: Uuid::new_v4(),
+            name: "Other".to_owned(),
+            sort_order: 1,
+            visible: true,
+            locked: false,
+        };
+        let layers = [default_layer.clone(), other_layer.clone()];
+
+        assert_eq!(
+            selectable_layer_ids(&layers, DEFAULT_LAYER_ID),
+            HashSet::from([DEFAULT_LAYER_ID])
+        );
+        assert_eq!(
+            selectable_layer_ids(&layers, other_layer.id),
+            HashSet::from([other_layer.id])
+        );
+
+        default_layer.locked = true;
+        assert!(selectable_layer_ids(&[default_layer], DEFAULT_LAYER_ID).is_empty());
+        let mut hidden = other_layer;
+        hidden.visible = false;
+        assert!(selectable_layer_ids(&[hidden.clone()], hidden.id).is_empty());
+    }
 
     #[test]
     fn tile_display_uses_content_rect_and_source_bleed_crop() {
@@ -2360,6 +4486,12 @@ mod tests {
             incremental_paint_operations(3, &[old.clone(), first.clone(), second.clone()])
                 .expect("empty tile-local delta")
                 .is_empty()
+        );
+        let new_lower_layer = operation(EditKind::Paint, Color::BLACK, 4);
+        let old_upper_layer = operation(EditKind::Paint, Color::BLACK, 3);
+        assert!(
+            incremental_paint_operations(3, &[new_lower_layer, old_upper_layer]).is_none(),
+            "a new lower-layer operation is not a render-order suffix"
         );
 
         let transparent = operation(EditKind::Paint, Color::rgba(20, 20, 20, 128), 4);
@@ -2740,6 +4872,80 @@ mod tests {
         assert_eq!(clamp_quick_depth(-100), -100);
         assert_eq!(clamp_quick_depth(100), 100);
         assert_eq!(clamp_quick_depth(i64::MAX), 10_000);
+    }
+
+    #[test]
+    fn redo_shortcuts_match_shift_z_before_ctrl_y() {
+        let shortcuts = redo_shortcuts();
+
+        assert_eq!(shortcuts[0].logical_key, egui::Key::Z);
+        assert!(shortcuts[0].modifiers.ctrl);
+        assert!(shortcuts[0].modifiers.shift);
+        assert_eq!(shortcuts[1].logical_key, egui::Key::Y);
+        assert!(shortcuts[1].modifiers.ctrl);
+        assert!(!shortcuts[1].modifiers.shift);
+    }
+
+    #[test]
+    fn tool_shortcuts_do_not_intercept_clipboard_modifiers() {
+        assert!(tool_shortcut_allowed(Modifiers::NONE));
+        assert!(!tool_shortcut_allowed(Modifiers::CTRL));
+        assert!(!tool_shortcut_allowed(Modifiers::COMMAND));
+        assert!(!tool_shortcut_allowed(Modifiers::ALT));
+    }
+
+    #[test]
+    fn canvas_pointer_press_surrenders_stale_keyboard_focus() {
+        let context = egui::Context::default();
+        let text_edit_id = egui::Id::new("stale text edit");
+        context.memory_mut(|memory| memory.request_focus(text_edit_id));
+        assert!(context.egui_wants_keyboard_input());
+
+        surrender_canvas_keyboard_focus(&context, true, true);
+
+        assert!(!context.egui_wants_keyboard_input());
+    }
+
+    #[test]
+    fn clipboard_events_map_to_internal_commands() {
+        assert_eq!(
+            clipboard_command_from_events(&[Event::Copy], Modifiers::CTRL),
+            Some(ClipboardCommand::Copy)
+        );
+        assert_eq!(
+            clipboard_command_from_events(&[Event::Cut], Modifiers::CTRL),
+            Some(ClipboardCommand::Cut)
+        );
+        assert_eq!(
+            clipboard_command_from_events(&[Event::Paste("ignored".to_owned())], Modifiers::CTRL),
+            Some(ClipboardCommand::Paste)
+        );
+        assert_eq!(
+            clipboard_command_from_events(
+                &[Event::Paste("ignored".to_owned())],
+                Modifiers::CTRL | Modifiers::SHIFT,
+            ),
+            Some(ClipboardCommand::PasteInPlace)
+        );
+    }
+
+    #[test]
+    fn native_clipboard_keys_trigger_only_on_press_edges() {
+        let mut keys = ClipboardShortcutKeys::default();
+        assert_eq!(
+            keys.update(true, false, true, false, false),
+            Some(ClipboardCommand::Copy)
+        );
+        assert_eq!(keys.update(true, false, true, false, false), None);
+        assert_eq!(keys.update(true, false, false, false, false), None);
+        assert_eq!(
+            keys.update(true, false, true, false, false),
+            Some(ClipboardCommand::Copy)
+        );
+        assert_eq!(
+            keys.update(true, true, false, false, true),
+            Some(ClipboardCommand::PasteInPlace)
+        );
     }
 
     #[test]

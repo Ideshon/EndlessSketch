@@ -1,5 +1,5 @@
 use crate::coords::{CameraAddress, DEPTH_RATIO};
-use crate::model::{Color, EditKind, EditOperation};
+use crate::model::{Color, EditOperation};
 use crate::smoothing::{
     GeometryClipRect, STROKE_SMOOTHING_PASSES, clip_polygon_to_rect, clip_polyline_to_rect,
     simplify_render_points, smooth_closed_points, smooth_stroke_points,
@@ -127,7 +127,7 @@ pub fn render_operations_onto_tile_with_options(
             .collect();
         let width = operation_width(operation, key.depth, resolution_scale);
         let color = operation.opaque_visible_color(background);
-        if operation.kind == EditKind::Fill {
+        if operation.kind.is_area() {
             if points.len() < 3 {
                 continue;
             }
@@ -441,6 +441,7 @@ fn rgba(color: Color) -> Rgba<u8> {
 mod tests {
     use super::*;
     use crate::coords::CanvasPoint;
+    use crate::model::EditKind;
     use crate::tile_cache::{TILE_RESOLUTIONS, tile_lod_for_resolution};
     use num_bigint::BigInt;
 
@@ -506,6 +507,49 @@ mod tests {
         let image = render_tile(&[erase, newer], &key, Color::WHITE);
         let center = image.get_pixel(TILE_BLEED + 256, TILE_BLEED + 256);
         assert!(center[0] < 30, "pixel={center:?}");
+    }
+
+    #[test]
+    fn erase_area_clears_older_content_inside_its_polygon() {
+        let base = EditOperation::draft(
+            EditKind::Fill,
+            0,
+            1.0,
+            vec![
+                point(0, 0.1, 0.1),
+                point(0, 0.9, 0.1),
+                point(0, 0.9, 0.9),
+                point(0, 0.1, 0.9),
+            ],
+            Color::BLACK,
+            0.0,
+        );
+        let erase = EditOperation::draft(
+            EditKind::EraseArea,
+            0,
+            1.0,
+            vec![
+                point(0, 0.4, 0.4),
+                point(0, 0.6, 0.4),
+                point(0, 0.6, 0.6),
+                point(0, 0.4, 0.6),
+            ],
+            Color::WHITE,
+            0.0,
+        );
+        let key = TileKey {
+            depth: 0,
+            x: 0.into(),
+            y: 0.into(),
+            lod: tile_lod_for_resolution(512),
+        };
+
+        let image = render_tile(&[base, erase], &key, Color::WHITE);
+        let erased = image.get_pixel(TILE_BLEED + 256, TILE_BLEED + 256);
+        let retained = image.get_pixel(TILE_BLEED + 160, TILE_BLEED + 256);
+
+        assert!(erased[0] > 240, "pixel={erased:?}");
+        assert!(retained[0] < 30, "pixel={retained:?}");
     }
 
     #[test]

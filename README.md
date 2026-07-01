@@ -8,7 +8,7 @@ EndlessSketch is a Windows application written in Rust for drawing on a canvas t
 
 The camera uses hierarchical depth levels, BigInt tile addresses, and local normalized coordinates. There is no global rectangular scene or coordinate limit.
 
-The source data is stored as compressed vector operations in SQLite/WAL. PNG tiles use a selectable physical resolution from 64 to 2048 px and remain a disposable, automatically rebuilt cache.
+The source data is stored as compressed vector operations in SQLite/WAL. Schema version 3 adds one undo/redo timeline for drawing and layer metadata; opening an older document creates a verified pre-migration backup. PNG tiles use a selectable physical resolution from 64 to 2048 px and remain a disposable, automatically rebuilt cache.
 
 When changing the depth, the app continues to show vectors until the entire visible area of a single revision is ready. An incomplete cache cannot replace a frame.
 
@@ -26,7 +26,9 @@ The new document is a name.esketch directory with manifest.json, canvas.sqlite3,
 
 - Middle mouse button / spacebar + LMB — move.
 
-- Ctrl+Z / Ctrl+Y — undo/redo.
+- Ctrl+Z — undo; Ctrl+Y or Ctrl+Shift+Z — redo.
+
+- S selects whole objects. Its Selection popover contains Inside/Crossing and Cut/Copy/Paste/Delete; the same clipboard shortcuts remain available. With a selection, Ctrl+wheel changes its paint order; the Layers window can move it to another visible unlocked layer.
 
 - Shift+LMB draws a straight Brush/Eraser line; Ctrl+LMB drag changes brush size.
 
@@ -36,7 +38,9 @@ The new document is a name.esketch directory with manifest.json, canvas.sqlite3,
 
 - The canvas overlay continuously shows the camera-center tile X/Y and normalized local X/Y coordinates. Extreme BigInt values are abbreviated to keep the overlay bounded.
 
-- The top panel contains color, brush size, document controls, bookmarks, and performance settings.
+- The top panel contains color, brush size, document controls, and buttons for utility windows. New bookmarks are named and added inside the Bookmarks window. The Layers window can move a selection between layers and merge the active layer into its immediate lower layer.
+
+- File opens the New/Open utility window. F1 opens its Help tab with Russian/English instructions for tools, gestures, selection, layers, navigation, files, and every current performance setting. Editable `help/*.json` catalogs are loaded beside the executable; another valid catalog adds a language tab without recompiling.
 
 ## Build and run
 
@@ -73,10 +77,11 @@ EndlessSketch — Windows-приложение на Rust для рисовани
 ## Как устроен холст
 
 - Камера использует иерархические уровни глубины, `BigInt`-адреса тайлов и локальные нормализованные координаты. Глобальной прямоугольной сцены и предела координат нет.
-- Исходные данные — сжатые векторные операции в SQLite/WAL. Физическое разрешение PNG-тайлов выбирается в Settings: `64/128/256/512/1024/2048 px`; логическая область тайла на холсте не меняется. Тайлы являются только удаляемым и автоматически восстанавливаемым кэшем.
+- Исходные данные — сжатые векторные операции в SQLite/WAL. Schema version 3 объединяет историю рисования и метаданных слоёв. Перед автоматической миграцией schema v1/v2 создаётся проверенная копия в `backups/migrations/`. Физическое разрешение PNG-тайлов выбирается в Settings: `64/128/256/512/1024/2048 px`; логическая область тайла на холсте не меняется. Тайлы являются только удаляемым и автоматически восстанавливаемым кэшем.
 - Версия растеризатора входит в имя PNG-кэша: после изменения алгоритма старые тайлы автоматически игнорируются и перестраиваются. Текущий Opaque Performance Mode использует прямую растеризацию сегментов без буфера прозрачного покрытия.
 - Fill использует циклическое сглаживание замкнутого контура и сглаживание границ 4×4, но строится по supersampled scanline spans вместо полного обхода всех точек полигона для каждого субпикселя.
 - При смене глубины приложение продолжает показывать векторы, пока не готова вся видимая область одной ревизии. После обычного сохранения последний готовый видимый тайл остаётся на экране, а поверх временно рисуются только операции с более новым `sequence`. Undo/redo очищают retained-тайлы для полного безопасного пересчёта.
+- Undo/redo загружает из SQLite только изменённую transaction group: undo удаляет её из памяти/spatial index, redo добавляет обратно без повторной распаковки всего документа.
 - Для последовательных непрозрачных Paint сохранений текущий PNG строится инкрементально из последнего готового PNG плюс новых Paint-операций. Fill, Eraser, non-opaque Paint, отсутствующий или несовместимый base PNG автоматически используют полный rebuild.
 - Сохранённая геометрия плотнее 256 экранных точек временно упрощается с допуском `0.25 px` и обрезается по границам экрана/тайла. Исходные операции не изменяются. Raster cache version 8 отделяет jitter prefilter и адаптивные кривые от старых алгоритмов.
 - Spatial query группирует видимые tile keys по target depth и вычисляет BigInt-масштаб один раз для каждой пары target/source depth. Это уменьшает повторную работу при больших диапазонах глубины без изменения результатов.
@@ -91,7 +96,15 @@ EndlessSketch — Windows-приложение на Rust для рисовани
 
 ## Управление
 
-- `B` — кисть, `E` — ластик, `L` — заливка лассо, `I` — пипетка.
+- `B` — кисть, `E` — ластик, `L` — заливка лассо, `I` — пипетка, `S` — прямоугольное выделение, `X` — стирающее лассо.
+- Rectangle Selection временно выделяет целые векторные операции только в active layer по режиму `Inside` или `Crossing`; `Esc` снимает выделение. Выделение не записывается в документ.
+- В Selection обычный клик выбирает один целый объект; зелёный hover показывает будущий выбор. При перекрытии приоритет получает ближайший объект с меньшими экранными границами, поэтому маленькую линию можно выбрать поверх длинной. `Alt+клик` перебирает объекты под курсором, `Alt+колесо вниз/вверх` перебирает их в прямом/обратном направлении: одно физическое деление колеса переключает один объект без zoom. `Shift+клик` добавляет, `Ctrl+клик` переключает объект.
+- `Ctrl+C` копирует Object selection во внутренний clipboard, `Ctrl+X` вырезает, `Ctrl+V` вставляет в active layer со смещением 16 px, `Ctrl+Shift+V` вставляет на прежнее место. Каждая следующая обычная вставка увеличивает offset ещё на 16 px. Cut и Paste являются отдельными undo/redo steps; вставленные объекты получают новые UUID и остаются выделенными. Clipboard очищается при смене документа.
+- Режим рамки `Inside` выбирает только полностью заключённые операции с учётом толщины stroke. `Crossing` выбирает все операции, которых касается рамка. После release рамка исчезает, остаётся только подсветка выбранных объектов.
+- `Delete` или кнопка `Delete selected` удаляет выбранные операции одной сохраняемой командой. Исходные векторы не перезаписываются; undo/redo и reopen восстанавливают состояние через UUID tombstone.
+- Чтобы переместить Object selection, потяните инструментом `S` за любую выделенную линию или внутреннюю область выделенного Fill. Во время drag показывается preview; на release исходные UUID заменяются перемещёнными векторными копиями одной атомарной transaction. Копии сохраняют исходный порядок рисования относительно соседних объектов, а выделение остаётся активным для повторного перемещения.
+- Eraser Lasso показывает красный контур только во время жеста. После release валидный замкнутый контур сохраняется как одна векторная операция `EraseArea`, стирает более старое содержимое внутри области и очищает preview; `Ctrl+Z`/redo и reopen восстанавливают результат. Клик, линия и другой вырожденный контур не записываются.
+- Кнопка `Layers` открывает список слоёв сверху вниз. Два checkbox управляют visibility и lock; `+` создаёт верхний слой, `Duplicate` копирует active layer над исходным с новыми UUID операций, `Delete` удаляет active layer, `Rename` меняет имя, `Up`/`Down` меняют порядок. Последний слой удалить нельзя; непустой требует подтверждения. Hidden layer не рисуется, hidden/locked active layer нельзя редактировать. Все команды сохраняются после reopen и отменяются в общей с рисованием истории.
 - Колесо мыши или `Z` + ЛКМ — масштабирование относительно курсора.
 - Средняя кнопка мыши или `Space` + ЛКМ — перемещение.
 - Клик кистью без движения — точка текущего размера и цвета.
@@ -100,7 +113,7 @@ EndlessSketch — Windows-приложение на Rust для рисовани
 - Вторая строка toolbar: введите depth от `-10000` до `10000` и нажмите `Go` или Enter для быстрого перехода с сохранением видимого центра.
 - Третья строка toolbar: введите абсолютные tile `X` и `Y` на текущей глубине и нажмите `Go XY` или Enter. Поддерживаются целые десятичные значения и запись `1eN`, например `1e100` или `-1e100`; `Origin` возвращает камеру к tile `0/0`. Переход сохраняет текущие depth, zoom и локальное смещение внутри тайла. После раскрытия координата ограничена 10 000 цифрами.
 - Canvas overlay постоянно показывает tile `X/Y` центра камеры и нормализованные local `X/Y` внутри текущего тайла. Небольшие координаты выводятся полностью, степени десяти как `1eN`, остальные огромные BigInt сокращаются с указанием количества цифр.
-- `Ctrl+Z` / `Ctrl+Y` — undo/redo.
+- `Ctrl+Z` — undo; `Ctrl+Y` или `Ctrl+Shift+Z` — redo.
 - Панель сверху содержит цвет, размер кисти, открытие/создание документов, закладки текущей позиции и Settings.
 - Color picker сейчас редактирует только RGB и создаёт непрозрачные операции. Alpha старых операций сохраняется в документе, но при отображении цвет сводится с фоном и обрабатывается как opaque; точная прозрачность отложена.
 
