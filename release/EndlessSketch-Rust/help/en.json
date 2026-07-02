@@ -40,6 +40,10 @@
           "description": "Ctrl + left-drag vertically changes the Brush, Eraser, or Fill size without drawing. Size is also available in the top toolbar."
         },
         {
+          "name": "Brush / Fill right-click",
+          "description": "With Brush or Fill active, right-click the canvas to open the current RGB color and shared Size at the pointer. They use the same toolbar state; editing the menu creates no stroke, lasso, or history step."
+        },
+        {
           "name": "Color and transparency",
           "description": "The current color picker edits RGB only. New objects are opaque. Alpha from older objects remains stored but is flattened over the white background for display."
         }
@@ -62,11 +66,11 @@
         },
         {
           "name": "Jump to depth",
-          "description": "Enter a depth from -10000 to 10000 and press Go or Enter. The visible center is preserved at the new depth."
+          "description": "Open Navigation, enter a depth from -10000 to 10000, and press Go or Enter. The visible center is preserved at the new depth."
         },
         {
           "name": "Tile X/Y jump",
-          "description": "Moves to absolute tile coordinates at the current depth. Large integers and notation such as 1e100 are accepted. Origin returns to tile 0/0."
+          "description": "Navigation moves to absolute tile coordinates at the current depth. Large integers and notation such as 1e100 are accepted. Full coordinates can be selected and copied; Origin returns to tile 0/0."
         },
         {
           "name": "Exact return",
@@ -96,6 +100,14 @@
         {
           "name": "Move",
           "description": "Drag any selected object. The complete selection moves together and is saved as one undoable command on release."
+        },
+        {
+          "name": "Uniform scale",
+          "description": "Drag one of the four square corners of the shared bounds without modifiers. Objects scale around the opposite corner; release saves one undoable command, while Escape cancels the preview."
+        },
+        {
+          "name": "Right-click Selection menu",
+          "description": "With Selection active, right-click the canvas to open the same Inside/Crossing, Cut, Copy, Paste, Paste in place, and Delete commands at the pointer. Opening it keeps the selection and does not start a box, move, or scale gesture."
         },
         {
           "name": "Order within a layer",
@@ -169,7 +181,7 @@
         },
         {
           "name": "Bookmarks",
-          "description": "Add stores the current camera under the entered name. Open returns to it, Rename changes the name, and Delete removes it."
+          "description": "The Bookmarks button in Navigation opens bookmarks. Add stores the current camera under the entered name. Open returns to it, Rename changes the name, and Delete removes it."
         }
       ]
     },
@@ -247,6 +259,18 @@
         {
           "name": "Preview FPS",
           "description": "Background refresh rate for drafts and tile waiting. Lower values reduce continuous load but may look less smooth. Direct pen and mouse events still request frames immediately."
+        },
+        {
+          "name": "Display: Show canvas overlay",
+          "description": "Master switch for text drawn over the canvas. Disabling it hides the overlay completely but does not change the document, camera, tiles, or drawing performance."
+        },
+        {
+          "name": "Display: Overlay profile",
+          "description": "Minimal shows only zoom and status. Standard also shows operation count, FPS, and active tile state. Diagnostics enables every field, including depth and coordinates. Manual changes produce Custom."
+        },
+        {
+          "name": "Display: individual fields",
+          "description": "Depth, Zoom, Tile X/Y, Local X/Y, Operation count, FPS / frame time, Status, and Tile / rebuild state can be enabled independently. Full extreme coordinates remain available in Navigation."
         },
         {
           "name": "Reset",
