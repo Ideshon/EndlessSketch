@@ -37,7 +37,7 @@
     "notes": [
       "Documents use a directory-based .esketch format; PNG tiles are rebuildable and never replace vector source operations.",
       "Content revisions are monotonic and persisted in SQLite so a stale tile cannot become current after restart.",
-      "The current local branch is test and remains six commits behind origin/test; no pull, commit, or push was performed.",
+      "The current local branch is Rust and tracks origin/Rust; no pull, commit, or push was performed in the M5.1a automated checkpoint.",
       "Existing untracked .idea, .ess, and .esp files are user-owned and must not be changed or committed without an explicit request."
     ]
   },
@@ -105,6 +105,13 @@
     "M4 checkpoint 4.6b manually confirmed: Merge Down combines the active layer with its immediate lower visible unlocked layer in one compound history step.",
     "M5.0a manually confirmed: Selection modes and edit commands moved into one popover, and Add bookmark moved into Bookmarks with a name field.",
     "M5.0b manually confirmed: New/Open moved into File; F1 opens clear Russian/English Help loaded from extensible external catalogs with built-in fallback.",
+    "M5.0c manually confirmed: Navigation owns current depth/zoom, exact Tile/Local coordinates, jumps, Origin, and Bookmarks access; Bookmarks quick access remains in the toolbar as requested.",
+    "M5.0d implemented pending manual confirmation: settings v11 persists Minimal/Standard/Diagnostics/Custom overlay profiles, a master switch, and independent Depth/Zoom/coordinates/operations/performance/status/tile-state fields.",
+    "M5.0d manually confirmed: Bookmarks dual access, Display master/presets/Custom toggles, immediate rendering, and persisted overlay behavior work.",
+    "M5.1a manually confirmed: Object selection bounding box, four corner handles, proportional live scale preview, Escape cancel, Move coexistence, grouped Undo/Redo, and reopen work.",
+    "Checkpoint 5.0e manually confirmed: when Selection is active, right-clicking the canvas opens the existing Selection command window at the pointer without duplicating command/history logic or starting rectangle, move, or scale gestures.",
+    "Checkpoint 5.0f manually confirmed after correction: Brush and Fill right-click menus use an inline RGB palette that remains open, share toolbar Size/color state, and do not start a stroke/lasso or change document history.",
+    "Planned M5.1c: Recolor selected Paint/Fill operations from the current RGB palette as one append-only replacement transaction while preserving geometry, layer, paint order, Undo/Redo, and reopen.",
     "Observed under High Quality load: UI stalls can merge rapid press/release cycles into check-mark strokes, misclassify Z+LMB as drawing, drop/reverse navigation deltas, and make wheel/pan intermittently unresponsive. A bounded input/FPS stabilization block is planned after the nearest Layers work and before export.",
     "Former FPS and extreme-navigation priorities are complete at the current validated baseline.",
     "Current main task: selection/editing, polygon Eraser Lasso, and Photoshop-like layers developed as three parallel workstreams over shared geometry, grouped history, layer scope, spatial filtering, and tile invalidation.",
@@ -113,7 +120,7 @@
     "Keep README, docs/project-implementation-plan.md, and this status aligned with behavior, commands, validation, and known limits."
   ],
   "backlog": [
-    "Main task: implement the Navigation and Display/overlay M5.0 checkpoints before Object transform, persistent Area selection, opaque Gradient, and layer folders.",
+    "Main task: implement Object transform in short checkpoints before persistent Area selection, opaque Gradient, and layer folders.",
     "Area selection block: Rectangle/Lasso remains in canvas coordinates as a temporary clipping mask for Brush/Eraser/Fill/Gradient, with Fill, Erase, Stroke boundary, Invert, and export-bounds actions.",
     "UI cleanup block: Selection commands move to a popover, Add bookmark moves into Bookmarks, File/Help and Navigation become separate windows, and Settings controls optional overlay fields.",
     "Multi-layer selection block: keep one active drawing layer plus a Ctrl/Shift selected layer set for atomic bulk visibility, lock, reorder, delete, duplicate, grouping, and contiguous Merge Selected.",
@@ -165,13 +172,29 @@
       "rule": "Run cargo fmt, Clippy with warnings denied, relevant tests, and a release build after behavior, interface, dependency, or persistence changes."
     },
     {
+      "priority": 7550,
+      "rule": "Every implementation report to the user must describe in detail what was added, user-visible behavior, persistence/data-safety effects, automated validation, known limitations, and include a concise minimum manual check directly in the user-facing response."
+    },
+    {
+      "priority": 7500,
+      "rule": "After each checkpoint, update the existing relevant files under docs in their established style: keep docs/project-implementation-plan.md as concise checkbox plan/status items rather than a long implementation report, and prefer an existing suitable document over creating a new one."
+    },
+    {
+      "priority": 7450,
+      "rule": "Put the minimum manual GUI check in the user-facing response, not as a detailed checklist in the plan. Do not spend the user's limited working session launching or executing GUI scenarios unless the user explicitly requests it."
+    },
+    {
       "priority": 7400,
       "rule": "Keep documentation aligned when behavior, commands, setup, or user workflows change."
+    },
+    {
+      "priority": 7350,
+      "rule": "When the user adds a future plan item without naming its location, place it autonomously in the technically most convenient bounded checkpoint and record enough scope to implement it later; ask only if placement would materially change the requested behavior."
     }
   ],
   "request_analysis": {
-    "updated_at_utc": "2026-07-01T11:12:52Z",
-    "request": "Make Help instructions clearer, add Russian/English tabs, and store translations in extensible files next to the executable.",
+    "updated_at_utc": "2026-07-02T05:18:14Z",
+    "request": "The corrected inline palette works; publish the latest tracked project version to GitHub.",
     "analysis": [
       "Retained last-complete tiles with newer-operation overlay are manually confirmed as working.",
       "Visible-tile spatial culling is now manually confirmed as working.",
@@ -1003,37 +1026,101 @@
       ,"A Cargo build script copies help/ beside debug/release executables; the same files and translation README are included in the portable release."
       ,"Added four focused tests for built-in validity/order, external override, added-language discovery, malformed-file fallback, and field validation."
       ,"Manual validation confirms the localized Russian/English Help works and the explanations are acceptable."
+      ,"M5.0c must reuse the existing camera jump methods and parsers so depth/lateral behavior, limits, Enter handling, cache invalidation, and extreme BigInt support remain unchanged."
+      ,"Keep one Navigation button in the main toolbar. Move current depth, exact Tile X/Y and Local X/Y, Depth jump, Tile X/Y jump, Origin, and a Bookmarks shortcut into the movable window."
+      ,"Remove depth/tile/local coordinate text from the always-visible canvas overlay. Keep zoom, object count, interaction FPS/frame time, status, and tile/rebuild state until M5.0d adds persisted Display toggles."
+      ,"Implemented a movable resizable Navigation window and removed the two navigation rows plus the standalone Bookmarks button from the main toolbar."
+      ,"Navigation displays complete BigInt Tile X/Y in horizontally scrollable selectable rows, compact extreme-coordinate hints, 17-digit Local X/Y, current depth, and nine-decimal zoom."
+      ,"Depth Go/Enter, Tile Go XY/Enter, Origin, and Bookmarks reuse the existing handlers. The canvas overlay now contains only zoom, operation count, interaction performance, status, and tile state."
+      ,"Updated Russian/English Help and package documentation to point navigation and bookmarks to the new window."
+      ,"Manual validation confirms Navigation works. Restore Bookmarks to the main toolbar as a deliberate duplicate quick-access command while retaining the Navigation button."
+      ,"Bookmarks quick access is restored in the toolbar and remains available inside Navigation; M5.0c is manually confirmed."
+      ,"M5.0d needs a settings schema migration with a master overlay switch and independent visibility for depth, zoom, Tile X/Y, Local X/Y, operation count, FPS/frame time, status, and tile/rebuild state."
+      ,"Provide Minimal, Standard, and Diagnostics presets plus derived Custom. Standard must preserve the manually accepted post-Navigation overlay: zoom, operations, performance, status, and tile state without duplicated depth or coordinates."
+      ,"Display changes affect UI only: they must not recreate tile workers, invalidate tiles, modify documents, or change camera behavior."
+      ,"Implemented settings version 11 overlay fields with serde-default migration from v10 and a Standard default matching the manually accepted post-Navigation display."
+      ,"Added Minimal, Standard, Diagnostics, and derived Custom profiles; applying an overlay profile changes only Display fields."
+      ,"Settings > Display exposes a master switch and independent Depth, Zoom, Tile X/Y, Local X/Y, Operation count, FPS/frame time, Status, and Tile/rebuild state checkboxes."
+      ,"Canvas overlay text is assembled only from enabled fields; master-off and an empty Custom selection render no overlay."
+      ,"Added six regressions for profile values, migration, unrelated-setting preservation, Standard rendering, Diagnostics rendering, and hidden/empty overlay behavior."
+      ,"Manual validation confirms M5.0d works; close the UI-cleanup block."
+      ,"Split Object transform into M5.1a scale and M5.1b rotate/Flip so each interaction and persistence path can be manually validated independently."
+      ,"M5.1a uses a shared screen-space affine mapping around an opposite-corner pivot, keeps source operations immutable until release, and commits one append-only tombstone/replacement transaction."
+      ,"Scale must preserve active layer scope, original paint order, relative stroke widths, undo/redo/reopen, extreme-coordinate safety, and existing Move behavior."
+      ,"The current working tree already contains the first M5.1a implementation; review and harden that implementation instead of restarting it."
+      ,"This pass uses automated validation only. Keep manual corner-scale validation pending for a later user-directed session."
+      ,"CanvasDocument transform now rejects hidden/locked layers and stale or mixed-layer selections before commit."
+      ,"Focused regressions cover area-operation closure/style, grouped undo/redo/reopen, extreme BigInt coordinates, and failure atomicity when a point cannot be represented."
+      ,"Russian/English Help, README, the implementation plan, and the portable README document the four-handle proportional scale workflow."
+      ,"All 185 tests, cargo fmt check, Clippy with warnings denied, and the release build pass; the portable executable matches target/release by SHA-256."
+      ,"The user requires detailed checkpoint reports covering behavior, data safety, validation, limitations, and exact manual checks rather than a short completion summary."
+      ,"Manual scenarios must be documented but remain deferred unless the user explicitly asks to spend session time running them."
+      ,"Use existing suitable docs files instead of creating a new document when the project already has an appropriate location."
+      ,"docs/settings-reference.md was read and intentionally left unchanged because M5.1a adds no setting or settings persistence behavior."
+      ,"The user corrected the documentation format: the implementation plan must remain concise and consistent with its existing checkbox items; detailed prose and the minimum manual checklist belong in the user-facing report."
+      ,"Removed the long M5.1a prose/checklists from the plan and replaced them with nested completion and pending-manual checkbox items."
+      ,"Added checkpoint 5.0e plus matching Selection UI and secondary-polish plan items for opening the existing Selection command window at the pointer on right-click while Selection is active."
+      ,"The planned right-click window must reuse the existing Selection popover dispatcher/state and must consume the click so it cannot begin rectangle selection, Move, or Scale."
+      ,"The user manually confirmed M5.1a corner-scale, including the requested minimum workflow; close M5.1a."
+      ,"Implement checkpoint 5.0e with egui's canvas context-menu surface and one shared Selection menu renderer/action dispatcher used by both toolbar and right-click."
+      ,"The right-click menu is available only while ToolKind::Selection is active, preserves the current selection, and does not change document revision merely by opening or changing Inside/Crossing."
+      ,"Refactored toolbar and canvas context entry points to one selection_menu_content renderer and one run_selection_menu_action dispatcher."
+      ,"The canvas calls egui Response::context_menu only for ToolKind::Selection; Cut/Copy/Paste/Paste in place/Delete retain their existing availability checks and persistence handlers."
+      ,"README, Russian/English Help, portable documentation, and the concise implementation plan describe the right-click entry point."
+      ,"All 186 tests, cargo fmt check, Clippy with warnings denied, and release build pass; portable and target/release hashes match."
+      ,"The user manually confirmed checkpoint 5.0e; close it."
+      ,"Place Brush/Fill palette and Size in checkpoint 5.0f because it directly extends the shared right-click command surface implemented by 5.0e."
+      ,"Place Recolor selected in M5.1c after rotate/Flip because it is persistent Object selection editing and should reuse the same grouped replacement infrastructure."
+      ,"Recolor applies the opaque current RGB color to selected Paint/Fill operations, preserves geometry/layer/paint order, leaves Erase/EraseArea unchanged, and round-trips through one Undo/Redo/Reopen step."
+      ,"Future requests that add plan items without a requested location should be placed in the most convenient bounded checkpoint without asking unless placement changes behavior."
+      ,"Implement 5.0f by generalizing the existing Selection-only canvas context-menu gate into Brush, Fill, and Selection menu kinds."
+      ,"Brush and Fill context menus must edit the same self.color and self.brush_size values as the toolbar; do not introduce settings or document persistence fields."
+      ,"Secondary input opens UI only and must not create a draft, commit an operation, or add a history step."
+      ,"Generalized the canvas context-menu gate to explicit Brush, Fill, and Selection kinds; Eraser, Eyedropper, and Eraser Lasso remain unsupported."
+      ,"Brush and Fill render one shared drawing_tool_menu_content with color_edit_button_srgb and the existing 1..100 Size slider bound directly to self.color and self.brush_size."
+      ,"Updated README, Russian/English Help, portable documentation, implementation plan, and status."
+      ,"All 186 tests, cargo fmt check, Clippy with warnings denied, and release build pass; portable and target/release SHA-256 hashes match."
+      ,"Manual validation found that the nested color_edit_button_srgb popup immediately closes with its parent context menu, while the Size slider works."
+      ,"Replace the popup color button only in the canvas context menu with egui color_picker_color32 rendered inline using Alpha::Opaque; keep the toolbar button unchanged."
+      ,"The inline picker must continue writing the same opaque RGB self.color state and must not add document or settings persistence."
+      ,"Implemented the inline opaque RGB picker inside the parent context menu; the nested popup path is no longer used for Brush/Fill."
+      ,"All 186 tests, cargo fmt check, Clippy with warnings denied, and release build pass."
+      ,"Portable refresh is blocked because running process PID 23524 holds release/EndlessSketch-Rust/endless-sketch.exe open; target/release contains the corrected build."
+      ,"After the user closed PID 23524, refreshed the portable executable successfully; target and portable SHA-256 are identical."
+      ,"The user manually confirmed the corrected inline palette remains open and works; close checkpoint 5.0f."
+      ,"GitHub publish scope is the 14 tracked modified project files only. Exclude user-owned untracked .esp/.ess files, desktop-shot.png, the untracked release ZIP, and release/local."
+      ,"GitHub CLI 2.95.0 is installed, origin is https://github.com/Ideshon/EndlessSketch.git, and the current branch is Rust."
+      ,"Publishing is blocked before staging because gh auth status reports the active Ideshon token is invalid; the user must run gh auth login -h github.com."
     ],
     "planned_scope": [
-      "Define a validated JSON catalog format with language id, tab label, title, introduction, section titles, item names, and plain-language descriptions.",
-      "Provide complete Russian and English catalogs with clearer descriptions of controls, settings effects, and performance/quality tradeoffs.",
-      "Load help/*.json beside the executable, replace built-in catalogs by matching language id, and add other valid language files as dynamic tabs.",
-      "Embed Russian and English catalogs as safe fallbacks and retain them when external files are absent or invalid.",
-      "Copy help resources beside Cargo-built debug/release executables and into the portable release package.",
-      "Do not change any drawing, navigation, selection, layer, persistence, or setting behavior."
+      "After GitHub authentication is restored, recheck the tracked diff and stage only the 14 tracked project files.",
+      "Create a codex feature branch from default branch Rust, commit the complete validated checkpoint series, and push with tracking.",
+      "Open a draft pull request against Rust with change, impact, root-cause, and validation details.",
+      "Keep all user-owned untracked documents and generated local artifacts outside the commit."
     ],
     "validation_plan": [
-      "Add focused tests for catalog validation, external override, added-language discovery, malformed-file fallback, and stable Russian/English ordering.",
-      "Run cargo fmt, all-target tests, Clippy with warnings denied, and a release build.",
-      "Verify help/ru.json and help/en.json are copied next to target/release and portable executables, then compare portable and target SHA-256.",
-      "Manually verify Russian/English tabs, readable wrapping/scrolling, and clear setting descriptions."
+      "Run cargo fmt, focused context-menu routing tests, all-target tests, Clippy with warnings denied, and a release build.",
+      "Refresh the portable executable and verify SHA-256 matches target/release.",
+      "Do not launch the GUI; provide the minimum Brush/Fill right-click check in the user-facing report."
     ],
-    "execution_result": "Localized external Help catalogs are implemented and manually confirmed. All 171 tests, formatting, Clippy with warnings denied, and release build passed. Portable executable and Help resources match target/release."
+    "execution_result": "Checkpoint 5.0f is manually confirmed and the validated portable release is current. GitHub publication is blocked before staging because the active gh token is invalid."
   },
   "recommended_next_action": {
-    "type": "development_checkpoint",
-    "target": "M5.0c: Navigation window",
-    "intent": "Move current depth, Depth jump, Tile X/Y jump, Origin, and exact current coordinates from the toolbar/overlay into one movable Navigation utility window without changing camera behavior."
+    "type": "github_auth_then_publish",
+    "target": "Ideshon/EndlessSketch",
+    "intent": "Run gh auth login -h github.com, then publish the 14 tracked project files on a codex branch and open a draft PR against Rust while excluding all user-owned untracked files."
   },
   "latest_check": {
-    "checked_at_utc": "2026-07-01T11:12:52Z",
+    "checked_at_utc": "2026-07-02T05:15:48Z",
     "branch": "Rust",
     "tracking": "origin/Rust",
     "ahead": 0,
     "behind": 0,
     "rust_toolchain": "rustc 1.96.0 stable x86_64-pc-windows-msvc",
     "release_executable": "release/EndlessSketch-Rust/endless-sketch.exe",
-    "release_executable_bytes": 18238464,
+    "release_executable_bytes": 18322432,
+    "target_release_executable_bytes": 18322432,
+    "target_release_sha256": "AF1D473E4436B66788E2835965C143CDD2D88B167938516C22730C69BD2CE774",
     "million_stroke_generation_ms": 320,
     "million_stroke_index_ms": 1410,
     "million_stroke_49_queries_ms": 665,
@@ -1042,16 +1129,16 @@
     "extreme_depth_1m_2001_band_index_ms": 1330,
     "extreme_depth_1m_2001_band_three_viewports_ms": 1650,
     "github_repository": "Ideshon/EndlessSketch",
-    "github_default_branch": "master",
+    "github_default_branch": "Rust",
     "local_https_push_ready": true
   },
   "test_file_statuses": {
     "cargo_fmt": "Passed cargo fmt --all and cargo fmt --all -- --check.",
-    "cargo_clippy_all_targets_deny_warnings": "Passed with warnings denied after localized external Help catalogs.",
-    "cargo_test_debug": "171 passed, 0 failed, including external translation override, added language discovery, malformed-file fallback, validation, and ru/en ordering.",
+    "cargo_clippy_all_targets_deny_warnings": "Passed after checkpoint 5.0f with warnings denied.",
+    "cargo_test_debug": "186 passed, 0 failed, including Brush/Fill/Selection context-menu routing and all previous affine scale, persistence, layer, input, render, and settings regressions.",
     "cargo_test_release": "Not run in the latest session; debug all-target tests passed.",
-    "release_build": "Passed cargo build --release; portable executable refreshed at 18,238,464 bytes and SHA-256 A162F725AFE9919FC8C859BF802F50CC71B17D30B77A9B6721789AA47027ACAC matches target/release. help/ru.json, en.json, and README.txt match the target/release copies.",
-    "gui_smoke": "Localized Russian/English Help is ready for manual validation; rapid-stroke check marks, High Quality input/FPS issues, and Selection FPS on dense active layers remain documented for S2-S5.",
+    "release_build": "Passed cargo build --release; portable executable refreshed at 18,322,432 bytes and SHA-256 AF1D473E4436B66788E2835965C143CDD2D88B167938516C22730C69BD2CE774 matches target/release.",
+    "gui_smoke": "M5.1a, checkpoint 5.0e, and corrected checkpoint 5.0f are manually confirmed. Rapid-stroke check marks, High Quality input/FPS issues, and Selection FPS on dense active layers remain documented for S2-S5.",
     "million_stroke_stress": "Passed at radius 1000 across 2001 depth bands: about 275ms generation, 1.33s indexing, 3.02s for 147 individual tile queries, and 1.65s for three batched viewport queries."
   }
 }

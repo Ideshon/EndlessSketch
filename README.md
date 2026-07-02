@@ -32,15 +32,17 @@ The new document is a name.esketch directory with manifest.json, canvas.sqlite3,
 
 - Shift+LMB draws a straight Brush/Eraser line; Ctrl+LMB drag changes brush size.
 
-- The second toolbar row accepts a direct depth target from -10000 to 10000; press Go or Enter to jump while preserving the visible center.
+- Navigation shows current depth, zoom, exact Tile X/Y and Local X/Y. Its depth target accepts -10000 to 10000; press Go or Enter to jump while preserving the visible center.
 
-- The third toolbar row accepts absolute BigInt tile X/Y coordinates at the current depth. Decimal and scientific integer notation such as `1e100` are supported; press Go XY or Enter to jump, or Origin to return to tile 0/0.
+- Navigation also accepts absolute BigInt tile X/Y coordinates at the current depth. Decimal and scientific integer notation such as `1e100` are supported; press Go XY or Enter to jump, or Origin to return to tile 0/0.
 
-- The canvas overlay continuously shows the camera-center tile X/Y and normalized local X/Y coordinates. Extreme BigInt values are abbreviated to keep the overlay bounded.
+- Exact extreme BigInt coordinates are horizontally scrollable and selectable in Navigation; a compact form such as `1e1000` is shown as an orientation aid.
 
-- The top panel contains color, brush size, document controls, and buttons for utility windows. New bookmarks are named and added inside the Bookmarks window. The Layers window can move a selection between layers and merge the active layer into its immediate lower layer.
+- The top panel contains tools, color, brush size, history, and buttons for File, Navigation, Bookmarks, Settings, and Layers. Navigation also opens Bookmarks. The Layers window can move a selection between layers and merge the active layer into its immediate lower layer.
 
 - File opens the New/Open utility window. F1 opens its Help tab with Russian/English instructions for tools, gestures, selection, layers, navigation, files, and every current performance setting. Editable `help/*.json` catalogs are loaded beside the executable; another valid catalog adds a language tab without recompiling.
+
+- Settings > Display controls the canvas overlay. Minimal, Standard, and Diagnostics presets plus independent Depth, Zoom, coordinates, operation count, performance, status, and tile-state switches persist in `local/settings.json`.
 
 ## Build and run
 
@@ -99,10 +101,13 @@ EndlessSketch — Windows-приложение на Rust для рисовани
 - `B` — кисть, `E` — ластик, `L` — заливка лассо, `I` — пипетка, `S` — прямоугольное выделение, `X` — стирающее лассо.
 - Rectangle Selection временно выделяет целые векторные операции только в active layer по режиму `Inside` или `Crossing`; `Esc` снимает выделение. Выделение не записывается в документ.
 - В Selection обычный клик выбирает один целый объект; зелёный hover показывает будущий выбор. При перекрытии приоритет получает ближайший объект с меньшими экранными границами, поэтому маленькую линию можно выбрать поверх длинной. `Alt+клик` перебирает объекты под курсором, `Alt+колесо вниз/вверх` перебирает их в прямом/обратном направлении: одно физическое деление колеса переключает один объект без zoom. `Shift+клик` добавляет, `Ctrl+клик` переключает объект.
+- При активном Selection ПКМ на холсте открывает возле курсора то же меню `Inside/Crossing`, Cut/Copy/Paste/Paste in place/Delete, что и кнопка `Selection` в toolbar. Открытие меню сохраняет текущее выделение и не запускает rectangle, Move или Scale.
+- При активном Brush или Fill ПКМ открывает возле курсора текущую RGB-палитру и общий `Size`. Они изменяют те же значения, что toolbar; открытие и настройка меню не создают stroke, lasso или history step.
 - `Ctrl+C` копирует Object selection во внутренний clipboard, `Ctrl+X` вырезает, `Ctrl+V` вставляет в active layer со смещением 16 px, `Ctrl+Shift+V` вставляет на прежнее место. Каждая следующая обычная вставка увеличивает offset ещё на 16 px. Cut и Paste являются отдельными undo/redo steps; вставленные объекты получают новые UUID и остаются выделенными. Clipboard очищается при смене документа.
 - Режим рамки `Inside` выбирает только полностью заключённые операции с учётом толщины stroke. `Crossing` выбирает все операции, которых касается рамка. После release рамка исчезает, остаётся только подсветка выбранных объектов.
 - `Delete` или кнопка `Delete selected` удаляет выбранные операции одной сохраняемой командой. Исходные векторы не перезаписываются; undo/redo и reopen восстанавливают состояние через UUID tombstone.
 - Чтобы переместить Object selection, потяните инструментом `S` за любую выделенную линию или внутреннюю область выделенного Fill. Во время drag показывается preview; на release исходные UUID заменяются перемещёнными векторными копиями одной атомарной transaction. Копии сохраняют исходный порядок рисования относительно соседних объектов, а выделение остаётся активным для повторного перемещения.
+- Выбранные объекты окружены общим bounding box с четырьмя квадратными угловыми handles. Потяните handle без модификаторов для пропорционального scale относительно противоположного угла: preview не меняет документ, release сохраняет одну атомарную replacement transaction, `Esc` отменяет жест.
 - Eraser Lasso показывает красный контур только во время жеста. После release валидный замкнутый контур сохраняется как одна векторная операция `EraseArea`, стирает более старое содержимое внутри области и очищает preview; `Ctrl+Z`/redo и reopen восстанавливают результат. Клик, линия и другой вырожденный контур не записываются.
 - Кнопка `Layers` открывает список слоёв сверху вниз. Два checkbox управляют visibility и lock; `+` создаёт верхний слой, `Duplicate` копирует active layer над исходным с новыми UUID операций, `Delete` удаляет active layer, `Rename` меняет имя, `Up`/`Down` меняют порядок. Последний слой удалить нельзя; непустой требует подтверждения. Hidden layer не рисуется, hidden/locked active layer нельзя редактировать. Все команды сохраняются после reopen и отменяются в общей с рисованием истории.
 - Колесо мыши или `Z` + ЛКМ — масштабирование относительно курсора.
@@ -110,12 +115,12 @@ EndlessSketch — Windows-приложение на Rust для рисовани
 - Клик кистью без движения — точка текущего размера и цвета.
 - `Shift` + левая кнопка мыши — прямая линия кистью или ластиком.
 - `Ctrl` + левая кнопка мыши — изменение размера кисти.
-- Вторая строка toolbar: введите depth от `-10000` до `10000` и нажмите `Go` или Enter для быстрого перехода с сохранением видимого центра.
-- Третья строка toolbar: введите абсолютные tile `X` и `Y` на текущей глубине и нажмите `Go XY` или Enter. Поддерживаются целые десятичные значения и запись `1eN`, например `1e100` или `-1e100`; `Origin` возвращает камеру к tile `0/0`. Переход сохраняет текущие depth, zoom и локальное смещение внутри тайла. После раскрытия координата ограничена 10 000 цифрами.
-- Canvas overlay постоянно показывает tile `X/Y` центра камеры и нормализованные local `X/Y` внутри текущего тайла. Небольшие координаты выводятся полностью, степени десяти как `1eN`, остальные огромные BigInt сокращаются с указанием количества цифр.
+- Окно `Navigation` показывает current depth, zoom, точные tile `X/Y` и local `X/Y`. Для быстрого перехода введите depth от `-10000` до `10000` и нажмите `Go` или Enter; видимый центр сохраняется.
+- В `Navigation` можно ввести абсолютные tile `X/Y` на текущей глубине и нажать `Go XY` или Enter. Поддерживаются целые десятичные значения и запись `1eN`, например `1e100` или `-1e100`; `Origin` возвращает камеру к tile `0/0`. Полные огромные BigInt доступны в прокручиваемой selectable-строке, рядом показана компактная форма.
 - `Ctrl+Z` — undo; `Ctrl+Y` или `Ctrl+Shift+Z` — redo.
-- Панель сверху содержит цвет, размер кисти, открытие/создание документов, закладки текущей позиции и Settings.
+- Панель сверху содержит инструменты, цвет, размер кисти, историю и кнопки `File`, `Navigation`, `Bookmarks`, `Settings`, `Layers`. Закладки также открываются из `Navigation`.
 - Color picker сейчас редактирует только RGB и создаёт непрозрачные операции. Alpha старых операций сохраняется в документе, но при отображении цвет сводится с фоном и обрабатывается как opaque; точная прозрачность отложена.
+- `Settings > Display` управляет canvas overlay: presets `Minimal/Standard/Diagnostics`, master switch и отдельные Depth, Zoom, Tile/Local coordinates, operations, FPS, status и tile-state сохраняются в `local/settings.json`.
 
 ## Сборка и запуск
 
