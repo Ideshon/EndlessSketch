@@ -1,4 +1,4 @@
-use crate::coords::{CameraAddress, CanvasPoint};
+use crate::coords::{CameraAddress, CanvasPoint, ScreenAffine};
 use crate::document::CanvasDocument;
 use crate::help::HelpLibrary;
 use crate::local_paths::{default_canvas_path, settings_path};
@@ -11,7 +11,7 @@ use crate::settings::{
     AppSettings, EdgeQuality, MAX_BRUSH_INPUT_SPACING_PX, MAX_CACHE_SIZE_MIB,
     MAX_FILL_INPUT_SPACING_PX, MAX_PREVIEW_FPS, MAX_TILE_PREFETCH_RADIUS,
     MIN_BRUSH_INPUT_SPACING_PX, MIN_CACHE_SIZE_MIB, MIN_FILL_INPUT_SPACING_PX, MIN_PREVIEW_FPS,
-    PerformanceProfile, PngCompression, SmoothingLevel, TileRebuildPolicy,
+    OverlayProfile, PerformanceProfile, PngCompression, SmoothingLevel, TileRebuildPolicy,
 };
 use crate::smoothing::{
     GeometryClipRect, clip_polygon_to_rect, clip_polyline_to_rect, simplify_render_points,
@@ -55,6 +55,10 @@ const MIN_LASSO_PREVIEW_SPACING_PX: f32 = 2.0;
 const CLICK_SELECTION_DRAG_THRESHOLD_PX: f32 = 4.0;
 const CLICK_SELECTION_TOLERANCE_PX: f64 = 6.0;
 const SELECTION_CYCLE_POSITION_TOLERANCE_PX: f32 = 6.0;
+const SELECTION_HANDLE_SIZE_PX: f32 = 10.0;
+const SELECTION_HANDLE_HIT_RADIUS_PX: f32 = 9.0;
+const MIN_SELECTION_SCALE: f32 = 0.05;
+const MAX_SELECTION_SCALE: f32 = 64.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PointAppendDecision {
@@ -80,6 +84,69 @@ enum RectangleSelectionMode {
 enum FileWindowTab {
     File,
     Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionScaleHandle {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl SelectionScaleHandle {
+    const ALL: [Self; 4] = [
+        Self::TopLeft,
+        Self::TopRight,
+        Self::BottomLeft,
+        Self::BottomRight,
+    ];
+
+    fn position(self, bounds: Rect) -> Pos2 {
+        match self {
+            Self::TopLeft => bounds.left_top(),
+            Self::TopRight => bounds.right_top(),
+            Self::BottomLeft => bounds.left_bottom(),
+            Self::BottomRight => bounds.right_bottom(),
+        }
+    }
+
+    fn pivot(self, bounds: Rect) -> Pos2 {
+        match self {
+            Self::TopLeft => bounds.right_bottom(),
+            Self::TopRight => bounds.left_bottom(),
+            Self::BottomLeft => bounds.right_top(),
+            Self::BottomRight => bounds.left_top(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectionScaleGesture {
+    handle: SelectionScaleHandle,
+    bounds: Rect,
+    pointer_start: Pos2,
+    current: Pos2,
+}
+
+impl SelectionScaleGesture {
+    fn scale(self) -> f32 {
+        let handle_position = self.handle.position(self.bounds);
+        let dragged_handle = handle_position + (self.current - self.pointer_start);
+        selection_scale_factor(self.bounds, self.handle, dragged_handle)
+    }
+
+    fn transform_position(self, position: Pos2) -> Pos2 {
+        let pivot = self.handle.pivot(self.bounds);
+        pivot + (position - pivot) * self.scale()
+    }
+
+    fn transformed_bounds(self) -> Rect {
+        Rect::from_two_pos(
+            self.handle.pivot(self.bounds),
+            self.transform_position(self.handle.position(self.bounds)),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,6 +178,19 @@ enum ClipboardCommand {
     Cut,
     Paste,
     PasteInPlace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionMenuAction {
+    Clipboard(ClipboardCommand),
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanvasContextMenuKind {
+    Brush,
+    Fill,
+    Selection,
 }
 
 #[derive(Default)]
@@ -206,16 +286,20 @@ struct CoordinateOverlayCache {
     tile_y: Option<BigInt>,
     formatted_x: String,
     formatted_y: String,
+    exact_x: String,
+    exact_y: String,
 }
 
 impl CoordinateOverlayCache {
     fn update(&mut self, camera: &CameraAddress) {
         if self.tile_x.as_ref() != Some(&camera.tile_x) {
             self.formatted_x = format_overlay_coordinate(&camera.tile_x);
+            self.exact_x = camera.tile_x.to_string();
             self.tile_x = Some(camera.tile_x.clone());
         }
         if self.tile_y.as_ref() != Some(&camera.tile_y) {
             self.formatted_y = format_overlay_coordinate(&camera.tile_y);
+            self.exact_y = camera.tile_y.to_string();
             self.tile_y = Some(camera.tile_y.clone());
         }
     }
@@ -247,6 +331,7 @@ pub struct EndlessSketchApp {
     file_window_tab: FileWindowTab,
     help_library: HelpLibrary,
     help_language_id: String,
+    show_navigation: bool,
     show_bookmarks: bool,
     show_settings: bool,
     show_layers: bool,
@@ -272,6 +357,7 @@ pub struct EndlessSketchApp {
     selection_move_start: Option<Pos2>,
     selection_move_current: Option<Pos2>,
     selection_move_active: bool,
+    selection_scale_gesture: Option<SelectionScaleGesture>,
     rectangle_selection_mode: RectangleSelectionMode,
     hovered_operation_id: Option<Uuid>,
     selection_hover_position: Option<Pos2>,
@@ -341,6 +427,7 @@ impl EndlessSketchApp {
             file_window_tab: FileWindowTab::File,
             help_library,
             help_language_id,
+            show_navigation: false,
             show_bookmarks: false,
             show_settings: false,
             show_layers: false,
@@ -366,6 +453,7 @@ impl EndlessSketchApp {
             selection_move_start: None,
             selection_move_current: None,
             selection_move_active: false,
+            selection_scale_gesture: None,
             rectangle_selection_mode: RectangleSelectionMode::Inside,
             hovered_operation_id: None,
             selection_hover_position: None,
@@ -378,8 +466,7 @@ impl EndlessSketchApp {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let mut selection_command = None;
-        let mut delete_selection_requested = false;
+        let mut selection_action = None;
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.tool, ToolKind::Brush, "Brush (B)");
             ui.selectable_value(&mut self.tool, ToolKind::Eraser, "Eraser (E)");
@@ -393,58 +480,8 @@ impl EndlessSketchApp {
                     RectangleSelectionMode::Inside => "Inside",
                     RectangleSelectionMode::Crossing => "Crossing",
                 };
-                let has_selection = !self.selected_operation_ids.is_empty();
-                let can_paste = !self.selection_clipboard.operations.is_empty()
-                    && self.document.layer_is_editable(self.active_layer_id);
                 ui.menu_button(format!("Selection: {mode}"), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.rectangle_selection_mode,
-                            RectangleSelectionMode::Inside,
-                            "Inside",
-                        );
-                        ui.selectable_value(
-                            &mut self.rectangle_selection_mode,
-                            RectangleSelectionMode::Crossing,
-                            "Crossing",
-                        );
-                    });
-                    ui.separator();
-                    if ui
-                        .add_enabled(has_selection, egui::Button::new("Cut"))
-                        .clicked()
-                    {
-                        selection_command = Some(ClipboardCommand::Cut);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(has_selection, egui::Button::new("Copy"))
-                        .clicked()
-                    {
-                        selection_command = Some(ClipboardCommand::Copy);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(can_paste, egui::Button::new("Paste"))
-                        .clicked()
-                    {
-                        selection_command = Some(ClipboardCommand::Paste);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(can_paste, egui::Button::new("Paste in place"))
-                        .clicked()
-                    {
-                        selection_command = Some(ClipboardCommand::PasteInPlace);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(has_selection, egui::Button::new("Delete"))
-                        .clicked()
-                    {
-                        delete_selection_requested = true;
-                        ui.close();
-                    }
+                    selection_action = self.selection_menu_content(ui);
                 });
             }
             ui.separator();
@@ -467,6 +504,9 @@ impl EndlessSketchApp {
                 self.file_window_tab = FileWindowTab::File;
                 self.show_file = true;
             }
+            if ui.button("Navigation").clicked() {
+                self.show_navigation = true;
+            }
             if ui.button("Bookmarks").clicked() {
                 self.show_bookmarks = true;
             }
@@ -477,52 +517,116 @@ impl EndlessSketchApp {
                 self.show_layers = true;
             }
         });
-        if delete_selection_requested {
-            self.delete_selected();
-        } else if let Some(command) = selection_command {
-            self.run_clipboard_command(command);
+        if let Some(action) = selection_action {
+            self.run_selection_menu_action(action);
         }
-        let mut jump_requested = false;
+    }
+
+    fn selection_menu_content(&mut self, ui: &mut egui::Ui) -> Option<SelectionMenuAction> {
+        let has_selection = !self.selected_operation_ids.is_empty();
+        let can_paste = !self.selection_clipboard.operations.is_empty()
+            && self.document.layer_is_editable(self.active_layer_id);
+        let mut action = None;
         ui.horizontal(|ui| {
-            ui.label(format!("Current depth: {}", self.camera.depth));
-            ui.label("Jump to");
-            let response = ui.add(
-                egui::DragValue::new(&mut self.depth_jump_target)
-                    .range(MIN_QUICK_DEPTH..=MAX_QUICK_DEPTH)
-                    .speed(1),
+            ui.selectable_value(
+                &mut self.rectangle_selection_mode,
+                RectangleSelectionMode::Inside,
+                "Inside",
             );
-            let submit_by_enter =
-                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            jump_requested = ui.button("Go").clicked() || submit_by_enter;
+            ui.selectable_value(
+                &mut self.rectangle_selection_mode,
+                RectangleSelectionMode::Crossing,
+                "Crossing",
+            );
         });
-        if jump_requested {
-            self.jump_to_target_depth();
+        ui.separator();
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Cut"))
+            .clicked()
+        {
+            action = Some(SelectionMenuAction::Clipboard(ClipboardCommand::Cut));
+            ui.close();
         }
-        let mut lateral_jump_requested = false;
-        let mut origin_requested = false;
-        ui.horizontal(|ui| {
-            ui.label("Tile jump");
-            ui.label("X");
-            let x_response = ui.add(
-                egui::TextEdit::singleline(&mut self.lateral_jump_x)
-                    .desired_width(150.0)
-                    .char_limit(MAX_LATERAL_COORDINATE_DIGITS + 8),
-            );
-            ui.label("Y");
-            let y_response = ui.add(
-                egui::TextEdit::singleline(&mut self.lateral_jump_y)
-                    .desired_width(150.0)
-                    .char_limit(MAX_LATERAL_COORDINATE_DIGITS + 8),
-            );
-            let submit_by_enter = (x_response.lost_focus() || y_response.lost_focus())
-                && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            lateral_jump_requested = ui.button("Go XY").clicked() || submit_by_enter;
-            origin_requested = ui.button("Origin").clicked();
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Copy"))
+            .clicked()
+        {
+            action = Some(SelectionMenuAction::Clipboard(ClipboardCommand::Copy));
+            ui.close();
+        }
+        if ui
+            .add_enabled(can_paste, egui::Button::new("Paste"))
+            .clicked()
+        {
+            action = Some(SelectionMenuAction::Clipboard(ClipboardCommand::Paste));
+            ui.close();
+        }
+        if ui
+            .add_enabled(can_paste, egui::Button::new("Paste in place"))
+            .clicked()
+        {
+            action = Some(SelectionMenuAction::Clipboard(
+                ClipboardCommand::PasteInPlace,
+            ));
+            ui.close();
+        }
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Delete"))
+            .clicked()
+        {
+            action = Some(SelectionMenuAction::Delete);
+            ui.close();
+        }
+        action
+    }
+
+    fn run_selection_menu_action(&mut self, action: SelectionMenuAction) {
+        match action {
+            SelectionMenuAction::Clipboard(command) => self.run_clipboard_command(command),
+            SelectionMenuAction::Delete => self.delete_selected(),
+        }
+    }
+
+    fn drawing_tool_menu_content(&mut self, ui: &mut egui::Ui) {
+        ui.label("Color");
+        ui.set_min_width(280.0);
+        let mut color = Color32::from_rgb(self.color.r, self.color.g, self.color.b);
+        if egui::color_picker::color_picker_color32(
+            ui,
+            &mut color,
+            egui::color_picker::Alpha::Opaque,
+        ) {
+            self.color = color_from_srgb([color.r(), color.g(), color.b()]);
+        }
+        ui.add(
+            egui::Slider::new(&mut self.brush_size, MIN_BRUSH_SIZE..=MAX_BRUSH_SIZE).text("Size"),
+        );
+    }
+
+    fn canvas_context_menu(&mut self, response: &egui::Response) {
+        let Some(kind) = canvas_context_menu_kind(self.tool) else {
+            return;
+        };
+        let mut action = None;
+        response.context_menu(|ui| match kind {
+            CanvasContextMenuKind::Brush => {
+                ui.strong("Brush");
+                ui.separator();
+                self.drawing_tool_menu_content(ui);
+            }
+            CanvasContextMenuKind::Fill => {
+                ui.strong("Fill");
+                ui.separator();
+                self.drawing_tool_menu_content(ui);
+            }
+            CanvasContextMenuKind::Selection => {
+                ui.strong("Selection");
+                ui.separator();
+                action = self.selection_menu_content(ui);
+            }
         });
-        if lateral_jump_requested {
-            self.jump_to_lateral_target();
-        } else if origin_requested {
-            self.jump_to_lateral_origin();
+        if let Some(action) = action {
+            self.run_selection_menu_action(action);
         }
     }
 
@@ -565,6 +669,111 @@ impl EndlessSketchApp {
         } else if open_requested {
             self.show_file = false;
             self.open_dialog();
+        }
+    }
+
+    fn navigation_window(&mut self, context: &egui::Context) {
+        if !self.show_navigation {
+            return;
+        }
+
+        self.coordinate_overlay.update(&self.camera);
+        let mut open = self.show_navigation;
+        let mut depth_jump_requested = false;
+        let mut lateral_jump_requested = false;
+        let mut origin_requested = false;
+        let mut bookmarks_requested = false;
+        let local_x = format!("{:.17}", self.camera.local_x);
+        let local_y = format!("{:.17}", self.camera.local_y);
+
+        egui::Window::new("Navigation")
+            .open(&mut open)
+            .default_width(520.0)
+            .resizable(true)
+            .show(context, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Depth");
+                    ui.monospace(self.camera.depth.to_string());
+                    ui.separator();
+                    ui.label("Zoom");
+                    ui.monospace(format!("{:.9}x", self.camera.zoom));
+                });
+                ui.separator();
+                navigation_coordinate_row(
+                    ui,
+                    "Tile X",
+                    &self.coordinate_overlay.formatted_x,
+                    &self.coordinate_overlay.exact_x,
+                );
+                navigation_coordinate_row(
+                    ui,
+                    "Tile Y",
+                    &self.coordinate_overlay.formatted_y,
+                    &self.coordinate_overlay.exact_y,
+                );
+                navigation_coordinate_row(ui, "Local X", &local_x, &local_x);
+                navigation_coordinate_row(ui, "Local Y", &local_y, &local_y);
+                ui.separator();
+                ui.label("Depth jump");
+                ui.horizontal(|ui| {
+                    ui.label("Target");
+                    let response = ui.add(
+                        egui::DragValue::new(&mut self.depth_jump_target)
+                            .range(MIN_QUICK_DEPTH..=MAX_QUICK_DEPTH)
+                            .speed(1),
+                    );
+                    let submit_by_enter = response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    depth_jump_requested = ui.button("Go").clicked() || submit_by_enter;
+                });
+                ui.separator();
+                ui.label("Tile X/Y jump");
+                ui.horizontal(|ui| {
+                    ui.label("X");
+                    let width = ui.available_width();
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.lateral_jump_x)
+                            .desired_width(width)
+                            .char_limit(MAX_LATERAL_COORDINATE_DIGITS + 8),
+                    );
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        lateral_jump_requested = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Y");
+                    let width = ui.available_width();
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.lateral_jump_y)
+                            .desired_width(width)
+                            .char_limit(MAX_LATERAL_COORDINATE_DIGITS + 8),
+                    );
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        lateral_jump_requested = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    lateral_jump_requested |= ui.button("Go XY").clicked();
+                    origin_requested = ui.button("Origin").clicked();
+                    bookmarks_requested = ui.button("Bookmarks").clicked();
+                });
+            });
+
+        self.show_navigation = open;
+        if depth_jump_requested {
+            self.jump_to_target_depth();
+        }
+        if lateral_jump_requested {
+            self.jump_to_lateral_target();
+        } else if origin_requested {
+            self.jump_to_lateral_origin();
+        }
+        if bookmarks_requested {
+            self.show_bookmarks = true;
         }
     }
 
@@ -783,6 +992,81 @@ impl EndlessSketchApp {
                         .text("Preview FPS"),
                     )
                     .changed();
+                ui.separator();
+                egui::CollapsingHeader::new("Display")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let mut active_profile = self.settings.overlay_profile();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Overlay");
+                            for profile in OverlayProfile::PRESETS {
+                                if ui
+                                    .selectable_label(active_profile == profile, profile.label())
+                                    .clicked()
+                                {
+                                    self.settings.apply_overlay_profile(profile);
+                                    active_profile = profile;
+                                    changed = true;
+                                }
+                            }
+                            let _ = ui.selectable_label(
+                                active_profile == OverlayProfile::Custom,
+                                OverlayProfile::Custom.label(),
+                            );
+                        });
+                        changed |= ui
+                            .checkbox(&mut self.settings.overlay_enabled, "Show canvas overlay")
+                            .changed();
+                        ui.add_enabled_ui(self.settings.overlay_enabled, |ui| {
+                            egui::Grid::new("canvas_overlay_fields")
+                                .num_columns(2)
+                                .show(ui, |ui| {
+                                    changed |= ui
+                                        .checkbox(&mut self.settings.overlay_show_depth, "Depth")
+                                        .changed();
+                                    changed |= ui
+                                        .checkbox(&mut self.settings.overlay_show_zoom, "Zoom")
+                                        .changed();
+                                    ui.end_row();
+                                    changed |= ui
+                                        .checkbox(
+                                            &mut self.settings.overlay_show_tile_coordinates,
+                                            "Tile X/Y",
+                                        )
+                                        .changed();
+                                    changed |= ui
+                                        .checkbox(
+                                            &mut self.settings.overlay_show_local_coordinates,
+                                            "Local X/Y",
+                                        )
+                                        .changed();
+                                    ui.end_row();
+                                    changed |= ui
+                                        .checkbox(
+                                            &mut self.settings.overlay_show_operation_count,
+                                            "Operation count",
+                                        )
+                                        .changed();
+                                    changed |= ui
+                                        .checkbox(
+                                            &mut self.settings.overlay_show_performance,
+                                            "FPS / frame time",
+                                        )
+                                        .changed();
+                                    ui.end_row();
+                                    changed |= ui
+                                        .checkbox(&mut self.settings.overlay_show_status, "Status")
+                                        .changed();
+                                    changed |= ui
+                                        .checkbox(
+                                            &mut self.settings.overlay_show_tile_state,
+                                            "Tile / rebuild state",
+                                        )
+                                        .changed();
+                                    ui.end_row();
+                                });
+                        });
+                    });
                 ui.separator();
                 if ui.button("Reset").clicked() {
                     reset_requested = true;
@@ -1331,6 +1615,7 @@ impl EndlessSketchApp {
         self.paint_draft(&painter, response.rect);
         self.paint_transient_overlays(&painter, response.rect);
         self.paint_overlay(&painter, response.rect);
+        self.canvas_context_menu(&response);
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
@@ -1363,8 +1648,12 @@ impl EndlessSketchApp {
             }
         });
         if context.input(|input| input.key_pressed(egui::Key::Escape)) {
-            self.clear_transient_tools();
-            self.status_message = "Selection cleared".to_owned();
+            if self.selection_scale_gesture.take().is_some() {
+                self.status_message = "Scale cancelled".to_owned();
+            } else {
+                self.clear_transient_tools();
+                self.status_message = "Selection cleared".to_owned();
+            }
         }
         if context.input(|input| input.key_pressed(egui::Key::Delete))
             && !self.selected_operation_ids.is_empty()
@@ -1657,6 +1946,7 @@ impl EndlessSketchApp {
                 if !primary_down
                     && !self.selection_drag_active
                     && !self.selection_move_active
+                    && self.selection_scale_gesture.is_none()
                     && position != self.selection_hover_position
                 {
                     self.selection_hover_position = position;
@@ -1674,7 +1964,25 @@ impl EndlessSketchApp {
                 {
                     self.hovered_operation_id = None;
                     self.selection_hover_position = None;
-                    if !modifiers.shift
+                    let scale_handle = (!modifiers.shift
+                        && !modifiers.ctrl
+                        && !modifiers.alt
+                        && !self.selected_operation_ids.is_empty())
+                    .then(|| self.selection_screen_bounds(response.rect))
+                    .flatten()
+                    .and_then(|bounds| {
+                        selection_scale_handle_at(bounds, position).map(|handle| (handle, bounds))
+                    });
+                    if let Some((handle, bounds)) = scale_handle {
+                        self.selection_scale_gesture = Some(SelectionScaleGesture {
+                            handle,
+                            bounds,
+                            pointer_start: position,
+                            current: position,
+                        });
+                        self.selection_move_active = false;
+                        self.selection_drag_active = false;
+                    } else if !modifiers.shift
                         && !modifiers.ctrl
                         && !modifiers.alt
                         && self.position_hits_selected(position, response.rect)
@@ -1689,6 +1997,22 @@ impl EndlessSketchApp {
                         self.selection_drag_active = true;
                         self.selection_move_active = false;
                     }
+                }
+                if self.selection_scale_gesture.is_some() {
+                    for position in drag_positions {
+                        if let Some(gesture) = self.selection_scale_gesture.as_mut() {
+                            gesture.current = position;
+                        }
+                    }
+                    if primary_released {
+                        if let (Some(position), Some(gesture)) =
+                            (position, self.selection_scale_gesture.as_mut())
+                        {
+                            gesture.current = position;
+                        }
+                        self.finish_selection_scale(response.rect);
+                    }
+                    return;
                 }
                 if self.selection_move_active {
                     for position in drag_positions {
@@ -2023,6 +2347,80 @@ impl EndlessSketchApp {
             })
     }
 
+    fn selection_screen_bounds(&self, canvas_rect: Rect) -> Option<Rect> {
+        let mut min = Pos2::new(f32::INFINITY, f32::INFINITY);
+        let mut max = Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        let mut found = false;
+        for operation in self
+            .document
+            .operations()
+            .iter()
+            .filter(|operation| self.selected_operation_ids.contains(&operation.id))
+        {
+            let radius = if operation.kind.is_area() {
+                0.0
+            } else {
+                operation_width(operation, self.camera.depth, self.camera.zoom) * 0.5
+            };
+            for position in operation
+                .points
+                .iter()
+                .filter_map(|point| self.point_to_position(point, canvas_rect))
+            {
+                min.x = min.x.min(position.x - radius);
+                min.y = min.y.min(position.y - radius);
+                max.x = max.x.max(position.x + radius);
+                max.y = max.y.max(position.y + radius);
+                found = true;
+            }
+        }
+        found.then(|| Rect::from_min_max(min, max))
+    }
+
+    fn finish_selection_scale(&mut self, canvas_rect: Rect) {
+        let Some(gesture) = self.selection_scale_gesture.take() else {
+            return;
+        };
+        let scale = gesture.scale();
+        if (scale - 1.0).abs() < 0.001 {
+            self.status_message = "Scale unchanged".to_owned();
+            return;
+        }
+        if !self.document.layer_is_editable(self.active_layer_id) {
+            self.status_message = "Active layer is hidden or locked".to_owned();
+            return;
+        }
+        let pivot = gesture.handle.pivot(gesture.bounds) - canvas_rect.min;
+        let Some(transform) =
+            ScreenAffine::uniform_scale(pivot.x as f64, pivot.y as f64, scale as f64)
+        else {
+            self.status_message = "Scale is not representable".to_owned();
+            return;
+        };
+        let selected = self.selected_operation_ids.clone();
+        match self.document.transform_operations(
+            &selected,
+            &self.camera,
+            canvas_rect.width() as f64,
+            canvas_rect.height() as f64,
+            transform,
+            scale,
+            self.active_layer_id,
+        ) {
+            Ok(replacement_ids) if !replacement_ids.is_empty() => {
+                self.selected_operation_ids = replacement_ids.into_iter().collect();
+                self.invalidate_tile_rendering();
+                self.status_message = format!(
+                    "Scaled {} objects to {:.1}%",
+                    self.selected_operation_ids.len(),
+                    scale * 100.0
+                );
+            }
+            Ok(_) => self.status_message = "Nothing scaled".to_owned(),
+            Err(error) => self.status_message = format!("Scale failed: {error:#}"),
+        }
+    }
+
     fn finish_selection_move(&mut self) {
         let delta = self.selection_move_delta();
         self.selection_move_active = false;
@@ -2320,6 +2718,7 @@ impl EndlessSketchApp {
             RectangleSelectionMode::Crossing => Color32::from_rgba_unmultiplied(220, 130, 20, 190),
         };
         let move_delta = self.selection_move_delta();
+        let scale_gesture = self.selection_scale_gesture;
 
         if let (Some(start), Some(end)) = (self.selection_drag_start, self.selection_drag_current) {
             let selection_rect =
@@ -2338,10 +2737,39 @@ impl EndlessSketchApp {
                 .points
                 .iter()
                 .filter_map(|point| self.point_to_position(point, rect))
-                .map(|point| point + move_delta)
+                .map(|point| {
+                    scale_gesture.map_or_else(
+                        || point + move_delta,
+                        |gesture| gesture.transform_position(point),
+                    )
+                })
                 .collect();
-            let width = operation_width(operation, self.camera.depth, self.camera.zoom);
+            let width = operation_width(operation, self.camera.depth, self.camera.zoom)
+                * scale_gesture.map_or(1.0, SelectionScaleGesture::scale);
             paint_operation_highlight(painter, operation.kind, &points, width, selection_color);
+        }
+
+        let selection_bounds = (self.tool == ToolKind::Selection)
+            .then(|| {
+                scale_gesture
+                    .map(SelectionScaleGesture::transformed_bounds)
+                    .or_else(|| {
+                        self.selection_screen_bounds(rect).map(|bounds| {
+                            Rect::from_min_max(bounds.min + move_delta, bounds.max + move_delta)
+                        })
+                    })
+            })
+            .flatten();
+        if let Some(bounds) = selection_bounds {
+            paint_rect_outline(painter, bounds, Stroke::new(1.5, selection_color));
+            for handle in SelectionScaleHandle::ALL {
+                let handle_rect = Rect::from_center_size(
+                    handle.position(bounds),
+                    egui::vec2(SELECTION_HANDLE_SIZE_PX, SELECTION_HANDLE_SIZE_PX),
+                );
+                painter.rect_filled(handle_rect, 0.0, Color32::WHITE);
+                paint_rect_outline(painter, handle_rect, Stroke::new(1.5, selection_color));
+            }
         }
 
         if let Some(operation) = self.hovered_operation_id.and_then(|id| {
@@ -2384,6 +2812,7 @@ impl EndlessSketchApp {
         self.selection_move_start = None;
         self.selection_move_current = None;
         self.selection_move_active = false;
+        self.selection_scale_gesture = None;
         self.hovered_operation_id = None;
         self.selection_hover_position = None;
         self.reset_selection_cycle();
@@ -2392,13 +2821,20 @@ impl EndlessSketchApp {
     }
 
     fn paint_overlay(&mut self, painter: &Painter, rect: Rect) {
-        self.coordinate_overlay.update(&self.camera);
+        if !self.settings.overlay_enabled {
+            return;
+        }
+        if self.settings.overlay_show_tile_coordinates
+            || self.settings.overlay_show_local_coordinates
+        {
+            self.coordinate_overlay.update(&self.camera);
+        }
         let tile_state = if self.settings.pause_tile_generation {
-            "   tiles paused"
+            "tiles paused"
         } else if self.automatic_tile_generation_pause {
-            "   tiles paused: drawing"
+            "tiles paused: drawing"
         } else if self.tile_rebuild_is_deferred() {
-            "   rebuild waiting"
+            "rebuild waiting"
         } else {
             ""
         };
@@ -2406,21 +2842,18 @@ impl EndlessSketchApp {
             || "fps --".to_owned(),
             |(fps, frame_time)| format!("fps {fps:.1} ({frame_time:.1} ms)"),
         );
-        let text = format!(
-            "depth {}   zoom {:.3}×   {} ops   {}   {}{}\n\
-             tile X {}\n\
-             tile Y {}   local X {:.6}   Y {:.6}",
-            self.camera.depth,
-            self.camera.zoom,
+        let Some(text) = canvas_overlay_text(
+            &self.settings,
+            &self.camera,
             self.document.operations().len(),
-            performance,
-            self.status_message,
+            &performance,
+            &self.status_message,
             tile_state,
-            self.coordinate_overlay.formatted_x,
-            self.coordinate_overlay.formatted_y,
-            self.camera.local_x,
-            self.camera.local_y
-        );
+            &self.coordinate_overlay.formatted_x,
+            &self.coordinate_overlay.formatted_y,
+        ) else {
+            return;
+        };
         painter.text(
             rect.left_top() + egui::vec2(12.0, 12.0),
             egui::Align2::LEFT_TOP,
@@ -3261,6 +3694,78 @@ fn help_content(ui: &mut egui::Ui, library: &HelpLibrary, selected_language_id: 
         });
 }
 
+fn navigation_coordinate_row(ui: &mut egui::Ui, label: &str, compact: &str, exact: &str) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if compact != exact {
+            ui.small(format!("({compact})"));
+        }
+    });
+    egui::ScrollArea::horizontal()
+        .id_salt(("navigation_coordinate", label))
+        .max_height(24.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(exact).monospace())
+                    .selectable(true)
+                    .sense(Sense::click()),
+            );
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canvas_overlay_text(
+    settings: &AppSettings,
+    camera: &CameraAddress,
+    operation_count: usize,
+    performance: &str,
+    status: &str,
+    tile_state: &str,
+    tile_x: &str,
+    tile_y: &str,
+) -> Option<String> {
+    if !settings.overlay_enabled {
+        return None;
+    }
+
+    let mut summary = Vec::new();
+    if settings.overlay_show_depth {
+        summary.push(format!("depth {}", camera.depth));
+    }
+    if settings.overlay_show_zoom {
+        summary.push(format!("zoom {:.3}x", camera.zoom));
+    }
+    if settings.overlay_show_operation_count {
+        summary.push(format!("{operation_count} ops"));
+    }
+    if settings.overlay_show_performance {
+        summary.push(performance.to_owned());
+    }
+    if settings.overlay_show_status && !status.is_empty() {
+        summary.push(status.to_owned());
+    }
+    if settings.overlay_show_tile_state && !tile_state.is_empty() {
+        summary.push(tile_state.to_owned());
+    }
+
+    let mut lines = Vec::new();
+    if !summary.is_empty() {
+        lines.push(summary.join("   "));
+    }
+    if settings.overlay_show_tile_coordinates {
+        lines.push(format!("tile X {tile_x}"));
+        lines.push(format!("tile Y {tile_y}"));
+    }
+    if settings.overlay_show_local_coordinates {
+        lines.push(format!(
+            "local X {:.6}   Y {:.6}",
+            camera.local_x, camera.local_y
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 fn paint_stroke_fallback(painter: &Painter, points: Vec<Pos2>, width: f32, color: Color32) {
     painter.extend(fast_stroke_fallback_shapes(points, width, color));
 }
@@ -3289,6 +3794,7 @@ impl eframe::App for EndlessSketchApp {
         let window = native_window(frame);
         egui::Panel::top("toolbar").show_inside(ui, |ui| self.toolbar(ui));
         self.file_window(&context);
+        self.navigation_window(&context);
         self.bookmark_window(&context);
         self.settings_window(&context);
         self.layers_window(&context);
@@ -3884,6 +4390,37 @@ fn selection_point(position: Pos2) -> SelectionPoint {
     SelectionPoint::new(position.x as f64, position.y as f64)
 }
 
+fn canvas_context_menu_kind(tool: ToolKind) -> Option<CanvasContextMenuKind> {
+    match tool {
+        ToolKind::Brush => Some(CanvasContextMenuKind::Brush),
+        ToolKind::LassoFill => Some(CanvasContextMenuKind::Fill),
+        ToolKind::Selection => Some(CanvasContextMenuKind::Selection),
+        ToolKind::Eraser | ToolKind::Eyedropper | ToolKind::EraserLasso => None,
+    }
+}
+
+fn selection_scale_handle_at(bounds: Rect, position: Pos2) -> Option<SelectionScaleHandle> {
+    SelectionScaleHandle::ALL
+        .into_iter()
+        .find(|handle| handle.position(bounds).distance(position) <= SELECTION_HANDLE_HIT_RADIUS_PX)
+}
+
+fn selection_scale_factor(bounds: Rect, handle: SelectionScaleHandle, dragged_handle: Pos2) -> f32 {
+    let pivot = handle.pivot(bounds);
+    let original = handle.position(bounds) - pivot;
+    let current = dragged_handle - pivot;
+    let denominator = original.length_sq();
+    if !denominator.is_finite() || denominator <= f32::EPSILON {
+        return 1.0;
+    }
+    let scale = current.dot(original) / denominator;
+    if scale.is_finite() {
+        scale.clamp(MIN_SELECTION_SCALE, MAX_SELECTION_SCALE)
+    } else {
+        1.0
+    }
+}
+
 fn operation_intersects_selection(
     kind: EditKind,
     points: &[SelectionPoint],
@@ -4163,28 +4700,31 @@ fn paint_operation_highlight(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardCommand, ClipboardShortcutKeys, FRAME_TIME_EMA_ALPHA, FrameRateTracker,
-        MAX_BRUSH_SIZE, MAX_FALLBACK_SMOOTHING_INPUT_POINTS, MIN_BRUSH_SIZE, PointAppendDecision,
+        CanvasContextMenuKind, ClipboardCommand, ClipboardShortcutKeys, FRAME_TIME_EMA_ALPHA,
+        FrameRateTracker, MAX_BRUSH_SIZE, MAX_FALLBACK_SMOOTHING_INPUT_POINTS, MIN_BRUSH_SIZE,
+        PointAppendDecision, SelectionScaleGesture, SelectionScaleHandle,
         TILE_POLL_REPAINT_INTERVAL, TileFallbackMode, adjusted_brush_size,
-        append_interpolated_points, append_preview_point, clamp_quick_depth, clip_pos2_polygon,
-        clip_pos2_polyline, clipboard_command_from_events, color_from_srgb, draft_is_committable,
+        append_interpolated_points, append_preview_point, canvas_context_menu_kind,
+        canvas_overlay_text, clamp_quick_depth, clip_pos2_polygon, clip_pos2_polyline,
+        clipboard_command_from_events, color_from_srgb, draft_is_committable,
         eraser_lasso_operation, fast_stroke_fallback_shapes, format_overlay_coordinate,
         incremental_paint_operations, interpolation_step_count, layer_operation_counts,
         operation_click_score, operation_contained_by_rectangle, operation_intersects_selection,
         paint_order_wheel_steps, parse_lateral_coordinate, point_append_decision,
         prepare_draft_for_commit, primary_pointer_positions, redo_shortcuts,
-        repaint_interval_for_work, selectable_layer_ids, selection_wheel_steps,
-        set_straight_draft_endpoint, should_paint_fill_fallback, should_paint_live_draft,
-        simplify_pos2_render_points, smooth_pos2_draft, smooth_pos2_saved_fallback,
-        space_pan_requested, straight_line_requested, surrender_canvas_keyboard_focus,
-        tile_display_rects, tile_fallback_mode, tile_generation_is_paused, tile_keys_for_view,
+        repaint_interval_for_work, selectable_layer_ids, selection_scale_factor,
+        selection_scale_handle_at, selection_wheel_steps, set_straight_draft_endpoint,
+        should_paint_fill_fallback, should_paint_live_draft, simplify_pos2_render_points,
+        smooth_pos2_draft, smooth_pos2_saved_fallback, space_pan_requested,
+        straight_line_requested, surrender_canvas_keyboard_focus, tile_display_rects,
+        tile_fallback_mode, tile_generation_is_paused, tile_keys_for_view,
         tile_rebuild_deferred_since, tool_shortcut_allowed, wrapped_cycle_index,
         z_drag_zoom_factor, z_zoom_requested, zoom_tile_requests_deferred_since,
     };
     use crate::coords::{CameraAddress, CanvasPoint};
-    use crate::model::{Color, DEFAULT_LAYER_ID, EditKind, EditOperation, Layer};
+    use crate::model::{Color, DEFAULT_LAYER_ID, EditKind, EditOperation, Layer, ToolKind};
     use crate::selection_geometry::{Point2, Rect2, SelectionShape};
-    use crate::settings::AppSettings;
+    use crate::settings::{AppSettings, OverlayProfile};
     use crate::tile_cache::{TILE_BLEED, TILE_SIZE, tile_lod_for_resolution, tile_resolution};
     use eframe::egui::{
         Color32, Event, Modifiers, MouseWheelUnit, PointerButton, Pos2, Rect, Shape, TouchPhase,
@@ -4193,6 +4733,29 @@ mod tests {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
+
+    #[test]
+    fn canvas_context_menu_routes_only_supported_tools() {
+        assert_eq!(
+            canvas_context_menu_kind(ToolKind::Brush),
+            Some(CanvasContextMenuKind::Brush)
+        );
+        assert_eq!(
+            canvas_context_menu_kind(ToolKind::LassoFill),
+            Some(CanvasContextMenuKind::Fill)
+        );
+        assert_eq!(
+            canvas_context_menu_kind(ToolKind::Selection),
+            Some(CanvasContextMenuKind::Selection)
+        );
+        for tool in [
+            ToolKind::Eraser,
+            ToolKind::Eyedropper,
+            ToolKind::EraserLasso,
+        ] {
+            assert_eq!(canvas_context_menu_kind(tool), None);
+        }
+    }
 
     #[test]
     fn selection_hit_test_uses_stroke_radius_and_fill_area() {
@@ -4225,6 +4788,55 @@ mod tests {
             0.0,
             &selection
         ));
+    }
+
+    #[test]
+    fn selection_scale_handles_hit_corners_and_preserve_click_offset() {
+        let bounds = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(110.0, 70.0));
+        assert_eq!(
+            selection_scale_handle_at(bounds, Pos2::new(114.0, 74.0)),
+            Some(SelectionScaleHandle::BottomRight)
+        );
+        assert_eq!(selection_scale_handle_at(bounds, bounds.center()), None);
+
+        let gesture = SelectionScaleGesture {
+            handle: SelectionScaleHandle::BottomRight,
+            bounds,
+            pointer_start: Pos2::new(114.0, 74.0),
+            current: Pos2::new(114.0, 74.0),
+        };
+        assert!((gesture.scale() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn selection_corner_scale_is_uniform_and_clamped_above_zero() {
+        let bounds = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 50.0));
+        assert!(
+            (selection_scale_factor(
+                bounds,
+                SelectionScaleHandle::BottomRight,
+                Pos2::new(200.0, 100.0),
+            ) - 2.0)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (selection_scale_factor(
+                bounds,
+                SelectionScaleHandle::TopLeft,
+                Pos2::new(-100.0, -50.0),
+            ) - 2.0)
+                .abs()
+                < f32::EPSILON
+        );
+        assert_eq!(
+            selection_scale_factor(
+                bounds,
+                SelectionScaleHandle::BottomRight,
+                Pos2::new(-10.0, -10.0),
+            ),
+            super::MIN_SELECTION_SCALE
+        );
     }
 
     #[test]
@@ -4984,6 +5596,95 @@ mod tests {
         assert_eq!(
             format_overlay_coordinate(&arbitrary),
             "12345678...34567890 (30d)"
+        );
+    }
+
+    #[test]
+    fn standard_overlay_matches_the_post_navigation_display() {
+        let settings = AppSettings::default();
+        let camera = CameraAddress::default();
+        let text = canvas_overlay_text(
+            &settings,
+            &camera,
+            42,
+            "fps 60.0 (16.7 ms)",
+            "Ready",
+            "tiles paused",
+            "123",
+            "456",
+        )
+        .expect("standard overlay");
+
+        assert!(text.contains("zoom 1.000x"));
+        assert!(text.contains("42 ops"));
+        assert!(text.contains("fps 60.0 (16.7 ms)"));
+        assert!(text.contains("Ready"));
+        assert!(text.contains("tiles paused"));
+        assert!(!text.contains("depth"));
+        assert!(!text.contains("tile X"));
+        assert!(!text.contains("local X"));
+    }
+
+    #[test]
+    fn diagnostic_overlay_includes_depth_and_coordinates() {
+        let mut settings = AppSettings::default();
+        settings.apply_overlay_profile(OverlayProfile::Diagnostics);
+        let camera = CameraAddress {
+            depth: 12,
+            local_x: 0.25,
+            local_y: -0.5,
+            ..CameraAddress::default()
+        };
+        let text = canvas_overlay_text(&settings, &camera, 7, "fps --", "Ready", "", "1e100", "-5")
+            .expect("diagnostic overlay");
+
+        assert!(text.contains("depth 12"));
+        assert!(text.contains("tile X 1e100"));
+        assert!(text.contains("tile Y -5"));
+        assert!(text.contains("local X 0.250000   Y -0.500000"));
+    }
+
+    #[test]
+    fn disabled_or_empty_custom_overlay_renders_nothing() {
+        let mut settings = AppSettings {
+            overlay_enabled: false,
+            ..AppSettings::default()
+        };
+        assert!(
+            canvas_overlay_text(
+                &settings,
+                &CameraAddress::default(),
+                0,
+                "fps --",
+                "Ready",
+                "",
+                "0",
+                "0",
+            )
+            .is_none()
+        );
+
+        settings.overlay_enabled = true;
+        settings.overlay_show_depth = false;
+        settings.overlay_show_zoom = false;
+        settings.overlay_show_tile_coordinates = false;
+        settings.overlay_show_local_coordinates = false;
+        settings.overlay_show_operation_count = false;
+        settings.overlay_show_performance = false;
+        settings.overlay_show_status = false;
+        settings.overlay_show_tile_state = false;
+        assert!(
+            canvas_overlay_text(
+                &settings,
+                &CameraAddress::default(),
+                0,
+                "fps --",
+                "Ready",
+                "",
+                "0",
+                "0",
+            )
+            .is_none()
         );
     }
 

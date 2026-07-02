@@ -68,6 +68,60 @@ impl CanvasPoint {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenAffine {
+    pivot_x: f64,
+    pivot_y: f64,
+    m11: f64,
+    m12: f64,
+    m21: f64,
+    m22: f64,
+}
+
+impl ScreenAffine {
+    pub fn uniform_scale(pivot_x: f64, pivot_y: f64, scale: f64) -> Option<Self> {
+        if !pivot_x.is_finite() || !pivot_y.is_finite() || !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            pivot_x,
+            pivot_y,
+            m11: scale,
+            m12: 0.0,
+            m21: 0.0,
+            m22: scale,
+        })
+    }
+
+    pub fn transform_canvas_point(
+        self,
+        point: &CanvasPoint,
+        camera: &CameraAddress,
+        viewport_width: f64,
+        viewport_height: f64,
+    ) -> Option<CanvasPoint> {
+        if !viewport_width.is_finite()
+            || viewport_width <= 0.0
+            || !viewport_height.is_finite()
+            || viewport_height <= 0.0
+        {
+            return None;
+        }
+        let (screen_x, screen_y) =
+            camera.canvas_to_screen(point, viewport_width, viewport_height)?;
+        let relative_x = screen_x - self.pivot_x;
+        let relative_y = screen_y - self.pivot_y;
+        let transformed_x = self.pivot_x + relative_x * self.m11 + relative_y * self.m12;
+        let transformed_y = self.pivot_y + relative_x * self.m21 + relative_y * self.m22;
+        point.translated_by_screen_delta(
+            camera.depth,
+            camera.zoom,
+            transformed_x - screen_x,
+            transformed_y - screen_y,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CameraAddress {
     pub depth: i64,
@@ -483,6 +537,40 @@ mod tests {
         assert_eq!(moved.tile_y, &point.tile_y - 1);
         assert!((moved.local_x - 0.25).abs() < f64::EPSILON);
         assert!((moved.local_y - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn uniform_screen_affine_scales_around_pivot_at_extreme_coordinates() {
+        let huge = BigInt::from(10u8).pow(1_000);
+        let camera = CameraAddress {
+            depth: 12,
+            tile_x: huge.clone(),
+            tile_y: -huge.clone(),
+            local_x: 0.5,
+            local_y: 0.5,
+            zoom: 2.0,
+        };
+        let point = CanvasPoint::new(12, huge.clone(), -huge, 0.6, 0.7);
+        let before = camera
+            .canvas_to_screen(&point, 800.0, 600.0)
+            .expect("project source");
+        let transform = ScreenAffine::uniform_scale(400.0, 300.0, 2.0).expect("valid scale");
+
+        let transformed = transform
+            .transform_canvas_point(&point, &camera, 800.0, 600.0)
+            .expect("transform point");
+        let after = camera
+            .canvas_to_screen(&transformed, 800.0, 600.0)
+            .expect("project transformed");
+
+        assert!((after.0 - (400.0 + (before.0 - 400.0) * 2.0)).abs() < 1.0e-8);
+        assert!((after.1 - (300.0 + (before.1 - 300.0) * 2.0)).abs() < 1.0e-8);
+    }
+
+    #[test]
+    fn uniform_screen_affine_rejects_invalid_scale() {
+        assert!(ScreenAffine::uniform_scale(0.0, 0.0, 0.0).is_none());
+        assert!(ScreenAffine::uniform_scale(0.0, 0.0, f64::NAN).is_none());
     }
 
     #[test]

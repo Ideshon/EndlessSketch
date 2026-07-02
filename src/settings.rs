@@ -19,7 +19,7 @@ const DEFAULT_TILE_PREFETCH_RADIUS: u8 = 1;
 const DEFAULT_CACHE_SIZE_MIB: u32 = 2048;
 const DEFAULT_PREVIEW_FPS: u32 = 60;
 const TILE_REBUILD_IDLE_MS: u64 = 180;
-const CURRENT_SETTINGS_VERSION: u32 = 10;
+const CURRENT_SETTINGS_VERSION: u32 = 11;
 
 pub const MIN_BRUSH_INPUT_SPACING_PX: f32 = 0.75;
 pub const MAX_BRUSH_INPUT_SPACING_PX: f32 = 8.0;
@@ -185,6 +185,79 @@ impl PerformanceProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayProfile {
+    Minimal,
+    Standard,
+    Diagnostics,
+    Custom,
+}
+
+impl OverlayProfile {
+    pub const PRESETS: [Self; 3] = [Self::Minimal, Self::Standard, Self::Diagnostics];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Minimal => "Minimal",
+            Self::Standard => "Standard",
+            Self::Diagnostics => "Diagnostics",
+            Self::Custom => "Custom",
+        }
+    }
+
+    const fn values(self) -> Option<OverlayValues> {
+        match self {
+            Self::Minimal => Some(OverlayValues {
+                enabled: true,
+                depth: false,
+                zoom: true,
+                tile_coordinates: false,
+                local_coordinates: false,
+                operation_count: false,
+                performance: false,
+                status: true,
+                tile_state: false,
+            }),
+            Self::Standard => Some(OverlayValues {
+                enabled: true,
+                depth: false,
+                zoom: true,
+                tile_coordinates: false,
+                local_coordinates: false,
+                operation_count: true,
+                performance: true,
+                status: true,
+                tile_state: true,
+            }),
+            Self::Diagnostics => Some(OverlayValues {
+                enabled: true,
+                depth: true,
+                zoom: true,
+                tile_coordinates: true,
+                local_coordinates: true,
+                operation_count: true,
+                performance: true,
+                status: true,
+                tile_state: true,
+            }),
+            Self::Custom => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayValues {
+    enabled: bool,
+    depth: bool,
+    zoom: bool,
+    tile_coordinates: bool,
+    local_coordinates: bool,
+    operation_count: bool,
+    performance: bool,
+    status: bool,
+    tile_state: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppSettings {
@@ -208,6 +281,15 @@ pub struct AppSettings {
     pub cache_size_mib: u32,
     pub png_compression: PngCompression,
     pub preview_fps: u32,
+    pub overlay_enabled: bool,
+    pub overlay_show_depth: bool,
+    pub overlay_show_zoom: bool,
+    pub overlay_show_tile_coordinates: bool,
+    pub overlay_show_local_coordinates: bool,
+    pub overlay_show_operation_count: bool,
+    pub overlay_show_performance: bool,
+    pub overlay_show_status: bool,
+    pub overlay_show_tile_state: bool,
 }
 
 impl Default for AppSettings {
@@ -231,6 +313,15 @@ impl Default for AppSettings {
             cache_size_mib: DEFAULT_CACHE_SIZE_MIB,
             png_compression: PngCompression::Fast,
             preview_fps: DEFAULT_PREVIEW_FPS,
+            overlay_enabled: true,
+            overlay_show_depth: false,
+            overlay_show_zoom: true,
+            overlay_show_tile_coordinates: false,
+            overlay_show_local_coordinates: false,
+            overlay_show_operation_count: true,
+            overlay_show_performance: true,
+            overlay_show_status: true,
+            overlay_show_tile_state: true,
         }
     }
 }
@@ -359,6 +450,43 @@ impl AppSettings {
         self.tile_worker_count = workers;
         self.fast_zoom_tile_settle_ms = settle_ms;
     }
+
+    pub fn overlay_profile(&self) -> OverlayProfile {
+        let values = self.overlay_values();
+        OverlayProfile::PRESETS
+            .into_iter()
+            .find(|profile| profile.values() == Some(values))
+            .unwrap_or(OverlayProfile::Custom)
+    }
+
+    pub fn apply_overlay_profile(&mut self, profile: OverlayProfile) {
+        let Some(values) = profile.values() else {
+            return;
+        };
+        self.overlay_enabled = values.enabled;
+        self.overlay_show_depth = values.depth;
+        self.overlay_show_zoom = values.zoom;
+        self.overlay_show_tile_coordinates = values.tile_coordinates;
+        self.overlay_show_local_coordinates = values.local_coordinates;
+        self.overlay_show_operation_count = values.operation_count;
+        self.overlay_show_performance = values.performance;
+        self.overlay_show_status = values.status;
+        self.overlay_show_tile_state = values.tile_state;
+    }
+
+    fn overlay_values(&self) -> OverlayValues {
+        OverlayValues {
+            enabled: self.overlay_enabled,
+            depth: self.overlay_show_depth,
+            zoom: self.overlay_show_zoom,
+            tile_coordinates: self.overlay_show_tile_coordinates,
+            local_coordinates: self.overlay_show_local_coordinates,
+            operation_count: self.overlay_show_operation_count,
+            performance: self.overlay_show_performance,
+            status: self.overlay_show_status,
+            tile_state: self.overlay_show_tile_state,
+        }
+    }
 }
 
 fn finite_clamp(value: f32, default: f32, min: f32, max: f32) -> f32 {
@@ -373,7 +501,7 @@ fn finite_clamp(value: f32, default: f32, min: f32, max: f32) -> f32 {
 mod tests {
     use super::{
         AppSettings, EdgeQuality, MAX_CACHE_SIZE_MIB, MAX_PREVIEW_FPS, MAX_TILE_PREFETCH_RADIUS,
-        PerformanceProfile, PngCompression, SmoothingLevel, TileRebuildPolicy,
+        OverlayProfile, PerformanceProfile, PngCompression, SmoothingLevel, TileRebuildPolicy,
     };
     use crate::tile_cache::PngCompression as CachePngCompression;
     use std::time::Duration;
@@ -399,6 +527,7 @@ mod tests {
             cache_size_mib: u32::MAX,
             png_compression: PngCompression::Small,
             preview_fps: u32::MAX,
+            ..AppSettings::default()
         }
         .normalized();
 
@@ -480,6 +609,9 @@ mod tests {
         changed.cache_size_mib = 512;
         changed.png_compression = PngCompression::Balanced;
         changed.preview_fps = 30;
+        changed.overlay_show_depth = true;
+        changed.overlay_show_tile_coordinates = true;
+        changed.overlay_show_performance = false;
         changed.save(&path).expect("save settings");
 
         assert_eq!(
@@ -508,7 +640,7 @@ mod tests {
 
         let settings = AppSettings::load(&path).expect("load legacy settings");
 
-        assert_eq!(settings.settings_version, 10);
+        assert_eq!(settings.settings_version, 11);
         assert_eq!(settings.tile_resolution_px, 512);
         assert!(!settings.pause_tile_generation);
         assert!(!settings.pause_tile_generation_while_drawing);
@@ -522,6 +654,7 @@ mod tests {
         assert_eq!(settings.cache_size_mib, 2048);
         assert_eq!(settings.png_compression, PngCompression::Fast);
         assert_eq!(settings.preview_fps, 60);
+        assert_eq!(settings.overlay_profile(), OverlayProfile::Standard);
     }
 
     #[test]
@@ -589,6 +722,63 @@ mod tests {
         assert_eq!(settings.cache_size_mib, 512);
         assert_eq!(settings.png_compression, PngCompression::Small);
         assert_eq!(settings.preview_fps, 30);
+    }
+
+    #[test]
+    fn overlay_profiles_apply_exact_values_and_detect_custom_changes() {
+        let mut settings = AppSettings::default();
+
+        assert_eq!(settings.overlay_profile(), OverlayProfile::Standard);
+        settings.apply_overlay_profile(OverlayProfile::Minimal);
+        assert!(settings.overlay_enabled);
+        assert!(settings.overlay_show_zoom);
+        assert!(settings.overlay_show_status);
+        assert!(!settings.overlay_show_depth);
+        assert!(!settings.overlay_show_operation_count);
+        assert!(!settings.overlay_show_performance);
+        assert_eq!(settings.overlay_profile(), OverlayProfile::Minimal);
+
+        settings.apply_overlay_profile(OverlayProfile::Diagnostics);
+        assert!(settings.overlay_show_depth);
+        assert!(settings.overlay_show_tile_coordinates);
+        assert!(settings.overlay_show_local_coordinates);
+        assert!(settings.overlay_show_operation_count);
+        assert!(settings.overlay_show_performance);
+        assert!(settings.overlay_show_tile_state);
+        assert_eq!(settings.overlay_profile(), OverlayProfile::Diagnostics);
+
+        settings.overlay_show_local_coordinates = false;
+        assert_eq!(settings.overlay_profile(), OverlayProfile::Custom);
+        settings.apply_overlay_profile(OverlayProfile::Custom);
+        assert!(!settings.overlay_show_local_coordinates);
+    }
+
+    #[test]
+    fn version_ten_settings_migrate_to_standard_overlay() {
+        let settings: AppSettings = serde_json::from_str(r#"{"settings_version": 10}"#)
+            .expect("deserialize version ten settings");
+        let settings = settings.normalized();
+
+        assert_eq!(settings.settings_version, 11);
+        assert_eq!(settings.overlay_profile(), OverlayProfile::Standard);
+    }
+
+    #[test]
+    fn overlay_profile_changes_only_display_fields() {
+        let mut settings = AppSettings {
+            tile_resolution_px: 1024,
+            tile_worker_count: 3,
+            fast_zoom_tile_settle_ms: 77,
+            brush_input_spacing_px: 7.0,
+            ..AppSettings::default()
+        };
+
+        settings.apply_overlay_profile(OverlayProfile::Diagnostics);
+
+        assert_eq!(settings.tile_resolution_px, 1024);
+        assert_eq!(settings.tile_worker_count, 3);
+        assert_eq!(settings.fast_zoom_tile_settle_ms, 77);
+        assert_eq!(settings.brush_input_spacing_px, 7.0);
     }
 
     #[test]

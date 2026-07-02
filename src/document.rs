@@ -1,9 +1,9 @@
-use crate::coords::CameraAddress;
+use crate::coords::{CameraAddress, ScreenAffine};
 use crate::model::{Bookmark, EditOperation, Layer, PaintOrderUpdate};
 use crate::spatial::OperationIndex;
 use crate::storage::{CanvasStore, HistoryChange, sort_operations_by_paint_order};
 use crate::tile_cache::TileKey;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use uuid::Uuid;
@@ -324,6 +324,93 @@ impl CanvasDocument {
             .filter(|operation| !operation.is_tombstone())
             .map(|operation| operation.id)
             .collect();
+        self.operations.extend(
+            commands
+                .into_iter()
+                .filter(|operation| !operation.is_tombstone()),
+        );
+        sort_operations_by_paint_order(&mut self.operations);
+        self.index = OperationIndex::build(&self.operations);
+        Ok(replacement_ids)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn transform_operations(
+        &mut self,
+        target_ids: &HashSet<Uuid>,
+        camera: &CameraAddress,
+        viewport_width: f64,
+        viewport_height: f64,
+        transform: ScreenAffine,
+        width_scale: f32,
+        layer_id: Uuid,
+    ) -> Result<Vec<Uuid>> {
+        if target_ids.is_empty() || !width_scale.is_finite() || width_scale <= 0.0 {
+            return Ok(Vec::new());
+        }
+        if !self.layer_is_editable(layer_id) {
+            bail!("active layer is hidden or locked");
+        }
+        let mut targets: Vec<_> = self
+            .operations
+            .iter()
+            .filter(|operation| {
+                target_ids.contains(&operation.id) && operation.layer_id == layer_id
+            })
+            .cloned()
+            .collect();
+        if targets.len() != target_ids.len() {
+            bail!("selection contains unavailable operations");
+        }
+        sort_operations_by_paint_order(&mut targets);
+
+        let transaction_id = Uuid::new_v4();
+        let mut tombstone = EditOperation::tombstone(
+            targets.iter().map(|operation| operation.id).collect(),
+            layer_id,
+        );
+        tombstone.transaction_id = transaction_id;
+        let mut replacements = Vec::with_capacity(targets.len());
+        for source in &targets {
+            let mut replacement = source.clone();
+            replacement.id = Uuid::new_v4();
+            replacement.sequence = 0;
+            replacement.paint_order = Some(source.effective_paint_order());
+            replacement.transaction_id = transaction_id;
+            replacement.affects_before_sequence = None;
+            let scaled_width = source.width_px * width_scale;
+            if !scaled_width.is_finite() {
+                bail!("scaled operation width is not finite");
+            }
+            replacement.width_px = scaled_width;
+            replacement.points = source
+                .points
+                .iter()
+                .map(|point| {
+                    transform
+                        .transform_canvas_point(point, camera, viewport_width, viewport_height)
+                        .context("transformed point is not representable at its operation depth")
+                })
+                .collect::<Result<_>>()?;
+            replacements.push(replacement);
+        }
+
+        let mut commands = Vec::with_capacity(replacements.len() + 1);
+        commands.push(tombstone);
+        commands.extend(replacements);
+        self.revision = self.store.commit_group(&mut commands)?;
+        self.max_sequence = commands
+            .last()
+            .map_or(self.max_sequence, |operation| operation.sequence);
+
+        let removed_ids: HashSet<_> = targets.iter().map(|operation| operation.id).collect();
+        self.operations
+            .retain(|operation| !removed_ids.contains(&operation.id));
+        let replacement_ids = commands
+            .iter()
+            .filter(|operation| !operation.is_tombstone())
+            .map(|operation| operation.id)
+            .collect::<Vec<_>>();
         self.operations.extend(
             commands
                 .into_iter()
@@ -716,7 +803,7 @@ impl CanvasDocument {
 #[cfg(test)]
 mod tests {
     use super::CanvasDocument;
-    use crate::coords::CanvasPoint;
+    use crate::coords::{CameraAddress, CanvasPoint, ScreenAffine};
     use crate::model::{Color, EditKind, EditOperation, Layer};
     use crate::tile_cache::TileKey;
     use num_bigint::BigInt;
@@ -997,6 +1084,207 @@ mod tests {
                 .collect::<HashSet<_>>(),
             replacement_ids.into_iter().collect()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_scale_is_one_persisted_history_transaction() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let root = temporary.path().join("test.esketch");
+        let mut document = CanvasDocument::open(&root)?;
+        let source = operation();
+        let source_id = source.id;
+        let source_points = source.points.clone();
+        document.commit(source)?;
+        let camera = CameraAddress::default();
+        let before: Vec<_> = source_points
+            .iter()
+            .map(|point| {
+                camera
+                    .canvas_to_screen(point, 512.0, 512.0)
+                    .expect("source projects")
+            })
+            .collect();
+        let transform = ScreenAffine::uniform_scale(256.0, 256.0, 2.0).expect("valid scale");
+
+        let replacement_ids = document.transform_operations(
+            &HashSet::from([source_id]),
+            &camera,
+            512.0,
+            512.0,
+            transform,
+            2.0,
+            crate::model::DEFAULT_LAYER_ID,
+        )?;
+
+        assert_eq!(replacement_ids.len(), 1);
+        assert_eq!(document.max_sequence(), 3);
+        assert_eq!(document.revision(), 2);
+        let replacement = &document.operations()[0];
+        assert_eq!(replacement.id, replacement_ids[0]);
+        assert_eq!(replacement.width_px, 10.0);
+        assert_eq!(replacement.effective_paint_order(), 1);
+        for (point, before) in replacement.points.iter().zip(before) {
+            let after = camera
+                .canvas_to_screen(point, 512.0, 512.0)
+                .expect("replacement projects");
+            assert!((after.0 - (256.0 + (before.0 - 256.0) * 2.0)).abs() < 0.001);
+            assert!((after.1 - (256.0 + (before.1 - 256.0) * 2.0)).abs() < 0.001);
+        }
+        drop(document);
+
+        let mut document = CanvasDocument::open(&root)?;
+        assert_eq!(document.operations()[0].id, replacement_ids[0]);
+        assert_eq!(document.operations()[0].width_px, 10.0);
+        assert!(document.undo()?);
+        assert_eq!(document.operations()[0].id, source_id);
+        assert_eq!(document.operations()[0].width_px, 5.0);
+        assert!(document.redo()?);
+        assert_eq!(document.operations()[0].id, replacement_ids[0]);
+        assert_eq!(document.operations()[0].width_px, 10.0);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_scale_preserves_area_geometry_and_style() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let points = vec![
+            CanvasPoint::new(0, 0.into(), 0.into(), 0.1, 0.1),
+            CanvasPoint::new(0, 0.into(), 0.into(), 0.4, 0.1),
+            CanvasPoint::new(0, 0.into(), 0.into(), 0.4, 0.4),
+            CanvasPoint::new(0, 0.into(), 0.into(), 0.1, 0.1),
+        ];
+        let color = Color::rgba(10, 80, 160, 255);
+        let mut source_ids = HashSet::new();
+        for kind in [EditKind::Fill, EditKind::EraseArea] {
+            let operation = EditOperation::draft(kind, 0, 1.0, points.clone(), color, 6.0);
+            source_ids.insert(operation.id);
+            document.commit(operation)?;
+        }
+        let transform = ScreenAffine::uniform_scale(256.0, 256.0, 1.5).expect("valid scale");
+
+        let replacement_ids = document.transform_operations(
+            &source_ids,
+            &CameraAddress::default(),
+            512.0,
+            512.0,
+            transform,
+            1.5,
+            crate::model::DEFAULT_LAYER_ID,
+        )?;
+
+        assert_eq!(replacement_ids.len(), 2);
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.kind)
+                .collect::<Vec<_>>(),
+            vec![EditKind::Fill, EditKind::EraseArea]
+        );
+        for operation in document.operations() {
+            assert_eq!(operation.layer_id, crate::model::DEFAULT_LAYER_ID);
+            assert_eq!(operation.color, color);
+            assert_eq!(operation.width_px, 9.0);
+            assert!(operation.destructive);
+            assert_eq!(operation.points.first(), operation.points.last());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selected_scale_rejects_locked_or_mixed_layer_selection() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let source = operation();
+        let source_id = source.id;
+        document.commit(source)?;
+        let other_layer = document.create_layer("Other")?;
+        let mut other = operation();
+        other.layer_id = other_layer.id;
+        let other_id = other.id;
+        document.commit(other)?;
+        let transform = ScreenAffine::uniform_scale(256.0, 256.0, 2.0).expect("valid scale");
+        let revision_before = document.revision();
+        let ids_before = document
+            .operations()
+            .iter()
+            .map(|operation| operation.id)
+            .collect::<Vec<_>>();
+
+        let error = document
+            .transform_operations(
+                &HashSet::from([source_id, other_id]),
+                &CameraAddress::default(),
+                512.0,
+                512.0,
+                transform,
+                2.0,
+                crate::model::DEFAULT_LAYER_ID,
+            )
+            .expect_err("mixed-layer selection must be rejected");
+        assert!(error.to_string().contains("unavailable operations"));
+        assert_eq!(document.revision(), revision_before);
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<Vec<_>>(),
+            ids_before
+        );
+
+        assert!(document.set_layer_locked(crate::model::DEFAULT_LAYER_ID, true)?);
+        let revision_before = document.revision();
+        let error = document
+            .transform_operations(
+                &HashSet::from([source_id]),
+                &CameraAddress::default(),
+                512.0,
+                512.0,
+                transform,
+                2.0,
+                crate::model::DEFAULT_LAYER_ID,
+            )
+            .expect_err("locked layer must be rejected");
+        assert!(error.to_string().contains("hidden or locked"));
+        assert_eq!(document.revision(), revision_before);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_scale_failure_does_not_commit_partial_history() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let mut source = operation();
+        source.native_depth = 1_000;
+        source.points = vec![
+            CanvasPoint::new(1_000, 0.into(), 0.into(), 0.1, 0.2),
+            CanvasPoint::new(1_000, 0.into(), 0.into(), 0.3, 0.4),
+        ];
+        let source_id = source.id;
+        document.commit(source)?;
+        let revision_before = document.revision();
+        let max_sequence_before = document.max_sequence();
+        let transform = ScreenAffine::uniform_scale(256.0, 256.0, 2.0).expect("valid scale");
+
+        document
+            .transform_operations(
+                &HashSet::from([source_id]),
+                &CameraAddress::default(),
+                512.0,
+                512.0,
+                transform,
+                2.0,
+                crate::model::DEFAULT_LAYER_ID,
+            )
+            .expect_err("unrepresentable transform must fail before commit");
+
+        assert_eq!(document.revision(), revision_before);
+        assert_eq!(document.max_sequence(), max_sequence_before);
+        assert_eq!(document.operations().len(), 1);
+        assert_eq!(document.operations()[0].id, source_id);
         Ok(())
     }
 
