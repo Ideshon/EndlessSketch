@@ -10,13 +10,17 @@ Notes:
   - Documents are stored as .esketch directories.
   - File contains New/Open and the current document path. F1 opens Russian/English Help with current controls, workflows, file safety, and detailed performance-setting guidance.
   - Editable translations are stored under help\ beside the executable. A valid additional JSON catalog with a unique id adds another language tab after restart; see help\README.txt.
+  - Settings > Display persists Minimal, Standard, Diagnostics, or Custom canvas-overlay fields. The master switch and each Depth, Zoom, coordinate, operation, FPS, status, and tile-state field are independent.
   - Ctrl+Z performs undo; Ctrl+Y and Ctrl+Shift+Z both perform redo.
   - S activates transient rectangle selection. X captures an Eraser Lasso contour; release commits a valid area as one durable vector erase operation, while Escape cancels an unfinished contour.
   - Selection click chooses one whole object, preferring nearer geometry and smaller screen bounds. Alt+click cycles overlaps; each physical Alt+wheel detent cycles exactly one object without zoom; Shift+click adds, and Ctrl+click toggles.
   - With Select active, the Selection popover contains Inside/Crossing plus Cut, Copy, Paste, Paste in place, and Delete. Existing keyboard shortcuts are unchanged.
+  - With Select active, right-clicking the canvas opens the same Selection commands at the pointer without clearing the selection or starting rectangle, move, or scale gestures.
+  - With Brush or Fill active, right-clicking the canvas opens the current RGB color and shared Size controls at the pointer. They edit the same toolbar state without creating a stroke, lasso, or history step.
   - Box Inside selects only fully enclosed stroke envelopes or Fill polygons; Box Crossing selects every intersected operation. Green hover previews the click candidate, and the drag frame disappears after release.
   - Delete or Delete selected persistently removes selected whole operations as one undoable UUID tombstone command; original vector payloads remain intact for undo/redo and reopen.
   - With S active, drag an already selected stroke or Fill to move the whole Object selection. Release commits one atomic tombstone/replacement transaction, preserves the original paint order relative to neighboring objects, and keeps the moved copies selected.
+  - The Object selection has one bounding box with four square corner handles. Drag a handle without modifiers to scale uniformly around the opposite corner; release commits one atomic replacement transaction, while Escape cancels the live preview.
   - With an Object selection, each Ctrl+wheel detent moves the selected objects one paint-order step inside the active layer: wheel up moves forward and wheel down moves backward. Undo/redo and reopen preserve the order and object identities.
   - Ctrl+C copies the Object selection to the internal clipboard, Ctrl+X cuts it, Ctrl+V pastes into the active layer with a cumulative 16px offset, and Ctrl+Shift+V pastes in place. Cut and Paste are atomic undo/redo steps; pasted objects receive new UUIDs and stay selected.
   - With an Object selection, Layers > Move selection to transfers it to another visible unlocked layer as one undo/redo step. The destination becomes active, and the moved replacements remain selected above its previous content.
@@ -31,10 +35,10 @@ Notes:
   - Running without a document path creates or opens local\default.esketch next to this executable.
   - Local app settings are stored in local\settings.json.
   - Brush input is 0.75..8 px (default 3) and Fill input is 1..4 px (default 2); these control accepted pointer sample density only.
-  - The second toolbar row jumps directly to depth -10000..10000 with Go or Enter while preserving the visible center and cancelling stale tile jobs.
-  - The third toolbar row jumps to absolute BigInt tile X/Y at the current depth with Go XY or Enter. Decimal and scientific integer notation such as 1e100 are supported up to 10000 expanded digits; Origin returns to tile 0/0.
-  - The canvas overlay continuously displays camera-center tile X/Y and normalized local X/Y. Extreme BigInt values are abbreviated, and their formatted text is cached until the camera crosses a tile boundary.
-  - Add a bookmark from the name field inside Bookmarks; Open, Rename, and Delete remain in the same window.
+  - Navigation shows current depth, zoom, exact Tile X/Y, and Local X/Y. It jumps directly to depth -10000..10000 with Go or Enter while preserving the visible center and cancelling stale tile jobs.
+  - Navigation jumps to absolute BigInt tile X/Y at the current depth with Go XY or Enter. Decimal and scientific integer notation such as 1e100 are supported up to 10000 expanded digits; Origin returns to tile 0/0.
+  - Full extreme BigInt coordinates are horizontally scrollable and selectable in Navigation, with a compact form such as 1e1000 shown as an orientation aid.
+  - Bookmarks is available from both the main toolbar and Navigation. Add stores the current position from its name field; Open, Rename, and Delete remain in the same window.
   - Interpolation gaps remain fixed at 8 px for Brush/Eraser and 4 px for Fill, and the final release endpoint is always preserved.
   - On Windows, active drafts recover up to 64 system mouse-history samples between UI frames before spacing/interpolation; regular egui events remain the automatic fallback.
   - Minimum Brush input with Smoothing Off intentionally exposes every integer mouse sample and can produce sharp raw vector joins; use a higher input value or enabled Smoothing for normal drawing.
