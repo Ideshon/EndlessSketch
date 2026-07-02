@@ -1,6 +1,6 @@
 # План EndlessSketch
 
-Обновлено: 2026-06-30
+Обновлено: 2026-07-02
 
 ## Обозначения
 
@@ -85,6 +85,7 @@
 - [ ] Добавить `Esc`/клик вне области для снятия выделения.
 - [ ] Не запускать tile rebuild при одном только изменении UI-выделения.
 - [ ] Убрать Cut/Copy/Paste/Delete из общей верхней панели в компактное всплывающее меню `Selection` рядом с режимами `Object/Area`, `Inside/Crossing` и `Rectangle/Lasso`.
+- [x] При активном инструменте Selection ПКМ на холсте открывает компактное окно `Selection` возле курсора; оно переиспользует те же команды и состояние, что toolbar popover, и не создаёт отдельную command/history логику.
 
 #### A.4. Подключение к общей grouped history
 
@@ -100,8 +101,10 @@
 #### A.5. Базовое редактирование
 
 - [x] Удаление Object selection через `Delete`/`Delete selected`: append-only UUID tombstone, reopen и атомарный undo/redo.
-- [ ] После стабилизации базовых команд добавить контекстное меню по ПКМ на выделении. Первый пункт — `Delete selected`; затем переиспользовать те же команды для Duplicate, Move и переноса на слой без отдельной логики history.
+- [ ] После базового Selection-окна по ПКМ из checkpoint 5.0e расширить его object-sensitive командами Duplicate, Move и переноса на слой без отдельной логики history.
 - [ ] Дублирование выделенного как одна grouped transaction: новые UUID, та же геометрия/стили/порядок и небольшой экранный offset.
+- [ ] Перекрашивание Object selection через текущую RGB-палитру: заменить color всех выбранных `Paint`/`Fill` одной append-only tombstone/replacement transaction, сохранив geometry, width, layer и paint order.
+- [ ] `Erase`/`EraseArea` не перекрашивать; при смешанном selection команда меняет только цветные операции, оставляет destructive operations и весь selection активными, а Undo/Redo/Reopen восстанавливают результат одним шагом.
 - [ ] Для `Area selection` разрезать Brush/Eraser polylines по границе рамки: внешние части остаются исходным содержимым, внутренние становятся отдельными редактируемыми фрагментами.
 - [ ] Для Fill выполнять polygon clipping и сохранять все валидные внутренние/внешние контуры без разрывов и самопересечений.
 - [ ] Записывать split/replacement как одну grouped transaction, чтобы undo полностью восстанавливал исходную операцию.
@@ -325,12 +328,22 @@ Depth остаётся пространственным масштабом и н
 
 #### M5. Расширенное редактирование
 
-- [ ] Checkpoint 5.0: разгрузить верхнюю панель и создать общие окна `File/Help`, `Navigation`, обновлённые `Bookmarks` и всплывающее меню `Selection`.
+- [x] Checkpoint 5.0: toolbar разгружен, окна `File/Help`, `Navigation`, обновлённые `Bookmarks`, `Settings > Display` и всплывающее меню `Selection` реализованы и проверены вручную.
 - [x] Checkpoint 5.0a: Inside/Crossing и Cut/Copy/Paste/Paste in place/Delete перенесены в `Selection` popover; Add с полем имени перенесён в Bookmarks. Проверено вручную.
 - [x] Checkpoint 5.0b: New/Open перенесены в окно `File` и проверены вручную; F1 открывает Help без дублирующих кнопок. Подробные вкладки `Русский/English` загружаются из внешних JSON-каталогов с встроенным fallback и проверены вручную.
-- [ ] Checkpoint 5.0c: окно `Navigation`.
-- [ ] Checkpoint 5.0d: `Settings > Display` и настраиваемый canvas overlay.
+- [x] Checkpoint 5.0c: окно `Navigation` проверено вручную; быстрый доступ `Bookmarks` оставлен и в toolbar, и внутри Navigation.
+- [x] Checkpoint 5.0d: `Settings > Display` и настраиваемый canvas overlay проверены вручную.
+- [x] Checkpoint 5.0e: при активном Selection ПКМ открывает существующее окно команд `Selection` в позиции курсора; текущий selection сохраняется, клик по команде не запускает rectangle/move/scale. Проверено автоматически и вручную.
+- [x] Checkpoint 5.0f: при активном Brush или Fill ПКМ открывает компактное tool menu с inline RGB-палитрой и общим `Size`; controls используют те же `color`/`brush_size`, что toolbar, и вторичная кнопка не начинает stroke или lasso. Вложенный color popup заменён inline picker и проверен вручную.
 - [ ] Checkpoint 5.1: общий transform box, scale, rotate и Flip для Object selection.
+  - [x] M5.1a: bounding box, corner-scale, live preview и одна grouped history transaction. Проверено автоматически и вручную.
+    - [x] Общий bounding box учитывает stroke width и показывает четыре фиксированных corner handles.
+    - [x] Scale пропорционален относительно противоположного угла; preview не меняет документ до release, `Esc` отменяет жест.
+    - [x] Release создаёт одну append-only tombstone/replacement transaction с сохранением layer, paint order, kind, color и Fill/EraseArea closure.
+    - [x] Автотесты покрывают Undo/Redo/reopen, extreme BigInt, locked/mixed-layer rejection и отказ без частичного commit; полный набор: `185 passed`.
+    - [x] Вручную подтверждены увеличение/уменьшение, handles, `Esc`, Move, Undo/Redo и reopen.
+  - [ ] M5.1b: rotate handle, Flip Horizontal/Vertical и общие transform-команды.
+  - [ ] M5.1c: `Recolor selected` через текущую палитру для Paint/Fill как одна grouped replacement transaction с сохранением geometry/layer/paint order и поддержкой Undo/Redo/Reopen.
 - [ ] Checkpoint 5.2: постоянная Rectangle/Lasso Area selection и clipping Brush/Eraser/Fill.
 - [ ] Checkpoint 5.3: opaque linear Gradient, Fill/Erase/Stroke boundary внутри Area selection; radial gradient вторым подпунктом.
 - [ ] Checkpoint 5.4a: выбор нескольких слоёв через Ctrl/Shift и атомарные bulk visibility/lock/reorder/delete/duplicate.
@@ -346,9 +359,9 @@ Depth остаётся пространственным масштабом и н
 - [x] Создано окно `File` с вкладками `File` и `Help`: New/Open и текущий document path работают, а F1 открывает прокручиваемую справку по инструментам, жестам, Selection, слоям, навигации, истории, файлам и всем текущим настройкам производительности.
 - [x] Справка вынесена в `help/*.json` рядом с exe: `ru/en` имеют встроенный fallback, внешний файл заменяет язык по `id`, новый уникальный `id` автоматически добавляет вкладку.
 - [ ] Save As/Export/Recent добавлять в File только одновременно с рабочей реализацией; текущие JSON-описания позже подключить к общему command/setting registry.
-- [ ] Создать отдельное окно `Navigation`: current depth, прямой Depth jump, Tile X/Y jump, Origin, точные текущие координаты и bookmarks shortcut.
-- [ ] Перенести управление canvas overlay в `Settings > Display`: master switch и независимые toggles для depth/zoom, Tile X/Y, Local X/Y, operation count, FPS/frame time и tile/rebuild state.
-- [ ] Добавить presets `Minimal` и `Diagnostics`; пользовательские комбинации определяются как `Custom` и сохраняются в `local/settings.json`.
+- [x] Создано отдельное перемещаемое окно `Navigation`: current depth/zoom, прямой Depth jump, Tile X/Y jump, Origin, точные прокручиваемые Tile/Local coordinates и переход в Bookmarks. Старые navigation rows и координаты удалены из постоянного toolbar/overlay; Bookmarks также оставлен отдельной toolbar-кнопкой.
+- [x] Управление canvas overlay перенесено в `Settings > Display`: master switch и независимые toggles для Depth, Zoom, Tile X/Y, Local X/Y, operation count, FPS/frame time, status и tile/rebuild state.
+- [x] Добавлены presets `Minimal`, `Standard`, `Diagnostics`; пользовательские комбинации определяются как `Custom` и сохраняются в `local/settings.json`.
 - [ ] Все окна перемещаемые и сохраняют разумное положение/открытое состояние; на маленьком экране текст и controls не перекрывают canvas.
 - [ ] Wheel-команды в Selection popover получают кнопки Up/Down или Previous/Next, чтобы ими можно было пользоваться стилусом даже без клавиатуры.
 
@@ -603,8 +616,9 @@ Depth остаётся пространственным масштабом и н
 
 - [ ] Вынести палитру цвета в отдельное перемещаемое окно с тем же поведением позиционирования, что у `Settings` и `Layers`.
 - [ ] Сохранить текущий быстрый доступ к активному цвету и не менять color/persistence модель в рамках этой UI-задачи.
-- [ ] После M5.0 добавить компактное контекстное меню холста по ПКМ, зависящее от активного инструмента и состояния selection.
-- [ ] Brush: size и color swatch; Eraser: size; Selection переиспользует команды общего popover; пустой canvas: Paste/New layer.
+- [x] Selection-версия контекстного окна по ПКМ выполнена в checkpoint 5.0e и переиспользует команды общего popover.
+- [x] В checkpoint 5.0f добавлены для Brush и Fill по ПКМ inline RGB-палитра и общий `Size`, связанные с теми же значениями toolbar; открытие/редактирование menu не создаёт operation или history step.
+- [ ] После 5.0f расширять тот же tool-sensitive command surface без дублирования обработчиков: Eraser — `Size`; Selection — общий popover; пустой canvas — Paste/New layer.
 - [ ] Не показывать больше 4-6 основных действий одновременно; расширенные параметры остаются в Settings/Layers/File/Navigation.
 - [x] `F1` открывает вкладку Help общего окна `File/Help`.
 - [ ] Help строить из тех же command/setting descriptions, чтобы горячие клавиши и диапазоны не расходились с UI.
@@ -612,6 +626,6 @@ Depth остаётся пространственным масштабом и н
 
 ## Ближайший checkpoint
 
-**Checkpoint 5.0c — следующий:** создать отдельное перемещаемое окно `Navigation`, перенести туда current depth, Depth jump, Tile X/Y jump, Origin и точные текущие координаты. File/Help, Selection popover и Bookmarks уже проверены вручную. После Navigation идёт `Settings > Display`, затем Object transform, постоянная Area selection, opaque Gradient и multi-layer selection перед folders. Падение FPS при Selection на насыщенном active layer добавлено в S5. Галочки быстрых отдельных штрихов не исправлены и остаются обязательной задачей S2 до экспорта.
+**Checkpoint 5.0f — проверен вручную:** Brush и Fill открывают по ПКМ inline RGB picker и `Size`; палитра остаётся открытой при взаимодействии, значения связаны с toolbar, а вторичная кнопка не создаёт operation/history step. Следующий transform-checkpoint — M5.1b rotate/Flip, затем M5.1c Recolor selected.
 
 После release рамка rectangle-selection исчезает; остаётся подсветка выбранных объектов, которая корректно следует за навигацией.

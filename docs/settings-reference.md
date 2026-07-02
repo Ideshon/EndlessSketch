@@ -1,6 +1,6 @@
 # Настройки EndlessSketch
 
-Обновлено: 2026-06-28
+Обновлено: 2026-07-01
 
 Настройки Rust-версии хранятся в `local/settings.json` рядом с исполняемым файлом. Изменения применяются сразу и сохраняются автоматически. Кнопка `Reset` возвращает все параметры к значениям по умолчанию.
 
@@ -201,7 +201,16 @@
 
 ### Canvas overlay / Display
 
-Планируется раздел `Settings > Display` с master switch и независимыми флагами: `Depth/Zoom`, `Tile X/Y`, `Local X/Y`, `Operation count`, `FPS/Frame time`, `Tile/Rebuild state`. Presets `Minimal` и `Diagnostics` выставляют проверенные комбинации, любое ручное изменение становится `Custom`. Выбор сохраняется в `local/settings.json` и влияет только на UI, не на документ или тайлы.
+Раздел `Settings > Display` появился в settings version 11. Он влияет только на текст поверх холста и не меняет документ, камеру, векторы или тайлы.
+
+- `Show canvas overlay` полностью скрывает или показывает overlay.
+- `Minimal`: только zoom и status.
+- `Standard` (по умолчанию): zoom, operation count, FPS/frame time, status и активное состояние tile/rebuild.
+- `Diagnostics`: все поля, включая depth, сокращённые Tile X/Y и Local X/Y.
+- `Custom` определяется автоматически после любого ручного изменения.
+- Независимые флаги: `Depth`, `Zoom`, `Tile X/Y`, `Local X/Y`, `Operation count`, `FPS / frame time`, `Status`, `Tile / rebuild state`.
+
+Старые settings v10 и ниже получают безопасный профиль `Standard`. Выбор сохраняется в `local/settings.json`. Полные огромные BigInt-координаты всегда доступны в окне `Navigation`, даже если их компактное отображение в overlay выключено.
 
 ### Persistent Area selection
 
