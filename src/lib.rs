@@ -8,6 +8,7 @@ pub mod mouse_history;
 pub mod projection_cache;
 pub mod raster;
 pub mod selection_geometry;
+pub mod session_log;
 pub mod settings;
 pub mod smoothing;
 pub mod spatial;

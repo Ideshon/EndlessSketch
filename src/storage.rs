@@ -1,5 +1,6 @@
 use crate::coords::CameraAddress;
 use crate::model::{Bookmark, DEFAULT_LAYER_ID, EditOperation, Layer};
+use crate::settings::StorageCommitMode;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -7,11 +8,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 3;
 const MAX_UNDO_OPERATIONS: i64 = 10_000;
+const MAX_UNDO_HISTORY_ENTRIES: i64 = 1_000;
+const OPERATION_ZSTD_LEVEL: i32 = 1;
 const MAX_LAYER_NAME_CHARS: usize = 128;
 const HISTORY_KIND_OPERATIONS: &str = "operations";
 const HISTORY_KIND_LAYERS: &str = "layers";
@@ -20,6 +23,28 @@ const HISTORY_KIND_LAYERS: &str = "layers";
 pub enum HistoryChange {
     Operations(Vec<EditOperation>),
     Layers { operations_changed: bool },
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct OperationCommitStats {
+    pub operation_count: usize,
+    pub compression_level: i32,
+    pub json_bytes: usize,
+    pub payload_bytes: usize,
+    pub sequence_ms: f64,
+    pub prepare_ms: f64,
+    pub normalize_ms: f64,
+    pub json_ms: f64,
+    pub compress_ms: f64,
+    pub insert_ms: f64,
+    pub draft_delete_ms: f64,
+    pub clear_redo_ms: f64,
+    pub history_ms: f64,
+    pub prune_history_ms: f64,
+    pub prune_undone_ms: f64,
+    pub revision_ms: f64,
+    pub transaction_commit_ms: f64,
+    pub total_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,7 +81,11 @@ impl CanvasStore {
 
         let connection = Connection::open(root.join("canvas.sqlite3"))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.pragma_update(
+            None,
+            "synchronous",
+            StorageCommitMode::Full.sqlite_synchronous(),
+        )?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
 
@@ -70,6 +99,12 @@ impl CanvasStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn set_commit_mode(&self, mode: StorageCommitMode) -> Result<()> {
+        self.connection
+            .pragma_update(None, "synchronous", mode.sqlite_synchronous())?;
+        Ok(())
     }
 
     pub fn load_active_operations(&self) -> Result<Vec<EditOperation>> {
@@ -288,7 +323,7 @@ impl CanvasStore {
         let transaction = self.connection.transaction()?;
         clear_redo_branch(&transaction)?;
         apply_layer_state(&transaction, &after)?;
-        insert_operation_rows(&transaction, &mut operations)?;
+        let _ = insert_operation_rows(&transaction, &mut operations)?;
         let history_sequence = next_history_sequence(&transaction)?;
         transaction.execute(
             "INSERT INTO history_entries(
@@ -301,6 +336,7 @@ impl CanvasStore {
                 payload
             ],
         )?;
+        prune_undo_history_entries(&transaction, MAX_UNDO_HISTORY_ENTRIES)?;
         let revision = revision_after_change(&transaction, !operations.is_empty())?;
         transaction.commit()?;
         Ok(Some((layer, operations, revision)))
@@ -354,6 +390,7 @@ impl CanvasStore {
                 payload
             ],
         )?;
+        prune_undo_history_entries(&transaction, MAX_UNDO_HISTORY_ENTRIES)?;
         let revision = revision_after_change(&transaction, !operation_ids.is_empty())?;
         transaction.commit()?;
         Ok(Some(revision))
@@ -444,7 +481,7 @@ impl CanvasStore {
         clear_redo_branch(&transaction)?;
         apply_layer_state(&transaction, &after)?;
         set_operations_active(&transaction, &source_command_ids, false)?;
-        insert_operation_rows(&transaction, &mut replacements)?;
+        let _ = insert_operation_rows(&transaction, &mut replacements)?;
         let history_sequence = next_history_sequence(&transaction)?;
         transaction.execute(
             "INSERT INTO history_entries(
@@ -457,6 +494,7 @@ impl CanvasStore {
                 payload
             ],
         )?;
+        prune_undo_history_entries(&transaction, MAX_UNDO_HISTORY_ENTRIES)?;
         let revision = revision_after_change(&transaction, !source_operations.is_empty())?;
         transaction.commit()?;
         Ok(Some((destination, replacements, revision)))
@@ -518,6 +556,7 @@ impl CanvasStore {
                 payload
             ],
         )?;
+        prune_undo_history_entries(&transaction, MAX_UNDO_HISTORY_ENTRIES)?;
         let revision = revision_after_change(&transaction, affects_render)?;
         transaction.commit()?;
         Ok(revision)
@@ -528,9 +567,18 @@ impl CanvasStore {
     }
 
     pub fn commit_group(&mut self, operations: &mut [EditOperation]) -> Result<u64> {
+        self.commit_group_with_stats(operations)
+            .map(|(revision, _)| revision)
+    }
+
+    pub fn commit_group_with_stats(
+        &mut self,
+        operations: &mut [EditOperation],
+    ) -> Result<(u64, OperationCommitStats)> {
         if operations.is_empty() {
             bail!("cannot commit an empty operation group");
         }
+        let total_start = Instant::now();
         for operation in operations.iter_mut() {
             operation.normalize_metadata();
         }
@@ -543,8 +591,12 @@ impl CanvasStore {
         }
 
         let transaction = self.connection.transaction()?;
+        let clear_redo_start = Instant::now();
         clear_redo_branch(&transaction)?;
-        insert_operation_rows(&transaction, operations)?;
+        let clear_redo_ms = clear_redo_start.elapsed().as_secs_f64() * 1_000.0;
+        let mut stats = insert_operation_rows(&transaction, operations)?;
+        stats.clear_redo_ms = clear_redo_ms;
+        let history_start = Instant::now();
         let history_sequence = next_history_sequence(&transaction)?;
         transaction.execute(
             "INSERT INTO history_entries(
@@ -557,13 +609,24 @@ impl CanvasStore {
                 HISTORY_KIND_OPERATIONS
             ],
         )?;
+        stats.history_ms = history_start.elapsed().as_secs_f64() * 1_000.0;
+        let prune_history_start = Instant::now();
+        prune_undo_history_entries(&transaction, MAX_UNDO_HISTORY_ENTRIES)?;
+        stats.prune_history_ms = prune_history_start.elapsed().as_secs_f64() * 1_000.0;
+        let prune_undone_start = Instant::now();
         transaction.execute(
             "DELETE FROM operations WHERE sequence < (SELECT MAX(sequence) - ?1 FROM operations) AND undone = 1",
             params![MAX_UNDO_OPERATIONS],
         )?;
+        stats.prune_undone_ms = prune_undone_start.elapsed().as_secs_f64() * 1_000.0;
+        let revision_start = Instant::now();
         let revision = revision_after_change(&transaction, true)?;
+        stats.revision_ms = revision_start.elapsed().as_secs_f64() * 1_000.0;
+        let transaction_commit_start = Instant::now();
         transaction.commit()?;
-        Ok(revision)
+        stats.transaction_commit_ms = transaction_commit_start.elapsed().as_secs_f64() * 1_000.0;
+        stats.total_ms = total_start.elapsed().as_secs_f64() * 1_000.0;
+        Ok((revision, stats))
     }
 
     pub fn save_draft(&self, operation: &EditOperation) -> Result<()> {
@@ -1094,7 +1157,25 @@ fn update_manifest_schema_version(root: &Path) -> Result<()> {
 
 fn encode_operation(operation: &EditOperation) -> Result<Vec<u8>> {
     let json = serde_json::to_vec(operation)?;
-    Ok(zstd::stream::encode_all(Cursor::new(json), 3)?)
+    Ok(zstd::stream::encode_all(
+        Cursor::new(json),
+        OPERATION_ZSTD_LEVEL,
+    )?)
+}
+
+fn encode_operation_with_stats(
+    operation: &EditOperation,
+    stats: &mut OperationCommitStats,
+) -> Result<Vec<u8>> {
+    let json_start = Instant::now();
+    let json = serde_json::to_vec(operation)?;
+    stats.json_ms += json_start.elapsed().as_secs_f64() * 1_000.0;
+    stats.json_bytes = stats.json_bytes.saturating_add(json.len());
+    let compress_start = Instant::now();
+    let payload = zstd::stream::encode_all(Cursor::new(json), OPERATION_ZSTD_LEVEL)?;
+    stats.compress_ms += compress_start.elapsed().as_secs_f64() * 1_000.0;
+    stats.payload_bytes = stats.payload_bytes.saturating_add(payload.len());
+    Ok(payload)
 }
 
 fn decode_operation(payload: &[u8]) -> Result<EditOperation> {
@@ -1117,38 +1198,54 @@ fn decode_layer_history(payload: &[u8]) -> Result<LayerHistoryPayload> {
 fn insert_operation_rows(
     transaction: &Transaction<'_>,
     operations: &mut [EditOperation],
-) -> Result<()> {
+) -> Result<OperationCommitStats> {
+    let total_start = Instant::now();
+    let mut stats = OperationCommitStats {
+        operation_count: operations.len(),
+        compression_level: OPERATION_ZSTD_LEVEL,
+        ..OperationCommitStats::default()
+    };
+    let sequence_start = Instant::now();
     let first_sequence: i64 = transaction.query_row(
         "SELECT COALESCE(MAX(sequence), 0) + 1 FROM operations",
         [],
         |row| row.get(0),
     )?;
+    stats.sequence_ms = sequence_start.elapsed().as_secs_f64() * 1_000.0;
+    let prepare_start = Instant::now();
+    let mut insert_statement = transaction.prepare(
+        "INSERT INTO operations(
+            sequence, operation_id, transaction_id, layer_id, payload, undone
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+    )?;
+    let mut delete_draft_statement =
+        transaction.prepare("DELETE FROM drafts WHERE operation_id = ?1")?;
+    stats.prepare_ms = prepare_start.elapsed().as_secs_f64() * 1_000.0;
     for (offset, operation) in operations.iter_mut().enumerate() {
+        let normalize_start = Instant::now();
         operation.normalize_metadata();
+        stats.normalize_ms += normalize_start.elapsed().as_secs_f64() * 1_000.0;
         let offset = i64::try_from(offset)?;
         operation.sequence = first_sequence
             .checked_add(offset)
             .context("operation sequence overflow")?;
         operation.affects_before_sequence = operation.destructive.then_some(operation.sequence - 1);
-        let payload = encode_operation(operation)?;
-        transaction.execute(
-            "INSERT INTO operations(
-                sequence, operation_id, transaction_id, layer_id, payload, undone
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-            params![
-                operation.sequence,
-                operation.id.as_bytes(),
-                operation.transaction_id.as_bytes(),
-                operation.layer_id.as_bytes(),
-                payload
-            ],
-        )?;
-        transaction.execute(
-            "DELETE FROM drafts WHERE operation_id = ?1",
-            params![operation.id.as_bytes()],
-        )?;
+        let payload = encode_operation_with_stats(operation, &mut stats)?;
+        let insert_start = Instant::now();
+        insert_statement.execute(params![
+            operation.sequence,
+            operation.id.as_bytes(),
+            operation.transaction_id.as_bytes(),
+            operation.layer_id.as_bytes(),
+            payload
+        ])?;
+        stats.insert_ms += insert_start.elapsed().as_secs_f64() * 1_000.0;
+        let draft_delete_start = Instant::now();
+        delete_draft_statement.execute(params![operation.id.as_bytes()])?;
+        stats.draft_delete_ms += draft_delete_start.elapsed().as_secs_f64() * 1_000.0;
     }
-    Ok(())
+    stats.total_ms = total_start.elapsed().as_secs_f64() * 1_000.0;
+    Ok(stats)
 }
 
 fn set_operations_active(
@@ -1201,6 +1298,28 @@ fn clear_redo_branch(transaction: &Transaction<'_>) -> Result<()> {
         [],
     )?;
     transaction.execute("DELETE FROM history_entries WHERE undone = 1", [])?;
+    Ok(())
+}
+
+fn prune_undo_history_entries(transaction: &Transaction<'_>, max_entries: i64) -> Result<()> {
+    if max_entries <= 0 {
+        return Ok(());
+    }
+    transaction.execute(
+        "DELETE FROM history_entries
+         WHERE undone = 0
+           AND history_sequence < COALESCE((
+                SELECT MIN(history_sequence)
+                FROM (
+                    SELECT history_sequence
+                    FROM history_entries
+                    WHERE undone = 0
+                    ORDER BY history_sequence DESC
+                    LIMIT ?1
+                )
+           ), 0)",
+        params![max_entries],
+    )?;
     Ok(())
 }
 
@@ -1427,6 +1546,19 @@ mod tests {
     }
 
     #[test]
+    fn commit_mode_updates_sqlite_synchronous_pragma() -> Result<()> {
+        let temporary = TempDir::new()?;
+        let store = CanvasStore::open(temporary.path().join("test.esketch"))?;
+
+        assert_eq!(sqlite_synchronous_value(&store)?, 2);
+        store.set_commit_mode(StorageCommitMode::Fast)?;
+        assert_eq!(sqlite_synchronous_value(&store)?, 1);
+        store.set_commit_mode(StorageCommitMode::Full)?;
+        assert_eq!(sqlite_synchronous_value(&store)?, 2);
+        Ok(())
+    }
+
+    #[test]
     fn schema_v1_migrates_operations_to_default_layer_transactions() -> Result<()> {
         let temporary = TempDir::new()?;
         let root = temporary.path().join("legacy.esketch");
@@ -1589,6 +1721,42 @@ mod tests {
         };
         assert_eq!(redone.len(), 2);
         assert_eq!(store.load_active_operations()?.len(), 2);
+        Ok(())
+    }
+
+    fn sqlite_synchronous_value(store: &CanvasStore) -> Result<i64> {
+        Ok(store
+            .connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))?)
+    }
+
+    #[test]
+    fn undo_history_pruning_keeps_active_operations() -> Result<()> {
+        let temporary = TempDir::new()?;
+        let mut store = CanvasStore::open(temporary.path().join("test.esketch"))?;
+        for _ in 0..3 {
+            let mut operation = operation();
+            store.commit(&mut operation)?;
+        }
+        {
+            let transaction = store.connection.transaction()?;
+            prune_undo_history_entries(&transaction, 2)?;
+            transaction.commit()?;
+        }
+
+        let history_count: i64 =
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM history_entries", [], |row| row.get(0))?;
+        assert_eq!(history_count, 2);
+        assert_eq!(store.load_active_operations()?.len(), 3);
+
+        assert!(store.undo()?.is_some());
+        assert_eq!(store.load_active_operations()?.len(), 2);
+        assert!(store.undo()?.is_some());
+        assert_eq!(store.load_active_operations()?.len(), 1);
+        assert!(store.undo()?.is_none());
+        assert_eq!(store.load_active_operations()?.len(), 1);
         Ok(())
     }
 

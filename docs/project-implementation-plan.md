@@ -1,6 +1,6 @@
 # План EndlessSketch
 
-Обновлено: 2026-07-02
+Обновлено: 2026-07-07
 
 ## Обозначения
 
@@ -55,14 +55,14 @@
 - [ ] Хранить активное выделение как временное состояние UI; не записывать его в документ в первой версии.
 - [x] Реализовать два режима попадания: `Inside` полностью заключает операцию, `Crossing` выбирает пересечения.
 - [x] Обычный клик выбирает один целый объект под курсором. Кандидаты ранжируются по расстоянию до геометрии, затем по меньшему screen-space bounding box и sequence, чтобы маленькая линия не терялась под длинной.
-- [x] `Alt+клик` и `Alt+колесо` циклически переключают перекрывающиеся объекты под курсором в прямом/обратном направлении; каждое сырое физическое деление колеса даёт ровно один шаг даже при быстрой прокрутке.
+- [x] `Alt+колесо` циклически переключает перекрывающиеся объекты под курсором в прямом/обратном направлении; каждое сырое физическое деление колеса даёт ровно один шаг даже при быстрой прокрутке. `Alt+ЛКМ` tap переиспользован для быстрого выбора цвета без смены инструмента, а `Alt+вертикальный drag` в Object Selection циклически перебирает overlap candidates для стилуса.
 - [x] `Shift+клик` добавляет объект к выделению, `Ctrl+клик` переключает его состояние.
 - [x] Rectangle по умолчанию работает в `Inside`; toolbar позволяет явно включить `Crossing`.
-- [ ] Первое `S` активирует Selection, каждое повторное `S` при уже активном Selection переключает `Inside`/`Crossing`.
+- [ ] Первое `S` активирует Selection, каждое повторное `S` при уже активном Selection Object mode переключает `Inside`/`Crossing`; первое `Q` активирует Selection, повторное `Q` переключает `Object`/`Area`.
 - [ ] Toolbar, status и курсор сразу показывают текущий Selection mode; переключение не очищает уже выбранные объекты.
-- [ ] Сохранить текущий `Object selection` для выбора операций целиком и добавить независимый `Area selection`, который задаёт постоянную clipping-область Rectangle/Lasso.
-- [ ] Object selection и Area selection не активны одновременно; явное переключение режима очищает несовместимое временное состояние после подтверждения, если это необходимо.
-- [ ] Учитывать Brush width, Fill polygon, Eraser и текущую видимость.
+- [x] Сохранить текущий `Object selection` для выбора операций целиком и добавить независимый `Area selection`, который задаёт постоянную clipping-область Rectangle/Lasso. M5.2a реализовал временный контур, M5.2b подключил commit-time clipping для новых Brush/Eraser/Fill.
+- [x] Object selection и Area selection не активны одновременно; явное переключение режима очищает несовместимое временное состояние.
+- [ ] Учитывать полную Brush/Eraser stroke width при clipping; M5.2b пока режет stroke по центральной линии, а Fill по polygon.
 - [x] Selection-фильтр принимает только active layer; hidden/locked active layer не возвращает кандидатов, а смена active layer очищает выделение.
 - [ ] Зафиксировать поведение выделения объектов с разных depth без потери BigInt-точности.
 
@@ -94,6 +94,7 @@
 - [ ] Сохранить recovery после аварийного завершения посередине операции.
 - [ ] Инвалидировать только тайлы, затронутые старой и новой геометрией.
 - [ ] Проверить undo/redo и reopen после каждого вида группового редактирования.
+- [x] Базовый лимит undo history: хранить только последние 1000 активных history transaction groups для обычного Undo, не удаляя активные векторные операции документа.
 - [ ] Добавить в Settings длину undo history в transaction groups, например `100/500/1000/5000/Unlimited`.
 - [ ] Ограничение должно менять только глубину доступной отмены, не удаляя активные векторные операции, которые остаются авторитетным содержимым рисунка.
 - [ ] Уменьшение размера самого документа через snapshots/compaction проектировать отдельно и только с проверенным backup.
@@ -106,14 +107,15 @@
 - [ ] Перекрашивание Object selection через текущую RGB-палитру: заменить color всех выбранных `Paint`/`Fill` одной append-only tombstone/replacement transaction, сохранив geometry, width, layer и paint order.
 - [ ] `Erase`/`EraseArea` не перекрашивать; при смешанном selection команда меняет только цветные операции, оставляет destructive operations и весь selection активными, а Undo/Redo/Reopen восстанавливают результат одним шагом.
 - [ ] Для `Area selection` разрезать Brush/Eraser polylines по границе рамки: внешние части остаются исходным содержимым, внутренние становятся отдельными редактируемыми фрагментами.
+- [ ] `Copy Area` и `Cut Area` работают с текущей Area selection, а не с Object selection: копируется/вырезается только геометрия внутри маски, при необходимости создавая обрезанные фрагменты и оставляя внешние части на месте.
 - [ ] Для Fill выполнять polygon clipping и сохранять все валидные внутренние/внешние контуры без разрывов и самопересечений.
 - [ ] Записывать split/replacement как одну grouped transaction, чтобы undo полностью восстанавливал исходную операцию.
 - [x] Drag-перемещение Object selection с live preview и сохранением как одной tombstone/replacement transaction; replacement наследует исходный `paint_order`, поэтому объект не поднимается над соседями после Move, reopen, undo или redo.
 - [x] `Ctrl+колесо` при непустом Object selection меняет порядок относительно соседних объектов active layer: вверх — на один шаг вперёд, вниз — на один шаг назад.
 - [x] Каждое физическое деление колеса даёт ровно один reorder step; обычное колесо продолжает zoom, `Alt+колесо` продолжает cycle объектов.
-- [ ] Добавить stylus-доступные drag-эквиваленты wheel-команд: default `Alt+вертикальный drag` циклически перебирает overlap candidates, `Ctrl+Alt+вертикальный drag` меняет paint order.
-- [ ] Дискретный drag накапливает signed distance и даёт ровно один command step на настраиваемый порог; отпускание сбрасывает остаток и завершает gesture.
-- [ ] Более специфичный modifier chord имеет приоритет: `Ctrl+Alt+drag` не запускает обычный `Alt` cycle, Selection/Brush и navigation не получают случайный stroke.
+- [x] Добавить stylus-доступный drag-эквивалент overlap wheel: `Alt+вертикальный drag` в Object Selection перебирает overlap candidates без zoom, stroke, rectangle или history; `Alt+tap` остаётся пипеткой.
+- [x] Дискретный drag накапливает signed distance и даёт ровно один selection-cycle step на порог около 28 px; отпускание сбрасывает остаток и завершает gesture.
+- [ ] Отдельно добавить stylus-доступный paint-order drag: `Ctrl+Alt+вертикальный drag` меняет порядок выбранных объектов, а более специфичный chord не запускает обычный `Alt` cycle.
 - [x] Для группы сохраняется внутренний порядок; объекты не переносятся через границу layer.
 - [x] Reorder записывается append-only metadata-командой `UUID → paint_order` без копирования геометрии; undo/redo и reopen сохраняют UUID, точки и слой.
 - [ ] `Ctrl+Shift+колесо` дополнительно рассмотреть как `Bring to front`/`Send to back`, если это не конфликтует с будущими настраиваемыми shortcuts.
@@ -132,13 +134,13 @@
 
 **Сложность: очень высокая.**
 
-- [ ] Rectangle и свободное Lasso после release преобразуются из screen-space в точную canvas/depth geometry и остаются на месте при pan/zoom/depth navigation.
-- [ ] Показать постоянный пунктирный контур и bounds; `Esc`/Deselect снимает область, не изменяя документ.
+- [x] Rectangle и свободное Lasso после release преобразуются из screen-space в canvas/depth geometry и остаются на месте при pan/zoom/depth navigation.
+- [x] Показать постоянный пунктирный контур и bounds; `Esc`/Deselect снимает область, не изменяя документ.
 - [ ] Первая версия использует один Replace-контур; затем добавить `Shift Add`, `Alt Subtract` и `Intersect` с валидной multi-contour geometry.
-- [ ] Area selection является временной clipping mask, а не layer mask и не отдельным объектом документа.
+- [x] Area selection является временной UI mask, а не layer mask и не отдельным объектом документа; M5.2b подключил clipping новых Brush/Eraser/Fill при commit.
 - [ ] Brush, Eraser, Fill и Gradient не создают содержимое за пределами активной области.
 - [ ] Clipping выполнять при commit: stroke может стать несколькими векторными fragments одной transaction, Fill/Erase/Gradient получают валидный polygon clip.
-- [ ] Изменение одной только Area selection не меняет revision и не запускает tile rebuild; commit инвалидирует только затронутые tiles.
+- [x] Изменение одной только Area selection не меняет document revision и не запускает tile rebuild; document revision меняется только при commit операции, которая попала в Area clipping.
 - [ ] Ограничить область active visible unlocked layer; режим `All unlocked layers` рассматривать отдельно для destructive команд.
 - [ ] Проверить Rectangle/Lasso на разных depth, огромных BigInt tile X/Y, self-intersection, holes, undo/redo и reopen результата операций.
 
@@ -185,7 +187,7 @@
 
 - [x] Добавить отдельный `Eraser Lasso`/`EraseArea`, не смешивая его с обычным stroke Eraser.
 - [ ] Объединить Lasso Fill и Eraser Lasso в один `Area` tool с общей capture/preview-геометрией и двумя режимами `Fill`/`Erase`.
-- [ ] Первое `X` активирует Area tool, повторное `X` циклически переключает `Fill`/`Erase`; прежний `L` можно временно оставить alias для прямого входа в Fill.
+- [x] Первое `X` активирует Area Fill, повторное `X` циклически переключает `Fill`/`Erase`; прежний `L` оставлен alias для прямого входа в Fill.
 - [ ] Явно показывать текущий Area mode цветом preview, toolbar-сегментом и status, чтобы destructive Erase нельзя было спутать с Fill.
 - [x] Замкнутый контур стирает более старое содержимое внутри области.
 - [ ] До появления layers воздействовать на весь видимый документ; после layers по умолчанию только на active layer.
@@ -342,9 +344,21 @@ Depth остаётся пространственным масштабом и н
     - [x] Release создаёт одну append-only tombstone/replacement transaction с сохранением layer, paint order, kind, color и Fill/EraseArea closure.
     - [x] Автотесты покрывают Undo/Redo/reopen, extreme BigInt, locked/mixed-layer rejection и отказ без частичного commit; полный набор: `185 passed`.
     - [x] Вручную подтверждены увеличение/уменьшение, handles, `Esc`, Move, Undo/Redo и reopen.
-  - [ ] M5.1b: rotate handle, Flip Horizontal/Vertical и общие transform-команды.
-  - [ ] M5.1c: `Recolor selected` через текущую палитру для Paint/Fill как одна grouped replacement transaction с сохранением geometry/layer/paint order и поддержкой Undo/Redo/Reopen.
+  - [x] M5.1b: rotate handle, Flip Horizontal/Vertical и общие transform-команды. Проверено автоматически и вручную.
+    - [x] Верхний круглый rotate handle поворачивает выделение вокруг центра; `Shift` включает шаг 15°.
+    - [x] Flip Horizontal/Vertical доступны в toolbar Selection и ПКМ Selection menu и используют ту же grouped replacement transaction без bitmap-растеризации.
+    - [x] Preview не меняет документ; release/Flip сохраняют layer, paint order, kind, color, width и selected replacement UUID.
+    - [x] Автотесты покрывают rotate handle/snap/bounds, rotate Undo/Redo/reopen и Flip H/V без изменения width; полный набор: `189 passed`.
+    - [x] Минимальная ручная проверка rotate/Flip подтверждена пользователем.
+  - [x] M5.1c: `Recolor selected` через текущую палитру для Paint/Fill как одна grouped replacement transaction с сохранением geometry/layer/paint order и поддержкой Undo/Redo/Reopen. Проверено автоматически и вручную.
+    - [x] Команда доступна в toolbar Selection и ПКМ Selection menu.
+    - [x] Paint/Fill получают текущий непрозрачный RGB цвет; Erase/EraseArea остаются без изменений и сохраняются в выделении.
+    - [x] Recolor пишет одну append-only tombstone/replacement transaction, сохраняет geometry, width, layer, paint order и selected replacement UUID.
+    - [x] Автотесты покрывают Paint/Fill recolor, Erase exclusion, отсутствие history для erase-only selection, locked/stale/mixed-layer rejection и Undo/Redo/Reopen; полный набор: `192 passed`.
+    - [x] Минимальная ручная проверка Recolor selected подтверждена пользователем.
 - [ ] Checkpoint 5.2: постоянная Rectangle/Lasso Area selection и clipping Brush/Eraser/Fill.
+  - [x] M5.2a: постоянный Area selection контур без clipping-коммита. `Object/Area` и `Rectangle/Lasso` доступны в Selection menu и ПКМ; контур хранится как временная canvas/depth geometry, следует за pan/zoom/depth navigation, очищается через `Esc`/Deselect и не меняет document revision/tile rebuild. Проверено вручную.
+  - [x] M5.2b: clipping Brush/Eraser/Fill по активной Area selection как отдельный grouped commit. Brush/Eraser режутся по screen-space centerline; Fill/EraseArea после correction сохраняют один чистый Area/intersection polygon для покрытых/выпуклых случаев, чтобы не получать feather/fan fragments. Saved fallback и raster tiles для Fill/EraseArea больше не сглаживают committed polygon corners, поэтому Area-углы остаются острыми. Area selection остаётся временным UI-состоянием и не записывается в документ. Проверено вручную.
 - [ ] Checkpoint 5.3: opaque linear Gradient, Fill/Erase/Stroke boundary внутри Area selection; radial gradient вторым подпунктом.
 - [ ] Checkpoint 5.4a: выбор нескольких слоёв через Ctrl/Shift и атомарные bulk visibility/lock/reorder/delete/duplicate.
 - [ ] Checkpoint 5.4b: folders/groups, сворачивание дерева и drag-and-drop Layers поверх multi-layer selection.
@@ -373,6 +387,17 @@ Depth остаётся пространственным масштабом и н
 - После каждого milestone выполняется общая проверка A+B+C; несовместимые локальные модели history или layer scope не допускаются.
 - Реализация всё равно поставляется короткими checkpoints, чтобы каждую рабочую часть можно было проверить вручную.
 
+## Расширение профилей настроек
+
+- [ ] Расширить `Performance/Balanced/Quality`, чтобы они управляли почти всеми настройками качества, производительности и плотности input, а не только tile resolution/workers/zoom settle.
+- [ ] Включить Brush/Fill input spacing, Fill fallback limits, automatic drawing pause, deferred preview, rebuild policy, prefetch, PNG compression, preview FPS, edge quality и smoothing.
+- [ ] Оставить независимыми ручной `Pause tile generation`, `Cache size MiB` и весь `Settings > Display`, поскольку это оперативное состояние, аппаратный бюджет и UI-предпочтения.
+- [ ] До реализации записать точную матрицу значений `Performance/Balanced/Quality`; `Balanced` сохраняет текущие безопасные defaults.
+- [ ] Определять `Custom` по всем управляемым полям и автоматически возвращать preset при полном совпадении.
+- [ ] Переиспользовать существующие runtime reactions для workers, tile generation и cache namespaces; применение профиля не меняет `.esketch`.
+- [ ] Покрыть preset matrix, migration, normalization, JSON round-trip и сохранение неуправляемых полей автоматическими тестами.
+- [ ] После реализации обновить Settings Help и `docs/settings-reference.md`, затем вручную проверить каждый preset и переходы `preset → Custom → preset`.
+
 ## Стабилизация ввода и FPS под нагрузкой
 
 **Сложность: высокая. Выполнить после ближайшего блока Layers и до экспорта.**
@@ -384,12 +409,14 @@ Depth остаётся пространственным масштабом и н
 - [ ] Добавить раздельные p50/p95/p99/max для frame, input, fallback paint, tile submit/result upload и UI tessellation.
 - [ ] Сделать debug stress mode с искусственной задержкой UI-потока `50/100/200/300 ms`, не меняя release defaults.
 - [ ] Считать входные `press/move/release`, wheel events, созданные strokes и случаи смены gesture mode.
+- [ ] Воспроизвести и измерить Fill-регрессию: при быстрых движениях контур/preview Lasso Fill снова может перестать дорисовываться, хотя Area selection работает нормально.
 - [ ] Сохранить контрольный насыщенный документ и одинаковые High Quality настройки для повторных замеров.
 
 ### S2. Последовательная очередь событий
 
 - [ ] Заменить один агрегированный `primary_pressed/primary_released` на обработку `PointerButton` и `PointerMoved` строго в порядке `egui::Event`.
 - [ ] Поддержать несколько полных `press -> move -> release` циклов за один UI-кадр; каждый цикл создаёт отдельный stroke.
+- [ ] Для Fill проверить, что быстрые `PointerMoved`/mouse-history samples не отбрасываются preview-веткой и всегда попадают в текущий lasso draft до release.
 - [ ] Mouse history использовать только для восстановления промежуточных координат внутри текущего нажатия, не для границ нажатия.
 - [ ] Не соединять release одного stroke с press следующего линейной интерполяцией.
 
@@ -402,17 +429,45 @@ Depth остаётся пространственным масштабом и н
 
 ### S4. Колесо без пропусков
 
-- [ ] Обрабатывать сырые wheel events по порядку вместо одного `smooth_scroll_delta` кадра.
-- [ ] Накапливать дробные trackpad delta отдельно; каждое физическое деление обычного колеса применять ровно один раз.
+- [x] Raw wheel zoom checkpoint manually confirmed: обычный canvas zoom теперь обрабатывает сырые `MouseWheel` events по порядку вместо одного `smooth_scroll_delta` кадра; line-wheel применяет каждое физическое деление отдельно, point/trackpad delta накапливает дробный остаток между кадрами.
+- [x] Накапливать дробные trackpad delta отдельно; каждое физическое деление обычного колеса применять ровно один раз.
 - [ ] Не терять wheel input во время отмены устаревшей tile generation и zoom settle.
 
 ### S5. Снижение нагрузки взаимодействия
 
 - [ ] Профилировать High Quality отдельно для активных tile workers, vector fallback, texture upload и egui tessellation.
+- [x] Tile phase diagnostics checkpoint: session log frame phases теперь разделяют `tile_total`, `tile_collect_upload`, `tile_request_queue` и `tile_draw`, а `tiles` payload содержит lightweight counters `uploaded_textures` и `queued_jobs`; это помогает отличить texture upload/queue pressure от vector fallback и input latency без изменения рендера.
+- [x] Session log perf merge follow-up: after manual log review, `slow_phase`, `fps_drop`, and aggregate perf payloads now merge with the existing frame `perf` object instead of replacing it. Future slowdown events keep fallback shape/segmented/fast counters next to phase or frame timing, making vector fallback cost easier to attribute.
+- [x] Bounded tile queue follow-up: after the next manual log showed `tile_request_queue` stalls while enqueueing 42 jobs in one UI frame, new tile job submission is capped to a small per-frame batch while preserving visible-first order. Missing tiles continue over later frames and final tile quality/cache identity are unchanged.
+- [x] Incremental commit indexing follow-up: after the bounded-queue log showed repeated `input` stalls around stroke save/commit events, ordinary append-only `CanvasDocument::commit` operations now update spatial/render indexes incrementally. Grouped edits, metadata, compact blocks, replacements, and out-of-order paint order still use the full rebuild path.
+- [x] Selection transform indexing follow-up: after the next log showed `selection_transform` input stalls, one-to-one non-CompactBlock move/scale/rotate replacements now update existing spatial/render index slots in place. Unsafe cases still fall back to the full rebuild path, so document storage and render output stay unchanged.
+- [x] Auto fallback interaction FPS follow-up: `Stroke fallback joins = Auto` now uses segmented joins only for calm no-interaction/no-pending-tile viewing. During drawing, navigation, selection interaction, or while tile jobs are pending, Auto temporarily uses the fast polyline fallback path; `Quality` and `Performance` keep their explicit behavior.
+- [x] Auto no-tile fallback FPS correction: the next log showed manual `Pause tile generation` still counted as calm viewing, so Auto kept segmented joins and full fallback still generated very large shape counts. Auto now also uses the fast polyline path whenever tile generation is paused; `Quality` remains the explicit no-tile quality override.
+- [x] Eraser Lasso input-density correction: fast Area Erase gestures now recover Windows mouse-history samples like Brush/Fill, and lasso preview point appending interpolates large remaining gaps while still filtering tiny jitter. This keeps the EraseArea contour less speed-dependent without changing `.esketch`, raster cache identity, tiles, or selection transforms.
+- [x] Performance profile expansion: Settings `Performance/Balanced/Quality` now manage the full meaningful speed/quality matrix: Brush/Fill input density, Fill fallback limits, Stroke fallback joins, zoom settle, tile workers/resolution, automatic pause while drawing, deferred preview, rebuild policy, prefetch radius, edge quality, smoothing, PNG compression, and preview FPS. Manual tile pause, cache budget, Display, diagnostics logging, and object-compaction/editability controls remain independent.
+- [x] Saved fallback operation budget checkpoint: temporary no-tile saved-vector fallback can skip oldest visible operations before projection when `Saved fallback ops` is set above `0`. The first hidden version was too visually destructive in Performance/Balanced, so settings v15 exposes it explicitly: `0` means Unlimited/full saved fallback, `Performance` preset sets `1500`, and `Balanced`/`Quality` set Unlimited. Session logs include both `saved_fallback_operation_limit` and `fallback_skipped_operations`.
+- [x] Fast saved-stroke fallback shape-count checkpoint: `Performance` and `Auto` pressure paths now draw saved strokes as one polyline shape without endpoint caps instead of polyline plus two cap circles. This reduces egui shape count for full no-tile fallback without hiding operations; calm Auto, segmented sparse joins, Quality behavior, stored geometry, and PNG tiles are unchanged.
+- [x] Fast saved-stroke fallback smoothing checkpoint: `Performance` and `Auto` pressure paths now also skip saved-stroke smoothing before clipping and draw raw projected saved points. This removes repeated smoothing CPU cost on dense no-tile fallback without hiding operations; Quality, calm Auto, Fill/EraseArea fallback, selection highlights, stored geometry, and PNG tiles are unchanged.
+- [x] Fallback phase timing diagnostics checkpoint: session logs now split saved fallback cost into `fallback_project`, `fallback_derive`, `fallback_clip`, and `fallback_shape_paint`, and record projected/painted fallback operation counters. Rendering, input, settings, presets, `.esketch`, tile cache identity, and raster output are unchanged; the next optimization should be selected from these measured costs.
+- [x] Saved fallback derived-geometry cache checkpoint: unchanged repaint frames now reuse derived saved fallback points by document revision, camera, viewport, smoothing/fallback settings, fill fallback point budget, and Auto fast-path state. This reduces repeated smoothing/sampling while waiting for tiles without changing clipping, painter submission, visual output, input, settings, `.esketch`, tile cache identity, or raster output. Session logs include derived fallback cache hit/miss counters.
+- [x] Saved fallback projection-bypass checkpoint: when derived saved fallback points are already cached for the unchanged frame, full/overlay fallback now skips raw projection and goes straight to clipping/paint. CompactBlock top-level bounds are no longer projected for fallback, and cached compact sources also bypass projection. Visual output, input, settings, `.esketch`, tile cache identity, and raster output are unchanged.
+- [x] Saved fallback cache clone-reduction checkpoint: derived fallback cache entries now store shared `Arc<[Pos2]>` point arrays, so cache hits pass slices into clipping/paint instead of cloning full `Vec<Pos2>` arrays. Visual output, input, settings, `.esketch`, tile cache identity, and raster output are unchanged.
+- [x] Visible render operation clone-reduction checkpoint: fallback frames now reuse the cached visible render operation list as `Arc<[EditOperation]>` and pass operation indices through the fallback paint queue, avoiding deep operation/CompactBlock source clones on unchanged frames. Visual output, input, settings, `.esketch`, tile cache identity, and raster output are unchanged.
+- [x] Saved fallback clipped-geometry cache checkpoint: unchanged saved fallback frames now reuse clipped stroke runs and clipped area polygons from `SavedFallbackRenderCache`, so cache-hit repaints avoid recomputing viewport clipping for every saved operation. Visual output, input, settings, `.esketch`, tile cache identity, and raster output are unchanged.
+- [x] Fill fallback shape diagnostics checkpoint: session logs now include `fallback_fill_shape_count`, counting Fill/EraseArea scanline rectangle shapes separately from stroke fallback shapes. Rendering, input, settings, `.esketch`, tile cache identity, and raster output are unchanged; the next paint optimization can distinguish stroke shape pressure from fill scanline pressure.
+- [x] Convex Fill fallback single-shape checkpoint: saved Fill/EraseArea fallback now draws convex clipped polygons as one filled egui polygon instead of thousands of scanline rectangles, while non-convex polygons keep the existing scanline path. Stored geometry, input, settings, `.esketch`, tile cache identity, and raster output are unchanged.
+- [x] Corrective rollback: convex Fill/EraseArea single-shape fallback caused cross-canvas line artifacts and zoom-dependent red-line thickness, so saved area fallback is back on the proven scanline renderer. `fallback_fill_shape_count` diagnostics remain; stored geometry, input, settings, `.esketch`, tile cache identity, and raster output are unchanged.
+- [x] Saved fallback revision-survival checkpoint: derived/clipped saved fallback cache entries now survive document revision-only changes when camera, viewport, smoothing/fallback settings, fill fallback budget, and Auto fast-path state are unchanged. Old unchanged operations reuse their operation-keyed cache entries after a new commit; new/replaced operations miss and populate normally. Rendering, input, settings, `.esketch`, tile cache identity, and raster output are unchanged.
 - [ ] Во время Draw/Zoom/Pan приостанавливать новые тяжёлые jobs и texture upload по frame budget; готовое качество восстанавливать после idle.
 - [ ] Добавить cooperative cancellation длинной растеризации устаревшего поколения, если profiling подтвердит конкуренцию CPU.
 - [ ] Отдельно профилировать Selection на слоях с большим числом объектов: hover hit test, projection, полную подсветку выбранной геометрии и egui tessellation.
 - [ ] Пересчитывать hover-кандидатов только при движении курсора/камеры/revision, кешировать projected selection overlay и отсекать невидимые операции spatial index.
+- [x] Исправить деградацию saved vector fallback после cross-depth навигации: projected fallback cache теперь сбрасывается при zoom/depth changes и depth-смена в `ProjectedGeometryCache` пересчитывает геометрию из исходных операций, а не масштабирует уже кешированные projected points. Автотесты покрывают `-4 -> -20 -> -4`; ручная проверка показала нормальное поведение с `Smoothing=Strong` и `Pause tile generation`.
+- [x] Проверить, почему при zoom/depth transitions линии на дальних глубинах заметно меняют форму: причина зафиксирована как navigation-history dependent projected cache; depth/zoom transitions больше не должны менять экранный контур через перенос старых projected points.
+- [x] Профилировать падение FPS до ~4 при отдалении/приближении: первый corrective step выполнен и проверен вручную — same-depth zoom больше не очищает projected fallback cache на каждом кадре, depth-change reset остаётся внутри `ProjectedGeometryCache`. Если просадки вернутся, отдельно замерить full vector fallback, tile request cancellation, retained texture drawing, texture upload и egui tessellation.
+- [x] Corrective checkpoint pending manual confirmation: raw/live Fill draft больше не ограничен `Fill fallback points`; append/interpolation продолжают принимать новые точки сверх fallback budget и не мутируют уже собранный контур. После release saved Fill получает производное fallback-представление в пределах `Fill fallback points`, поэтому большой быстрый Fill должен быть виден до готовности PNG-тайла без изменения сохранённого raw contour. Автотесты покрывают raw append сверх budget и bounded saved fallback; M5.2a Area selection не менялась.
+- [x] Corrective checkpoint pending manual confirmation: no-tile saved vector fallback больше не применяет screen-space `0.25 px` simplification к сохранённым объектам и не сглаживает Brush после viewport clipping. Это стабилизирует форму дальних объектов при быстрых zoom/depth changes; Fill fallback теперь сэмплирует исходный порядок точек без предварительного screen-space simplify. Автотесты покрывают стабильный clipping/source-point path и Fill sampling без screen-space simplification.
+- [ ] Добавить low-end/slow-HDD stability check: на слабом компьютере с медленным диском пользователь наблюдал зависание и системное окно `WerFault.exe` с ошибкой запуска приложения `0xc000012d`; поскольку на этой машине зависало и остальное, не считать это подтверждённым багом приложения, но при повторе собрать Windows Event Viewer/WER details, параметры документа/настроек, состояние диска/CPU/RAM и поведение под искусственным I/O starvation.
 - [ ] Для очень больших selection рассмотреть упрощённый bounding-box preview вместо полной подсветки каждой линии во время взаимодействия.
 - [ ] Не снижать итоговое качество тайлов: допустимо только временное упрощение интерактивного preview.
 - [ ] Нативную timestamped очередь `WM_INPUT`/`WM_POINTER` добавлять только если упорядоченные egui events всё ещё теряются.
@@ -423,19 +478,37 @@ Depth остаётся пространственным масштабом и н
 - [ ] 100 жестов Z + ЛКМ не создают Brush operations, не меняют направление и не теряют release.
 - [ ] Wheel и pan дают воспроизводимый суммарный сдвиг при той же задержке.
 - [ ] Deferred drawing остаётся дополнительным режимом снижения нагрузки, а не условием корректного press/release.
+- [ ] Быстрый Lasso Fill сохраняет и показывает непрерывный контур preview без пропавших участков при обычных и восстановленных mouse-history событиях.
 - [ ] High Quality после завершения взаимодействия даёт тот же результат, что и до оптимизации.
+- [ ] При `Pause tile generation` сохранённый vector fallback со `Smoothing=Strong` после переходов между далёкими depth совпадает с результатом свежей raster tile generation и не требует ручного переключения Smoothing.
+- [ ] Во время изменения масштаба дальняя геометрия сохраняет форму в пределах ожидаемой screen-space погрешности; pan/zoom/depth history не меняет кривизну сохранённых линий.
+- [ ] На слабом ПК/медленном HDD приложение либо остаётся управляемым при I/O starvation, либо отказ фиксируется диагностически: WER/Event Viewer, app logs при наличии, параметры документа/настроек и системная нагрузка позволяют отделить системный сбой от дефекта EndlessSketch.
+- [x] Timeline session logging checkpoint: `Settings > Diagnostics > Session logging` writes retained JSONL files under `local/logs`, `F12`/`Mark log` creates numbered markers, and automatic events capture navigation, tile/fallback state, document edits, FPS drops, and frame phase costs for FPS/zoom debugging.
+- [x] Marker 3 follow-up: Selection highlight/bounds now reuse saved fallback render geometry instead of raw points, so selected sparse lines should not visually disagree with full fallback during zoom; expensive hover hit-testing is skipped during pan/zoom settle and recomputed after navigation.
+- [x] Marker 1 compacted-old-lines follow-up: saved vector fallback smoothing now uses scale-stable corner sampling for stored sparse strokes, so sharp bends from early point/smoothing experiments should keep the same shape while zoom changes; stored document geometry and raster tile smoothing remain unchanged.
+- [x] Old sparse line raster follow-up: compact/selection are not required for the flicker; cached tile rasterization now keeps sparse Paint/Eraser stroke geometry exact before scale-stable smoothing, only oversized strokes use screen-space simplification, and tile renderer cache version 9 forces affected PNG tiles to rebuild.
+- [x] No-tile sparse fallback join follow-up: when tile generation is off, sparse vector fallback now renders stored strokes as per-segment capsule shapes with filled vertex joins instead of one egui polyline join, reducing sharp-corner protrusion/clipping changes during zoom; dense strokes keep the fast single-polyline path.
+- [x] Sparse fallback FPS follow-up manually confirmed: `Settings > Stroke fallback joins` now persists `Auto/Quality/Performance` in settings v14. `Auto` is the default: saved sparse strokes use segmented capsule joins up to 128 screen points only when no draft is active, while active drawing forces background saved strokes onto the fast polyline path. `Quality` keeps segmented joins up to 512 points, `Performance` always uses the fast path, and session logs record the join mode plus fallback segmented/fast counters.
 
 ### S7. Уплотнение старых объектов
 
-**Сложность: очень высокая; выполнять только после profiling S1-S5.**
+**Сложность: очень высокая; приоритет поднят пользователем до profiling/optimization.**
 
-- [ ] Добавить ручную команду `Freeze/Compact selected` и `Freeze/Compact layer` для старого завершённого содержимого.
-- [ ] Не заменять исходные векторы одним bitmap: хранить проверенный compressed source snapshot и rebuildable multi-depth LOD cache.
-- [ ] Представлять frozen block как один spatial/index object; раскрывать внутренние операции только при редактировании или cache miss.
-- [ ] Undo размораживает исходные операции без потери UUID/геометрии; reopen и удаление cache дают идентичный рисунок.
-- [ ] После ручного режима добавить опциональный auto-compact в idle по порогу числа операций, например `Off/500/1000/5000`.
-- [ ] Автоматически объединять только стабильные операции вне активной истории/выделения/draft и только после проверенного checkpoint.
-- [ ] Сравнить размер SQLite, время открытия, spatial query, fallback FPS и tile rebuild до включения auto-compact.
+Технический план:
+
+- [x] C0: зафиксировать контракт `CompactBlock`: это не bitmap flatten. Блок хранит compressed snapshot исходных `EditOperation` и работает как обычный оптимизированный объект; PNG/LOD остаются rebuildable cache. Разбор через пользовательский Unfreeze не входит в продуктовый сценарий, а Undo разъединяет блок только пока сама Freeze transaction ещё находится в обычной истории.
+- [x] C0.5: обычный Undo ограничен последними 1000 history transaction groups; старые активные операции остаются содержимым документа, но перестают быть доступными для бесконечного Ctrl+Z.
+- [x] C1: добавлен persistable `CompactBlock` operation как совместимое payload-расширение `EditOperation` без schema bump. Команда Freeze создаёт одну grouped transaction: tombstone исходных операций + один compact block replacement с tight bounds/слоем/paint order. Пока Freeze transaction находится в undo history, Undo удаляет block и реактивирует исходные UUID без потери геометрии; после выхода за лимит undo block считается стабильным обычным объектом.
+- [x] C2: ручная команда `Freeze/Compact selected` добавлена в Selection menu только для текущего Object selection в active visible unlocked layer. Текущий checkpoint отклоняет пустое, mixed-layer, locked/hidden и metadata/tombstone commands. Разнесённые объекты, mixed-depth объекты и уже compact blocks можно объединять в один block; вложенные blocks при этом flatten в один snapshot.
+- [x] C3 partial: vector fallback и tile rasterizer раскрывают `CompactBlock` во внутренние операции; raster equivalence покрыта тестом. Future export должен переиспользовать тот же expansion path.
+- [x] C4: spatial/index поведение: top-level index видит block как один объект с tight union bounds; hit test/selection выбирает block как один объект. Внутреннее редактирование содержимого не планируется для обычного пользовательского workflow.
+- [x] C5: CompactBlock ведёт себя как обычный объект для основных операций: Move/Scale/Rotate/Flip трансформируют snapshot, Copy/Cut/Paste и Move selection to layer работают с блоком целиком, повторный Freeze flatten-ит вложенные blocks.
+- [ ] C6: покрыть оставшимися тестами schema compatibility, layer guards, hidden/locked rejection, cache invalidation revision, delete cache rebuild и selection/hit behavior on block. Уже покрыто: Freeze/Undo/Redo/Reopen, tile raster equivalence, whole-block Move/Scale, Paste, Move-to-layer, повторное уплотнение existing CompactBlock, объединение двух existing CompactBlocks и объединение разнесённых non-contiguous объектов.
+- [ ] C7: после ручного режима измерить размер SQLite, open time, top-level operation count, spatial query time, fallback projection time, egui tessellation, tile rebuild. Только после этого рассматривать idle auto-compact thresholds (`Off/500/1000/5000`).
+- [ ] C8: auto-compact разрешать только для стабильных операций вне активной истории/selection/draft и только после отдельного проверенного checkpoint.
+- [ ] C8a: глобальное уплотнение по счётчику: настройка `Keep latest regular objects` (`100/1000/5000/Unlimited`) оставляет последние N обычных объектов редактируемыми, а более старые операции упаковывает в CompactBlock-группы по layer/depth/spatial region/paint-order range. Не делать один бесконечный block на весь документ; несоединённые объекты объединять через non-rendered bounds geometry внутри CompactBlock, а не видимым helper stroke.
+- [x] C8b: первый UI checkpoint для счётчика: `Settings > Keep latest objects` (`Unlimited/5000/1000/100`) и ручная команда `Compact older now`; старые операции сжимаются только непрерывными layer/depth/paint-order runs. Render path раскрывает CompactBlock в source-операции и сортирует их в общем paint order, поэтому уже созданные blocks не должны менять порядок наложения относительно обычных объектов. Раскрытый render-only spatial index хранится в `CanvasDocument` и перестраивается только при изменении операций, а не при каждом zoom/tile query. Auto/idle trigger включать только после ручной проверки.
+- [x] C9: улучшить точность пипетки. Picker теперь семплирует верхнюю видимую render-operation под курсором с учётом layers, CompactBlock expansion, Fill/EraseArea, Eraser/background, текущих depth/zoom и stroke radius; `Alt+ЛКМ` берёт цвет без смены текущего инструмента и без history step. Полностью пиксельное семплирование сглаженного tile/fallback можно добавить позже, если ручная проверка выявит расхождение на краях strong smoothing.
 
 ## Приоритет 2. Экспорт
 
@@ -586,9 +659,9 @@ Depth остаётся пространственным масштабом и н
 - [ ] Проверка конфликтов, reset и сохранение в settings.
 - [ ] Default `Shift+N` создаёт и активирует новый верхний слой; команда проходит через registry и может быть переназначена.
 - [ ] Общий контракт tool shortcut: первое выполнение активирует tool, повторное выполнение при уже активном tool вызывает `Cycle mode`.
-- [ ] `S` циклически меняет Selection `Inside/Crossing`; `X` циклически меняет Area `Fill/Erase`.
+- [ ] `S` циклически меняет Selection `Inside/Crossing`, `Q` циклически меняет Selection `Object/Area`, `X` циклически меняет Area `Fill/Erase`. Локальные `X` и `S/Q` checkpoints реализуются без полного command registry.
 - [ ] Тот же механизм использовать для будущих инструментов с конечным набором режимов, без отдельных hardcoded обработчиков клавиш.
-- [ ] Не обрабатывать tool shortcuts и cycle mode, когда фокус находится в text/numeric input.
+- [x] Не обрабатывать tool shortcuts и cycle mode, когда фокус находится в text/numeric input.
 - [ ] Command registry предоставляет названия текущего и следующего mode для toolbar, status, context menu и Help.
 - [ ] Ни одна wheel-команда не остаётся wheel-only: registry связывает её с wheel binding, `key + pointer drag` gesture и кнопкой/menu fallback.
 - [ ] Сохранить существующие `Z+drag` для zoom и `Space+drag` для pan; добавить `Alt+vertical drag` для overlap cycle и `Ctrl+Alt+vertical drag` для selected paint-order steps.
@@ -614,18 +687,84 @@ Depth остаётся пространственным масштабом и н
 
 **Сложность: средняя.**
 
-- [ ] Вынести палитру цвета в отдельное перемещаемое окно с тем же поведением позиционирования, что у `Settings` и `Layers`.
-- [ ] Сохранить текущий быстрый доступ к активному цвету и не менять color/persistence модель в рамках этой UI-задачи.
+- [x] Вынести палитру цвета в отдельное перемещаемое и растягиваемое окно с тем же поведением позиционирования, что у `Settings` и `Layers`; picker внутри окна автоматически следует за шириной окна.
+- [x] Сохранить текущий быстрый доступ к активному цвету и не менять color/persistence модель в рамках этой UI-задачи.
+- [x] После Palette выполнить tool shortcut cycles: `X` переключает общий Area tool `Fill/Erase`, `S` циклически меняет Selection `Inside/Crossing`, а `Q` — `Object/Area`.
+- [ ] После shortcut cycles перейти к уплотнению старых объектов, затем к profiling/optimization.
 - [x] Selection-версия контекстного окна по ПКМ выполнена в checkpoint 5.0e и переиспользует команды общего popover.
 - [x] В checkpoint 5.0f добавлены для Brush и Fill по ПКМ inline RGB-палитра и общий `Size`, связанные с теми же значениями toolbar; открытие/редактирование menu не создаёт operation или history step.
 - [ ] После 5.0f расширять тот же tool-sensitive command surface без дублирования обработчиков: Eraser — `Size`; Selection — общий popover; пустой canvas — Paste/New layer.
 - [ ] Не показывать больше 4-6 основных действий одновременно; расширенные параметры остаются в Settings/Layers/File/Navigation.
 - [x] `F1` открывает вкладку Help общего окна `File/Help`.
 - [ ] Help строить из тех же command/setting descriptions, чтобы горячие клавиши и диапазоны не расходились с UI.
-- [ ] В Controls явно описать правило повторного нажатия shortcut и показать текущие циклы `S: Inside/Crossing`, `X: Fill/Erase`.
+- [ ] В Controls явно описать правило повторного нажатия shortcut и показать текущие циклы `S: Inside/Crossing`, `Q: Object/Area`, `X: Fill/Erase`.
 
 ## Ближайший checkpoint
 
-**Checkpoint 5.0f — проверен вручную:** Brush и Fill открывают по ПКМ inline RGB picker и `Size`; палитра остаётся открытой при взаимодействии, значения связаны с toolbar, а вторичная кнопка не создаёт operation/history step. Следующий transform-checkpoint — M5.1b rotate/Flip, затем M5.1c Recolor selected.
+**Palette — вручную подтверждено:** текущая RGB-палитра вынесена в отдельное перемещаемое и растягиваемое окно с компактным доступом из toolbar; picker внутри окна автоматически следует за шириной окна. Color persistence, документ и Brush/Fill/Recolor поведение не менялись.
+
+**X cycle — вручную подтверждено:** первое `X` активирует Area Fill, повторное `X` переключает Area Fill/Area Erase, прежний прямой вход `L` в Fill остаётся alias. Реализация переиспользует существующие Fill и EraseArea capture/commit пути без изменения документа.
+
+**S/Q cycles — вручную подтверждено:** первое `S` активирует Selection, повторное `S` в Object mode циклически меняет Selection `Inside/Crossing` без очистки текущего Object selection. Первое `Q` активирует Selection из других инструментов, повторное `Q` при активном Selection переключает `Object/Area` через существующую логику очистки несовместимого состояния.
+
+**Undo history / compaction base — реализовано:** обычный Undo теперь ограничен последними 1000 активными history transaction groups, при этом активные векторные операции остаются авторитетным содержимым документа. Это база для стабильного `CompactBlock`: после выхода Freeze за лимит обычный Ctrl+Z уже не должен разъединять compact object.
+
+**CompactBlock C1/C2 — реализовано:** `Freeze/Compact selected` в Selection menu создаёт один persistable `CompactBlock` из выбранного Object set active visible unlocked layer, включая разнесённые объекты, mixed-depth объекты и existing CompactBlocks. Блок хранит vector snapshot исходных операций на их исходных depth, а служебный bounds строится на anchor depth для selection/spatial index; fallback/tiles раскрывают snapshot при рендере, Undo/Redo/Reopen работают пока Freeze находится в undo history.
+
+**CompactBlock C1/C2 — вручную подтверждено с follow-up:** Freeze/Compact работает, но получившийся block пока нельзя изменять/перемещать, а рамка выделения заметно больше видимого объекта из-за грубых tile bounds. Следующий corrective checkpoint: tight bounds по исходной geometry с учётом local coordinates/stroke width и whole-block Move/Scale/Rotate/Flip через трансформацию `compact_sources` + пересчёт block bounds одной replacement transaction.
+
+**CompactBlock normal-object checkpoint — реализовано pending validation/manual confirmation:** bounds считаются по реальной source geometry с local coordinates и stroke width. Selected CompactBlock можно Move/Scale/Rotate/Flip как один объект; Copy/Cut/Paste и Move selection to layer работают с блоком целиком; повторный Freeze с другими объектами или другими blocks flatten-ит nested `compact_sources` в один snapshot без требования contiguous paint-order range.
 
 После release рамка rectangle-selection исчезает; остаётся подсветка выбранных объектов, которая корректно следует за навигацией.
+
+## Идеи на потом
+
+- [ ] Возможно не делать: экспериментальный 3D-просмотр холста, где глубины/слои/тайлы можно осматривать в объёмной сцене отдельно от основного 2D-редактора; сначала оценить полезность, производительность и риск усложнения навигации.
+
+## Текущий performance checkpoint
+
+- [x] Saved fallback fast-path cache churn: `Auto` fast-path state no longer clears the whole saved fallback derived/clipped cache; stroke entries use an operation `render_variant` keyed by effective smoothing passes, while Fill/EraseArea entries can survive fast/quality toggles. Session logs now include `auto_fast_stroke_fallback` and the last canvas rect values/bits for future cache-miss diagnosis. No `.esketch`, raster tile, tile cache identity, selection, or compact-block data format changes.
+
+- [x] Frame phase diagnostics checkpoint: fps_drop, marker, and normal session events now include the last frame phase timings (`input_ms`, tile total/subphases, fallback total/subphases, `overlay_ms`, `total_frame_ms`, measured `frame_ms`, and `last_fps_ema`). Rendering, input, settings, presets, saved operations, `.esketch`, tile cache identity, and raster output are unchanged.
+
+- [x] ProjectedGeometryCache cross-depth reuse checkpoint: projected reference-point caches now survive representable zoom depth-boundary crossings by using a depth-aware screen scale. The cache still resets for unrepresentable centers/scales and when the current center moves more than 8 anchor tiles. Rendering math is covered against direct `canvas_to_screen`; `.esketch`, saved operations, tile cache identity, raster output, settings, and input are unchanged.
+
+- [x] ProjectedGeometryCache anchor-radius checkpoint: projection anchor reuse now allows up to 64 anchor tiles instead of 8 before resetting. This preserves cached reference projections across ordinary zoom-out navigation that previously crossed the small radius and caused full fallback projection spikes, while unrepresentable centers/scales and larger moves still reset safely. `.esketch`, saved operations, tile cache identity, raster output, settings, and input are unchanged.
+
+- [x] Selection top-layer cache-preservation checkpoint: Selection recolor, scale/rotate/flip, move, and reorder now use the top-layer document revision path instead of full tile-render invalidation when the active layer is already topmost. This keeps saved fallback derived/clipped caches warm for unchanged visible operations after selection edits, while non-top-layer edits, layer reorder, and layer merge still fall back to full invalidation. Visual output, `.esketch`, saved operations, raster tiles, tile cache identity, input, and settings are unchanged.
+
+- [x] Selection replacement fallback warm-up checkpoint: after Selection recolor, move, scale, rotate, or flip creates replacement operations, the saved fallback derived-point cache is warmed from the previous operation keys to the new operation keys. Move/recolor reuse exact translated/unchanged screen points; scale/rotate/flip apply the same `ScreenAffine` used for persisted geometry. Clipped runs/polygons are intentionally not copied because clipping depends on the new viewport intersection. This targets the remaining 541 replacement-operation misses seen in `session-20260715-125125`; document format, raster tiles, tile cache identity, settings, presets, and input sampling are unchanged.
+
+- [x] OperationIndex direct-removal checkpoint: the spatial operation index now records reverse tile membership for each indexed operation. Replacing selected operations can remove only the affected operation indices from their recorded buckets instead of scanning every indexed bucket in the document. This targets the remaining Selection-transform `input_ms` spikes seen after cache misses were eliminated; query behavior, document format, saved operations, raster tiles, tile cache identity, fallback rendering, settings, presets, and input sampling are unchanged.
+
+- [x] Storage prepared-statement checkpoint: grouped operation commits now prepare the repeated operation `INSERT` and draft cleanup `DELETE` statements once per `insert_operation_rows` call instead of rebuilding SQL execution state for every operation. This targets dense Selection move/scale/rotate commits of hundreds of replacement operations; transaction boundaries, sequence assignment, JSON/zstd payload format, history, `.esketch`, raster tiles, tile cache identity, rendering, input, settings, and presets are unchanged.
+
+- [x] Selection commit subphase diagnostics checkpoint: `selection_transform` session events now include `selection_commit` timings for document target collection, replacement construction, storage commit, storage encode/compress/insert/history subphases, in-memory replacement/index update, fallback-cache warm-up, byte counts, and affected operation counts. Rendering, input behavior, persistence format, settings, presets, tile cache identity, and raster output are unchanged.
+
+- [x] Selection in-memory replacement lookup checkpoint: `replace_operations_in_place` now builds UUID-to-position maps for the authoritative operations list and render operations list once per replacement batch, instead of linearly searching both lists for every replaced object. This targets the `memory_replace_ms` portion measured at roughly 190-213 ms for dense Selection commits; operation order, replacement IDs, paint order, spatial indexes, render indexes, storage format, history, rendering, settings, presets, tile cache identity, and input behavior are unchanged.
+
+- [x] Operation payload compression-level checkpoint: newly written operation and draft payloads now use zstd level 1 instead of level 3, while retaining the same zstd payload format and decoder compatibility for old and new operations. This targets `selection_commit.document.storage.compress_ms`, measured around 188-215 ms for dense Selection commits; SQLite schema, transaction boundaries, `synchronous=FULL`, layer-history compression, undo/redo, rendering, settings, presets, tile cache identity, and input behavior are unchanged. Session diagnostics now include the active operation `compression_level`.
+
+- [x] OperationIndex metadata direct-removal checkpoint: `OperationIndex::remove_indices` now removes known operation indices directly from `operation_ids` and `operation_layers` instead of retain-scanning both full maps for every replacement batch. This targets the remaining `memory_replace_ms` portion of dense Selection commits after compression was reduced; broad-operation cleanup, tile-bucket removal/pruning, query ordering, document format, history, rendering, settings, presets, tile cache identity, and input behavior are unchanged.
+
+- [x] OperationIndex precomputed-bounds checkpoint: replacement operations now compute spatial bounds once in `replace_operations_in_place` and reuse those bounds when inserting the same replacement into both the authoritative operation index and render operation index. This avoids scanning the same replacement geometry twice during dense Selection commits; broad/indexable behavior, tile-bucket insertion, query ordering, document format, history, rendering, settings, presets, tile cache identity, and input behavior are unchanged.
+
+- [x] Selection memory-replace subphase diagnostics checkpoint: `selection_commit.document` now includes `memory_replace_fallback` plus nested `memory_replace` timings for replacement count, UUID position map construction, position lookup, replacement bounds, authoritative index removal, render index removal, assignment/index insertion, and total time. This targets the remaining broad `memory_replace_ms` cost in dense Selection commits; operation replacement behavior, ordering, document format, history, rendering, settings, presets, tile cache identity, and input behavior are unchanged.
+
+- [x] Selection memory-replace fallback-reason diagnostics checkpoint: `selection_commit.document` now reports `memory_replace_fallback_reason`, and nested `memory_replace` includes counts for compact replacements, metadata replacements, missing authoritative-operation UUIDs, and missing render-operation UUIDs. This preserves the existing full-rebuild fallback behavior while making the next dense Selection log identify why the fast in-memory replacement path was skipped; document format, history, rendering, settings, presets, tile cache identity, and input behavior are unchanged.
+
+- [x] Selection CompactBlock memory-replace fast path checkpoint: `replace_operations_in_place` now supports top-level `CompactBlock` replacements by removing the old block's expanded render-source indices, replacing the authoritative top-level block in place, and reusing/reindexing expanded render-source slots for the replacement block. This targets dense Selection commits where one compact replacement forced a full in-memory rebuild of the whole document; storage, history, `.esketch`, operation ordering, raster tiles, tile cache identity, rendering output, settings, presets, and input behavior are unchanged.
+
+- [x] Dense Selection overlay single-pass bounds checkpoint: selected-object overlay painting now accumulates the same screen-space bounds while it paints highlights and reuses those bounds for the Selection transform box, instead of projecting/smoothing the selected operations a second time in the same frame. This targets the 25-29 ms `overlay_ms` frames seen with roughly 923 selected objects; selection hit testing, transform math, storage, history, `.esketch`, settings, presets, tile cache identity, and rendered selection semantics are unchanged.
+
+- [x] Storage commit durability setting checkpoint: settings v16 adds `Storage commit` with `Full` as the default/current safety behavior and `Fast` mapping to SQLite `synchronous=NORMAL` for lower dense-edit commit latency. The setting is applied on document open and Settings save, is included in performance profiles (`Performance=Fast`, `Balanced/Quality=Full`), and is written to session log context. `.esketch` format, WAL mode, transactions, undo/redo, tile cache identity, rendering, and SQLite schema are unchanged.
+
+- [x] Segmented fallback frame-budget checkpoint: saved no-tile stroke fallback now has a per-frame segmented-shape budget. `Quality` and `Auto` still use segmented capsule joins while the scene is moderate, but overloaded dense scenes downgrade over-budget runs to the existing fast polyline path and report `fallback_segmented_budget_fallbacks` in session logs. This targets the Performance-to-Quality crash/shape spike where Quality generated roughly 828k-868k stroke shapes per fallback frame; saved vectors, PNG tiles, `.esketch`, selection, presets, SQLite, and tile cache identity are unchanged.
+
+- [x] Large Selection overlay fast-interaction checkpoint: when 512+ objects are selected and an interaction is active, the overlay temporarily skips per-object highlight contours and keeps the common transform bounds/handles. Full object highlights return while idle. Session logs include `large_selection_fast_overlay` so the next dense-scene check can separate overlay savings from fallback and commit costs. `.esketch`, selection membership, hit testing, transforms, storage, raster tiles, settings, presets, and tile cache identity are unchanged.
+
+- [x] Large Selection overlay cached-bounds checkpoint: the active large-selection fast overlay now reuses aggregate canvas-space bounds keyed by document revision and selected UUID signature, then projects only cached per-depth rectangles each frame. This removes the remaining per-frame `selection_screen_bounds` geometry walk from the fast overlay path while preserving exact hit testing, transform start bounds, small selections, idle full highlights, `.esketch`, storage, raster tiles, settings, presets, and tile cache identity.
+
+- [x] Large Selection transform-outline correction: fast overlay is now disabled while a Selection move, scale, or rotate gesture is active, so the exact per-object transform outline remains visible during direct object transforms. Cached-bounds fast overlay remains available for large selected sets during navigation/tile-deferred interaction. Document format, storage, raster tiles, settings, presets, and tile cache identity are unchanged.
+
+- [x] Saved fallback screen-cull checkpoint manually confirmed: ordinary saved no-tile fallback operations are now rejected by rough screen bounds before expensive point projection when they are definitely outside the current viewport. CompactBlock source culling remains unchanged, and early rejections are included in `fallback_skipped_operations` diagnostics. This targets paused/manual tile-generation scenes where `fallback_project_ms` was dominated by thousands of projected operations after navigation; `.esketch`, saved operations, raster tiles, tile cache identity, settings, presets, selection, and input behavior are unchanged.

@@ -1,14 +1,16 @@
-use crate::coords::{CameraAddress, DEPTH_RATIO};
+use crate::coords::{CameraAddress, CanvasPoint, DEPTH_RATIO};
 use crate::model::{Color, EditOperation};
 use crate::smoothing::{
     GeometryClipRect, STROKE_SMOOTHING_PASSES, clip_polygon_to_rect, clip_polyline_to_rect,
-    simplify_render_points, smooth_closed_points, smooth_stroke_points,
+    simplify_render_points, smooth_stroke_points_stable,
 };
+use crate::spatial::operation_bounds;
 use crate::tile_cache::{TILE_BLEED, TILE_SIZE, TileKey, tile_resolution};
 use image::{Rgba, RgbaImage};
 
 const MAX_EDGE_QUALITY: u8 = 2;
 const MAX_SMOOTHING_PASSES: u8 = 3;
+const MAX_EXACT_RASTER_STROKE_POINTS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RasterOptions {
@@ -116,61 +118,170 @@ pub fn render_operations_onto_tile_with_options(
     let mut fill_coverage = None;
 
     for operation in operations {
-        let points: Vec<(f32, f32)> = operation
-            .points
-            .iter()
-            .filter_map(|point| {
-                camera
-                    .canvas_to_screen(point, content_size as f64, content_size as f64)
-                    .map(|(x, y)| (x as f32 + TILE_BLEED as f32, y as f32 + TILE_BLEED as f32))
-            })
-            .collect();
-        let width = operation_width(operation, key.depth, resolution_scale);
-        let color = operation.opaque_visible_color(background);
-        if operation.kind.is_area() {
-            if points.len() < 3 {
-                continue;
-            }
-            let points = simplify_render_points(&points, true);
-            let image_width = image.width();
-            let image_height = image.height();
-            let coverage =
-                fill_coverage.get_or_insert_with(|| FillCoverage::new(image_width, image_height));
-            let smoothed_points =
-                smooth_closed_points(&points, usize::from(options.smoothing_passes));
-            let clipped_points = clip_polygon_to_rect(
-                &smoothed_points,
-                GeometryClipRect::new(0.0, 0.0, image_width as f32, image_height as f32),
-            );
-            if clipped_points.len() < 3 {
-                continue;
-            }
-            fill_polygon(
-                image,
-                &clipped_points,
-                color,
-                coverage,
-                options.fill_sample_grid(),
-            );
-        } else {
-            if points.len() < 2 {
-                continue;
-            }
-            let points = simplify_render_points(&points, false);
-            let smoothed_points =
-                smooth_stroke_points(&points, usize::from(options.smoothing_passes));
-            let margin = width * 0.5 + 1.0;
-            let clip_rect = GeometryClipRect::new(
-                -margin,
-                -margin,
-                image.width() as f32 + margin,
-                image.height() as f32 + margin,
-            );
-            for run in clip_polyline_to_rect(&smoothed_points, clip_rect) {
-                draw_opaque_stroke(image, &run, width, color, options.stroke_edge_mode());
+        render_operation_onto_tile(
+            image,
+            operation,
+            key,
+            background,
+            options,
+            &camera,
+            content_size,
+            resolution_scale,
+            &mut fill_coverage,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_operation_onto_tile(
+    image: &mut RgbaImage,
+    operation: &EditOperation,
+    key: &TileKey,
+    background: Color,
+    options: RasterOptions,
+    camera: &CameraAddress,
+    content_size: u32,
+    resolution_scale: f64,
+    fill_coverage: &mut Option<FillCoverage>,
+) {
+    if operation.is_compact_block() {
+        for source in &operation.compact_sources {
+            if operation_may_affect_tile(source, key, camera, content_size, resolution_scale) {
+                render_operation_onto_tile(
+                    image,
+                    source,
+                    key,
+                    background,
+                    options,
+                    camera,
+                    content_size,
+                    resolution_scale,
+                    fill_coverage,
+                );
             }
         }
+        return;
     }
+
+    let points: Vec<(f32, f32)> = operation
+        .points
+        .iter()
+        .filter_map(|point| {
+            camera
+                .canvas_to_screen(point, content_size as f64, content_size as f64)
+                .map(|(x, y)| (x as f32 + TILE_BLEED as f32, y as f32 + TILE_BLEED as f32))
+        })
+        .collect();
+    let width = operation_width(operation, key.depth, resolution_scale);
+    let color = operation.opaque_visible_color(background);
+    if operation.kind.is_area() {
+        if points.len() < 3 {
+            return;
+        }
+        let points = simplify_render_points(&points, true);
+        let image_width = image.width();
+        let image_height = image.height();
+        let coverage =
+            fill_coverage.get_or_insert_with(|| FillCoverage::new(image_width, image_height));
+        let clipped_points = clip_polygon_to_rect(
+            &points,
+            GeometryClipRect::new(0.0, 0.0, image_width as f32, image_height as f32),
+        );
+        if clipped_points.len() < 3 {
+            return;
+        }
+        fill_polygon(
+            image,
+            &clipped_points,
+            color,
+            coverage,
+            options.fill_sample_grid(),
+        );
+    } else {
+        if points.len() < 2 {
+            return;
+        }
+        let smoothed_points = raster_stroke_render_points(&points, options.smoothing_passes);
+        let margin = width * 0.5 + 1.0;
+        let clip_rect = GeometryClipRect::new(
+            -margin,
+            -margin,
+            image.width() as f32 + margin,
+            image.height() as f32 + margin,
+        );
+        for run in clip_polyline_to_rect(&smoothed_points, clip_rect) {
+            draw_opaque_stroke(image, &run, width, color, options.stroke_edge_mode());
+        }
+    }
+}
+
+fn raster_stroke_render_points(points: &[(f32, f32)], smoothing_passes: u8) -> Vec<(f32, f32)> {
+    if points.len() > MAX_EXACT_RASTER_STROKE_POINTS {
+        let simplified = simplify_render_points(points, false);
+        return smooth_stroke_points_stable(&simplified, usize::from(smoothing_passes));
+    }
+    smooth_stroke_points_stable(points, usize::from(smoothing_passes))
+}
+
+fn operation_may_affect_tile(
+    operation: &EditOperation,
+    key: &TileKey,
+    camera: &CameraAddress,
+    content_size: u32,
+    resolution_scale: f64,
+) -> bool {
+    let Some(bounds) = operation_bounds(operation) else {
+        return false;
+    };
+    let corners = [
+        CanvasPoint::new(
+            bounds.depth,
+            bounds.min_x.clone(),
+            bounds.min_y.clone(),
+            0.0,
+            0.0,
+        ),
+        CanvasPoint::new(
+            bounds.depth,
+            bounds.max_x.clone(),
+            bounds.min_y.clone(),
+            1.0,
+            0.0,
+        ),
+        CanvasPoint::new(
+            bounds.depth,
+            bounds.max_x.clone(),
+            bounds.max_y.clone(),
+            1.0,
+            1.0,
+        ),
+        CanvasPoint::new(bounds.depth, bounds.min_x, bounds.max_y, 0.0, 1.0),
+    ];
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for corner in corners {
+        let Some((x, y)) =
+            camera.canvas_to_screen(&corner, f64::from(content_size), f64::from(content_size))
+        else {
+            return true;
+        };
+        if !x.is_finite() || !y.is_finite() {
+            return true;
+        }
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    let margin = f64::from(operation_width(operation, key.depth, resolution_scale).max(1.0)) * 0.5
+        + f64::from(TILE_BLEED)
+        + 2.0;
+    max_x >= -margin
+        && min_x <= f64::from(content_size) + margin
+        && max_y >= -margin
+        && min_y <= f64::from(content_size) + margin
 }
 
 pub fn operation_width(operation: &EditOperation, target_depth: i64, target_zoom: f64) -> f32 {
@@ -450,6 +561,29 @@ mod tests {
     }
 
     #[test]
+    fn sparse_raster_stroke_geometry_scales_without_changing_shape() {
+        let points = [
+            (0.0, 0.0),
+            (0.10, 0.0),
+            (0.20, 4.0),
+            (0.30, 0.0),
+            (16.0, 0.0),
+        ];
+        let scale = 8.0;
+        let scaled: Vec<_> = points.iter().map(|(x, y)| (x * scale, y * scale)).collect();
+
+        let rendered = raster_stroke_render_points(&points, 3);
+        let scaled_rendered = raster_stroke_render_points(&scaled, 3);
+
+        assert_eq!(rendered.len(), scaled_rendered.len());
+        assert!(rendered.iter().any(|(_, y)| *y > 2.0));
+        for ((x, y), (scaled_x, scaled_y)) in rendered.iter().zip(scaled_rendered) {
+            assert!((x * scale - scaled_x).abs() < 0.001);
+            assert!((y * scale - scaled_y).abs() < 0.001);
+        }
+    }
+
+    #[test]
     fn later_opaque_stroke_removes_older_pixels_across_depths() {
         let old = EditOperation::draft(
             EditKind::Paint,
@@ -478,6 +612,53 @@ mod tests {
         assert!(center[0] > 180 && center[1] < 80, "pixel={center:?}");
         let old_visible = image.get_pixel(TILE_BLEED + 220, TILE_BLEED + 256);
         assert!(old_visible[0] < 80, "pixel={old_visible:?}");
+    }
+
+    #[test]
+    fn compact_block_raster_matches_source_snapshot() {
+        let stroke = EditOperation::draft(
+            EditKind::Paint,
+            0,
+            1.0,
+            vec![point(0, 0.2, 0.25), point(0, 0.8, 0.25)],
+            Color::BLACK,
+            18.0,
+        );
+        let fill = EditOperation::draft(
+            EditKind::Fill,
+            0,
+            1.0,
+            vec![
+                point(0, 0.3, 0.35),
+                point(0, 0.7, 0.35),
+                point(0, 0.7, 0.75),
+                point(0, 0.3, 0.75),
+                point(0, 0.3, 0.35),
+            ],
+            Color::rgba(40, 80, 220, 255),
+            1.0,
+        );
+        let block = EditOperation::compact_block(
+            crate::model::DEFAULT_LAYER_ID,
+            vec![
+                point(0, 0.0, 0.0),
+                point(0, 1.0, 0.0),
+                point(0, 1.0, 1.0),
+                point(0, 0.0, 1.0),
+            ],
+            vec![stroke.clone(), fill.clone()],
+        );
+        let key = TileKey {
+            depth: 0,
+            x: 0.into(),
+            y: 0.into(),
+            lod: tile_lod_for_resolution(512),
+        };
+
+        let sources = render_tile(&[stroke, fill], &key, Color::WHITE);
+        let compact = render_tile(&[block], &key, Color::WHITE);
+
+        assert_eq!(compact.as_raw(), sources.as_raw());
     }
 
     #[test]

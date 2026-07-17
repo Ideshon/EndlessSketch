@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 const LOCAL_DATA_DIR: &str = "local";
 const DEFAULT_CANVAS_DIR: &str = "default.esketch";
 const SETTINGS_FILE: &str = "settings.json";
+const LOGS_DIR: &str = "logs";
 
 pub fn local_data_root() -> PathBuf {
     std::env::current_exe()
@@ -40,9 +41,20 @@ pub fn settings_path_from_root(local_root: &Path) -> PathBuf {
     local_root.join(SETTINGS_FILE)
 }
 
+pub fn session_logs_path() -> PathBuf {
+    session_logs_path_from_root(&local_data_root())
+}
+
+pub fn session_logs_path_from_root(local_root: &Path) -> PathBuf {
+    local_root.join(LOGS_DIR)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{default_canvas_path_from_root, local_data_root_from_exe, settings_path_from_root};
+    use super::{
+        default_canvas_path_from_root, local_data_root_from_exe, session_logs_path_from_root,
+        settings_path_from_root,
+    };
     use std::path::Path;
 
     #[test]
@@ -63,6 +75,10 @@ mod tests {
         assert_eq!(
             settings_path_from_root(root),
             Path::new(r"C:\Apps\EndlessSketch\local\settings.json")
+        );
+        assert_eq!(
+            session_logs_path_from_root(root),
+            Path::new(r"C:\Apps\EndlessSketch\local\logs")
         );
     }
 }

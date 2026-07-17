@@ -8,14 +8,39 @@
 
 ## Профиль производительности
 
-`Profile` одновременно меняет только разрешение тайлов, число tile workers и задержку после zoom:
+`Profile` одновременно меняет почти все параметры, которые влияют на скорость, качество, плотность ввода, временный vector fallback, tile work и частоту preview.
 
-- `Performance`: `128 px`, `1` worker, `250 ms`.
-- `Balanced` (по умолчанию): `512 px`, `1` worker, `140 ms`.
-- `Quality`: `1024 px`, `2` workers, `80 ms`.
-- `Custom`: определяется автоматически, если хотя бы одно из этих трёх значений не совпадает с профилем.
+| Параметр | Performance | Balanced (по умолчанию) | Quality |
+| --- | --- | --- | --- |
+| Brush input px | `6` | `3` | `1.5` |
+| Fill input px | `4` | `2` | `1` |
+| Fill fallback points | `1024` | `4096` | `32768` |
+| Fill fallback depth | `3` | `6` | `12` |
+| Stroke fallback joins | `Performance` | `Auto` | `Quality` |
+| Saved fallback ops | `1500` | `0` / Unlimited | `0` / Unlimited |
+| Zoom settle ms | `250` | `140` | `80` |
+| Tile workers | `1` | `1` | `2` |
+| Tile resolution | `128 px` | `512 px` | `1024 px` |
+| Pause tile generation while drawing | `on` | `off` | `off` |
+| Deferred drawing preview | `on` | `off` | `off` |
+| Rebuild policy | `After interaction` | `Immediate` | `Immediate` |
+| Prefetch tiles | `0` | `1` | `2` |
+| Edge quality | `Performance` | `Balanced` | `Quality` |
+| Smoothing | `Light` | `Balanced` | `Strong` |
+| PNG compression | `Fast` | `Fast` | `Small` |
+| Storage commit | `Fast` | `Full` | `Full` |
+| Preview FPS | `30` | `60` | `120` |
 
-Профиль не меняет Brush/Fill input spacing, fallback limits, pause, rebuild policy, prefetch, edge quality, smoothing, cache size, PNG compression или preview FPS.
+`Custom` определяется автоматически, если хотя бы одно управляемое поле не совпадает с полной матрицей выбранного профиля. Если вручную вернуть все управляемые поля к точным значениям одного профиля, UI снова покажет этот профиль.
+
+Профиль намеренно не меняет:
+
+- `Pause tile generation`: это оперативный ручной выключатель фоновой работы.
+- `Cache size MiB`: это аппаратный/дисковый бюджет пользователя.
+- `Keep latest objects`: это контроль редактируемости/уплотнения старых объектов.
+- `Settings > Display`, overlay и session logging: это UI/diagnostics-настройки, а не качество рендера.
+
+Новые параметры должны попадать в профильную матрицу, если они осмысленно влияют на скорость, качество, плотность ввода, fallback cost, tile work или preview cadence. Исключения нужно фиксировать явно.
 
 ## Геометрия ввода
 
@@ -50,8 +75,8 @@
 
 - Диапазон: `128..65536`.
 - По умолчанию: `4096`.
-- Ограничивает число экранных точек, при котором сохранённый Fill разрешено временно рисовать векторно до готовности PNG-тайла.
-- Меньшее значение снижает нагрузку интерфейса, но чаще оставляет Fill видимым только через готовые тайлы.
+- Ограничивает число экранных точек производного временного vector fallback для сохранённого Fill до готовности PNG-тайла.
+- Меньшее значение снижает нагрузку интерфейса и делает временный fallback грубее, но не обрезает raw/live Fill contour и не меняет сохранённую геометрию.
 
 ### Fill fallback depth
 
@@ -59,6 +84,26 @@
 - По умолчанию: `6`.
 - Ограничивает разницу между текущей глубиной камеры и native depth Fill для временной векторной отрисовки.
 - За пределом значения Fill ожидает тайл, что предотвращает дорогую или некорректную full-screen fallback-геометрию.
+
+### Stroke fallback joins
+
+- Значения: `Auto`, `Quality`, `Performance`.
+- По умолчанию: `Auto`.
+- Управляет joins только во временном no-tile vector fallback для сохранённых Brush/Eraser strokes. Cached PNG tiles, live input, сохранённые точки и формат `.esketch` не меняются.
+- `Auto` рисует короткие сохранённые sparse strokes до `128` экранных точек segmented capsule-joins, когда нет активного draft. Во время рисования, ожидания тайлов или tile pause уже сохранённые фоновые strokes временно используют быстрый one-shape raw polyline path без saved smoothing и endpoint caps, чтобы снизить input latency.
+- `Quality` сохраняет segmented capsule-joins для сохранённых strokes до `512` экранных точек даже во время рисования.
+- `Performance` всегда использует быстрый one-shape raw polyline path без saved smoothing и endpoint caps.
+- Dense strokes выше выбранного лимита всегда остаются на быстром polyline path.
+- На перегруженной no-tile сцене действует защитный лимит segmented stroke shapes на кадр: когда Quality/Auto исчерпывают лимит, оставшиеся runs в этом кадре временно рисуются быстрым path. Это предотвращает вылеты/резкие memory spikes и не меняет сохранённые точки или PNG-тайлы. В session log это видно как `fallback_segmented_budget_fallbacks`.
+
+### Saved fallback ops
+
+- Диапазон: `0..100000`.
+- По умолчанию: `0` (`Unlimited`).
+- Управляет временным no-tile saved vector fallback: если значение больше нуля, fallback рисует только новейшие N видимых сохранённых операций и пропускает более старые до готовности тайлов.
+- Это снижает projection/smoothing/clipping/egui-shape cost на перегруженной глубине, но старая часть рисунка может временно пропасть без тайлов.
+- PNG-тайлы, live draft, сохранённые операции, `.esketch`, история, compact blocks и raster output не меняются.
+- `Performance` preset выставляет `1500`. `Balanced` и `Quality` выставляют `0`, чтобы обычный просмотр оставался полным.
 
 ## Генерация тайлов
 
@@ -137,6 +182,16 @@
 - Compression не меняет пиксели, исходные операции или cache identity.
 - Уже существующие PNG не переписываются; режим применяется к новым и перестроенным тайлам.
 
+### Storage commit
+
+- Значения: `Full`, `Fast`.
+- По умолчанию: `Full`.
+- Управляет SQLite `PRAGMA synchronous` для commit-ов текущего документа.
+- `Full` использует `synchronous=FULL`, то есть сохраняет прежнюю более осторожную запись на диск. Это медленнее на больших Selection/compact commit-ах, но лучше защищает от потери последних изменений при сбое ОС или питания.
+- `Fast` использует `synchronous=NORMAL`. Это снижает задержку `transaction_commit_ms` в тяжёлых массовых правках, но слабее защищает последние commit-ы при системном сбое или отключении питания. Обычное закрытие приложения, `.esketch` формат, WAL, undo/redo и схема SQLite не меняются.
+- `Performance` preset выставляет `Fast`. `Balanced` и `Quality` оставляют `Full`.
+- Текущий режим пишется в session log как `context.storage_commit_mode`, чтобы сравнивать FPS/input lag с фактической долговечностью commit-ов.
+
 ### Preview FPS
 
 - Диапазон: `15..120 FPS`.
@@ -162,11 +217,11 @@
 - `Balanced` (по умолчанию): jitter tolerance `0.9 px`, средний радиус и шаг адаптивной quadratic-кривой.
 - `Strong`: jitter tolerance `1.5 px`, широкий радиус, более чувствительное обнаружение поворотов и наиболее частая тесселяция.
 
-При включённом уровне сначала удаляются малые отклонения в пределах указанного screen-space допуска, затем строятся адаптивные кривые. Error-bounded RDP работает окнами не больше `64` точек или `32 px` пути и никогда не увеличивает число входных точек. Smoothing применяется при растеризации Brush, Eraser и замкнутого Fill, к единственному активному live draft и к сохранённому full/retained fallback до готовности тайла. Сохранённые точки не изменяются. Для ограничения нагрузки fallback остаётся исходным при более чем `4096` входных или `8192` сглаженных точках; Brush обрезается до видимой области перед сглаживанием.
+При включённом уровне сначала удаляются малые отклонения в пределах указанного screen-space допуска, затем строятся адаптивные кривые. Error-bounded RDP работает окнами не больше `64` точек или `32 px` пути и никогда не увеличивает число входных точек. Smoothing применяется при растеризации Brush, Eraser и замкнутого Fill, к единственному активному live draft и к сохранённому full/retained fallback до готовности тайла. Сохранённые точки не изменяются. Для ограничения нагрузки fallback остаётся исходным при более чем `4096` входных или `8192` сглаженных точках; Brush сглаживается до clipping, чтобы clipping не менял форму кривой при zoom/depth navigation.
 
 ## Фиксированная оптимизация геометрии
 
-Это не пользовательская настройка. Сохранённые операции плотнее 256 спроецированных точек временно упрощаются с допуском `0.25 px`, затем stroke и Fill обрезаются по границам экрана или тайла. Sparse-геометрия, live draft и точки в `.esketch` не изменяются.
+Это не пользовательская настройка. No-tile vector fallback больше не упрощает сохранённые операции по экранному `0.25 px` допуску, потому что такой допуск менял набор точек при zoom/depth navigation и мог визуально менять дальние объекты. Stroke clipping выполняется после fallback smoothing, а Fill fallback ограничивает точки стабильным сэмплингом исходного порядка. Live draft, cached tiles и точки в `.esketch` не изменяются.
 
 ## Внутренний clipboard Selection
 
@@ -212,9 +267,21 @@
 
 Старые settings v10 и ниже получают безопасный профиль `Standard`. Выбор сохраняется в `local/settings.json`. Полные огромные BigInt-координаты всегда доступны в окне `Navigation`, даже если их компактное отображение в overlay выключено.
 
+### Session logging / Diagnostics
+
+`Settings > Diagnostics > Session logging` persists in `local/settings.json`.
+
+- `Off`: disables session JSONL writes.
+- `Basic` (default): writes launch/open/settings, markers, coalesced navigation, tile pause/resume/fallback/queue changes, save/undo/redo/compact/selection edits, FPS drops, and slow frame/phase snapshots.
+- `Detailed`: also records navigation-caused tile generation invalidations.
+
+Session files are written next to settings under `local/logs/session-YYYYMMDD-HHMMSS.jsonl`; only the newest 20 session logs are kept at startup. Each line is one JSON event with monotonic `t_ms`, local `wall_time`, camera depth/zoom/tile/local coordinates, document revision/counts, tile pause/fallback/pending state, performance metrics, active tool, selection count, smoothing, stroke fallback join mode, saved fallback operation limit, tile resolution, compaction limit, and status text. Slow-frame and phase events also include lightweight saved fallback counters: approximate fallback stroke shape count, segmented/fast stroke path counts, `fallback_projected_operations`, `fallback_painted_operations`, saved fallback projection/derived `fallback_cache_hits`/`fallback_cache_misses`, and `fallback_skipped_operations` when the temporary saved fallback budget omits old visible operations. Tile diagnostics split frame time into `tile_total`, `tile_collect_upload`, `tile_request_queue`, and `tile_draw`; fallback diagnostics split frame time into `fallback_project`, `fallback_derive`, `fallback_clip`, and `fallback_shape_paint`, with matching `perf` fields in milliseconds. The tile payload records per-frame `uploaded_textures` and `queued_jobs`. When an automatic FPS/phase event adds timing fields, they are merged into the existing `perf` object so fallback counters remain visible in the same JSON line.
+
+Press `F12` or the `Mark log` button to write a manual marker. The status/overlay shows `Log marker #N`. For FPS/zoom analysis, send the marker number, the approximate action around it, and the `.jsonl` file.
+
 ### Persistent Area selection
 
-Планируется отдельный временный режим `Area selection` с формами `Rectangle/Lasso`. Контур хранится в canvas coordinates, следует за pan/zoom/depth и ограничивает новые Brush/Eraser/Fill/Gradient operations. Selection не записывается в документ и не меняет revision, пока пользователь не выполнит операцию. В первой версии один Replace-контур; Add/Subtract/Intersect добавляются после устойчивого polygon clipping.
+`Area selection` работает как временный режим с формами `Rectangle/Lasso`. Контур хранится в canvas coordinates, следует за pan/zoom/depth и ограничивает новые Brush/Eraser/Fill operations при commit; сам Selection не записывается в документ и не меняет revision, пока пользователь не выполнит операцию. В текущей версии один Replace-контур; Add/Subtract/Intersect добавляются после устойчивого polygon clipping. Gradient остаётся планируемой операцией внутри активной Area selection.
 
 ### Gradient
 

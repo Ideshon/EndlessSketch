@@ -79,18 +79,59 @@ pub struct ScreenAffine {
 }
 
 impl ScreenAffine {
-    pub fn uniform_scale(pivot_x: f64, pivot_y: f64, scale: f64) -> Option<Self> {
-        if !pivot_x.is_finite() || !pivot_y.is_finite() || !scale.is_finite() || scale <= 0.0 {
+    pub fn new(pivot_x: f64, pivot_y: f64, m11: f64, m12: f64, m21: f64, m22: f64) -> Option<Self> {
+        if !pivot_x.is_finite()
+            || !pivot_y.is_finite()
+            || !m11.is_finite()
+            || !m12.is_finite()
+            || !m21.is_finite()
+            || !m22.is_finite()
+        {
             return None;
         }
         Some(Self {
             pivot_x,
             pivot_y,
-            m11: scale,
-            m12: 0.0,
-            m21: 0.0,
-            m22: scale,
+            m11,
+            m12,
+            m21,
+            m22,
         })
+    }
+
+    pub fn uniform_scale(pivot_x: f64, pivot_y: f64, scale: f64) -> Option<Self> {
+        if !pivot_x.is_finite() || !pivot_y.is_finite() || !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        Self::new(pivot_x, pivot_y, scale, 0.0, 0.0, scale)
+    }
+
+    pub fn rotation(pivot_x: f64, pivot_y: f64, angle_radians: f64) -> Option<Self> {
+        if !angle_radians.is_finite() {
+            return None;
+        }
+        let (sin, cos) = angle_radians.sin_cos();
+        Self::new(pivot_x, pivot_y, cos, -sin, sin, cos)
+    }
+
+    pub fn flip_horizontal(pivot_x: f64, pivot_y: f64) -> Option<Self> {
+        Self::new(pivot_x, pivot_y, -1.0, 0.0, 0.0, 1.0)
+    }
+
+    pub fn flip_vertical(pivot_x: f64, pivot_y: f64) -> Option<Self> {
+        Self::new(pivot_x, pivot_y, 1.0, 0.0, 0.0, -1.0)
+    }
+
+    pub fn transform_screen_point(self, screen_x: f64, screen_y: f64) -> Option<(f64, f64)> {
+        if !screen_x.is_finite() || !screen_y.is_finite() {
+            return None;
+        }
+        let relative_x = screen_x - self.pivot_x;
+        let relative_y = screen_y - self.pivot_y;
+        let transformed_x = self.pivot_x + relative_x * self.m11 + relative_y * self.m12;
+        let transformed_y = self.pivot_y + relative_x * self.m21 + relative_y * self.m22;
+        (transformed_x.is_finite() && transformed_y.is_finite())
+            .then_some((transformed_x, transformed_y))
     }
 
     pub fn transform_canvas_point(
@@ -109,10 +150,7 @@ impl ScreenAffine {
         }
         let (screen_x, screen_y) =
             camera.canvas_to_screen(point, viewport_width, viewport_height)?;
-        let relative_x = screen_x - self.pivot_x;
-        let relative_y = screen_y - self.pivot_y;
-        let transformed_x = self.pivot_x + relative_x * self.m11 + relative_y * self.m12;
-        let transformed_y = self.pivot_y + relative_x * self.m21 + relative_y * self.m22;
+        let (transformed_x, transformed_y) = self.transform_screen_point(screen_x, screen_y)?;
         point.translated_by_screen_delta(
             camera.depth,
             camera.zoom,

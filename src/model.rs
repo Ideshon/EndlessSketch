@@ -66,6 +66,7 @@ pub enum EditKind {
     Erase,
     Fill,
     EraseArea,
+    CompactBlock,
 }
 
 impl EditKind {
@@ -134,6 +135,8 @@ pub struct EditOperation {
     pub tombstone_targets: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paint_order_updates: Vec<PaintOrderUpdate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_sources: Vec<EditOperation>,
 }
 
 impl EditOperation {
@@ -164,6 +167,7 @@ impl EditOperation {
             affects_before_sequence: None,
             tombstone_targets: Vec::new(),
             paint_order_updates: Vec::new(),
+            compact_sources: Vec::new(),
         }
     }
 
@@ -187,6 +191,7 @@ impl EditOperation {
             affects_before_sequence: None,
             tombstone_targets: targets,
             paint_order_updates: Vec::new(),
+            compact_sources: Vec::new(),
         }
     }
 
@@ -208,6 +213,33 @@ impl EditOperation {
             affects_before_sequence: None,
             tombstone_targets: Vec::new(),
             paint_order_updates: updates,
+            compact_sources: Vec::new(),
+        }
+    }
+
+    pub fn compact_block(
+        layer_id: Uuid,
+        points: Vec<CanvasPoint>,
+        sources: Vec<EditOperation>,
+    ) -> Self {
+        let id = Uuid::new_v4();
+        Self {
+            id,
+            sequence: 0,
+            paint_order: None,
+            transaction_id: id,
+            layer_id,
+            kind: EditKind::CompactBlock,
+            native_depth: points.first().map_or(0, |point| point.depth),
+            native_zoom: 1.0,
+            points,
+            color: Color::BLACK,
+            width_px: 0.0,
+            destructive: false,
+            affects_before_sequence: None,
+            tombstone_targets: Vec::new(),
+            paint_order_updates: Vec::new(),
+            compact_sources: sources,
         }
     }
 
@@ -222,6 +254,15 @@ impl EditOperation {
             .retain(|target_id| *target_id != self.id);
         self.tombstone_targets.sort_unstable();
         self.tombstone_targets.dedup();
+        if self.is_compact_block() {
+            self.compact_sources
+                .retain(|source| source.id != self.id && !source.is_metadata_command());
+            for source in &mut self.compact_sources {
+                source.normalize_metadata();
+            }
+        } else {
+            self.compact_sources.clear();
+        }
     }
 
     pub fn is_tombstone(&self) -> bool {
@@ -230,6 +271,10 @@ impl EditOperation {
 
     pub fn is_paint_order_command(&self) -> bool {
         !self.paint_order_updates.is_empty()
+    }
+
+    pub fn is_compact_block(&self) -> bool {
+        matches!(self.kind, EditKind::CompactBlock)
     }
 
     pub fn is_metadata_command(&self) -> bool {

@@ -20,7 +20,7 @@ pub const TILE_BLEED: u32 = 2;
 pub const TILE_RESOLUTIONS: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
 pub const DEFAULT_TILE_RESOLUTION: u32 = 512;
 pub const MAX_TILE_LOD: u8 = TILE_RESOLUTIONS.len() as u8 - 1;
-const TILE_RENDERER_CACHE_VERSION: u32 = 8;
+const TILE_RENDERER_CACHE_VERSION: u32 = 9;
 const DEFAULT_MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -386,7 +386,7 @@ mod tests {
             current
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains("_rv8_r7.png"))
+                .is_some_and(|name| name.contains("_rv9_r7.png"))
         );
         assert!(current.to_string_lossy().contains("p64"));
         assert!(cache.load(&key, 7)?.is_none());

@@ -14,11 +14,19 @@ pub struct OperationIndex {
     broad_operations: Vec<usize>,
     operation_ids: HashMap<usize, Uuid>,
     operation_layers: HashMap<usize, Uuid>,
+    operation_tiles: HashMap<usize, Vec<IndexedTile>>,
 }
 
 #[derive(Default)]
 struct DepthBucket {
     columns: BTreeMap<BigInt, BTreeMap<BigInt, Vec<usize>>>,
+}
+
+#[derive(Clone)]
+struct IndexedTile {
+    depth: i64,
+    x: BigInt,
+    y: BigInt,
 }
 
 impl OperationIndex {
@@ -31,10 +39,20 @@ impl OperationIndex {
     }
 
     pub fn insert(&mut self, operation_index: usize, operation: &EditOperation) {
+        let bounds = operation_bounds(operation);
+        self.insert_with_bounds(operation_index, operation, bounds.as_ref());
+    }
+
+    pub fn insert_with_bounds(
+        &mut self,
+        operation_index: usize,
+        operation: &EditOperation,
+        bounds: Option<&OperationBounds>,
+    ) {
         self.operation_ids.insert(operation_index, operation.id);
         self.operation_layers
             .insert(operation_index, operation.layer_id);
-        let Some(bounds) = operation_bounds(operation) else {
+        let Some(bounds) = bounds else {
             return;
         };
         if !bounds.indexable_within(MAX_INDEXED_TILES_PER_OPERATION) {
@@ -42,8 +60,9 @@ impl OperationIndex {
             return;
         }
 
-        let mut x = bounds.min_x;
+        let mut x = bounds.min_x.clone();
         let one = BigInt::from(1u8);
+        let mut indexed_tiles = Vec::new();
         while x <= bounds.max_x {
             let mut y = bounds.min_y.clone();
             while y <= bounds.max_y {
@@ -56,9 +75,17 @@ impl OperationIndex {
                     .entry(y.clone())
                     .or_default()
                     .push(operation_index);
+                indexed_tiles.push(IndexedTile {
+                    depth: bounds.depth,
+                    x: x.clone(),
+                    y: y.clone(),
+                });
                 y += &one;
             }
             x += &one;
+        }
+        if !indexed_tiles.is_empty() {
+            self.operation_tiles.insert(operation_index, indexed_tiles);
         }
     }
 
@@ -121,20 +148,38 @@ impl OperationIndex {
         }
         self.broad_operations
             .retain(|index| !removed.contains(index));
-        self.operation_ids
-            .retain(|index, _| !removed.contains(index));
-        self.operation_layers
-            .retain(|index, _| !removed.contains(index));
-        self.depths.retain(|_, bucket| {
-            bucket.columns.retain(|_, column| {
-                column.retain(|_, indices| {
-                    indices.retain(|index| !removed.contains(index));
-                    !indices.is_empty()
-                });
-                !column.is_empty()
-            });
-            !bucket.columns.is_empty()
-        });
+        for index in removed {
+            self.operation_ids.remove(index);
+            self.operation_layers.remove(index);
+            let Some(tiles) = self.operation_tiles.remove(index) else {
+                continue;
+            };
+            for tile in tiles {
+                let remove_bucket = {
+                    let Some(bucket) = self.depths.get_mut(&tile.depth) else {
+                        continue;
+                    };
+                    let remove_column = if let Some(column) = bucket.columns.get_mut(&tile.x) {
+                        if let Some(indices) = column.get_mut(&tile.y) {
+                            indices.retain(|candidate| candidate != index);
+                            if indices.is_empty() {
+                                column.remove(&tile.y);
+                            }
+                        }
+                        column.is_empty()
+                    } else {
+                        false
+                    };
+                    if remove_column {
+                        bucket.columns.remove(&tile.x);
+                    }
+                    bucket.columns.is_empty()
+                };
+                if remove_bucket {
+                    self.depths.remove(&tile.depth);
+                }
+            }
+        }
     }
 }
 
@@ -464,6 +509,48 @@ mod tests {
         ];
 
         assert_eq!(index.query_many_ids(&keys), vec![first_id]);
+    }
+
+    #[test]
+    fn removing_middle_indices_preserves_other_tile_queries() {
+        let operations = vec![
+            operation(0, 0, 0),
+            operation(0, 1, 0),
+            operation(0, 2, 0),
+            operation(0, 3, 0),
+        ];
+        let first_id = operations[0].id;
+        let last_id = operations[3].id;
+        let mut index = OperationIndex::build(&operations);
+        index.remove_indices(&HashSet::from([1, 2]));
+        let keys = [
+            TileKey {
+                depth: 0,
+                x: 0.into(),
+                y: 0.into(),
+                lod: 0,
+            },
+            TileKey {
+                depth: 0,
+                x: 1.into(),
+                y: 0.into(),
+                lod: 0,
+            },
+            TileKey {
+                depth: 0,
+                x: 2.into(),
+                y: 0.into(),
+                lod: 0,
+            },
+            TileKey {
+                depth: 0,
+                x: 3.into(),
+                y: 0.into(),
+                lod: 0,
+            },
+        ];
+
+        assert_eq!(index.query_many_ids(&keys), vec![first_id, last_id]);
     }
 
     #[test]

@@ -281,6 +281,31 @@ pub fn smooth_stroke_points(points: &[(f32, f32)], passes: usize) -> Vec<(f32, f
     smoothed
 }
 
+pub fn smooth_stroke_points_stable(points: &[(f32, f32)], passes: usize) -> Vec<(f32, f32)> {
+    if points.len() <= 2 || passes == 0 {
+        return points.to_vec();
+    }
+
+    let parameters = curve_parameters(passes);
+    let mut smoothed = Vec::with_capacity(points.len() * stable_corner_steps(passes));
+    smoothed.push(points[0]);
+    for index in 1..points.len() - 1 {
+        append_stable_smoothed_corner(
+            &mut smoothed,
+            points[index - 1],
+            points[index],
+            points[index + 1],
+            parameters,
+            passes,
+        );
+    }
+    push_unique(
+        &mut smoothed,
+        *points.last().expect("stroke has an endpoint"),
+    );
+    smoothed
+}
+
 pub fn smooth_closed_points(points: &[(f32, f32)], passes: usize) -> Vec<(f32, f32)> {
     let mut ring = points;
     if ring.len() > 1 && ring.first() == ring.last() {
@@ -304,6 +329,30 @@ pub fn smooth_closed_points(points: &[(f32, f32)], passes: usize) -> Vec<(f32, f
             ring[index],
             ring[(index + 1) % ring.len()],
             parameters,
+        );
+    }
+    smoothed
+}
+
+pub fn smooth_closed_points_stable(points: &[(f32, f32)], passes: usize) -> Vec<(f32, f32)> {
+    let mut ring = points;
+    if ring.len() > 1 && ring.first() == ring.last() {
+        ring = &ring[..ring.len() - 1];
+    }
+    if ring.len() < 3 || passes == 0 {
+        return ring.to_vec();
+    }
+
+    let parameters = curve_parameters(passes);
+    let mut smoothed = Vec::with_capacity(ring.len() * stable_corner_steps(passes));
+    for index in 0..ring.len() {
+        append_stable_smoothed_corner(
+            &mut smoothed,
+            ring[(index + ring.len() - 1) % ring.len()],
+            ring[index],
+            ring[(index + 1) % ring.len()],
+            parameters,
+            passes,
         );
     }
     smoothed
@@ -469,6 +518,37 @@ fn append_smoothed_corner(
     }
 }
 
+fn append_stable_smoothed_corner(
+    output: &mut Vec<(f32, f32)>,
+    previous: (f32, f32),
+    corner: (f32, f32),
+    next: (f32, f32),
+    parameters: CurveParameters,
+    passes: usize,
+) {
+    if turn_amount(previous, corner, next) < parameters.minimum_turn {
+        push_unique(output, corner);
+        return;
+    }
+
+    let enter = lerp(corner, previous, parameters.corner_fraction);
+    let exit = lerp(corner, next, parameters.corner_fraction);
+    push_unique(output, enter);
+    let steps = stable_corner_steps(passes);
+    for step in 1..=steps {
+        let t = step as f32 / steps as f32;
+        push_unique(output, quadratic_point(enter, corner, exit, t));
+    }
+}
+
+fn stable_corner_steps(passes: usize) -> usize {
+    match passes.min(3) {
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    }
+}
+
 fn turn_amount(previous: (f32, f32), corner: (f32, f32), next: (f32, f32)) -> f32 {
     let incoming = (corner.0 - previous.0, corner.1 - previous.1);
     let outgoing = (next.0 - corner.0, next.1 - corner.1);
@@ -512,7 +592,8 @@ mod tests {
     use super::{
         GeometryClipRect, STROKE_SMOOTHING_PASSES, clip_polygon_to_rect, clip_polyline_to_rect,
         distance_to_segment, prefilter_smoothing_points, simplify_render_points,
-        smooth_closed_points, smooth_stroke_points,
+        smooth_closed_points, smooth_closed_points_stable, smooth_stroke_points,
+        smooth_stroke_points_stable,
     };
 
     #[test]
@@ -543,6 +624,36 @@ mod tests {
             smooth_stroke_points(&points, STROKE_SMOOTHING_PASSES),
             points
         );
+    }
+
+    #[test]
+    fn stable_smoothing_scales_without_changing_shape() {
+        let points = [(0.0, 0.0), (10.0, 30.0), (20.0, -5.0), (32.0, 12.0)];
+        let scaled: Vec<_> = points.iter().map(|(x, y)| (x * 7.5, y * 7.5)).collect();
+
+        let smoothed = smooth_stroke_points_stable(&points, 3);
+        let scaled_smoothed = smooth_stroke_points_stable(&scaled, 3);
+
+        assert_eq!(smoothed.len(), scaled_smoothed.len());
+        for ((x, y), (scaled_x, scaled_y)) in smoothed.iter().zip(scaled_smoothed) {
+            assert!((x * 7.5 - scaled_x).abs() < 0.001);
+            assert!((y * 7.5 - scaled_y).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn stable_closed_smoothing_scales_without_changing_shape() {
+        let points = [(0.0, 0.0), (20.0, 0.0), (12.0, 18.0), (0.0, 0.0)];
+        let scaled: Vec<_> = points.iter().map(|(x, y)| (x * 4.0, y * 4.0)).collect();
+
+        let smoothed = smooth_closed_points_stable(&points, 2);
+        let scaled_smoothed = smooth_closed_points_stable(&scaled, 2);
+
+        assert_eq!(smoothed.len(), scaled_smoothed.len());
+        for ((x, y), (scaled_x, scaled_y)) in smoothed.iter().zip(scaled_smoothed) {
+            assert!((x * 4.0 - scaled_x).abs() < 0.001);
+            assert!((y * 4.0 - scaled_y).abs() < 0.001);
+        }
     }
 
     #[test]

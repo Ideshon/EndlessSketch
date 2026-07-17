@@ -16,20 +16,20 @@
           "description": "Удаляет более старое содержимое под штрихом. Размер общий с кистью."
         },
         {
-          "name": "Заливка лассо (L)",
-          "description": "Обведите замкнутую область. После отпускания кнопки контур автоматически замыкается и сохраняется как векторная заливка."
+          "name": "Area Fill (L / X)",
+          "description": "Обведите замкнутую область. После отпускания кнопки контур автоматически замыкается и сохраняется как векторная заливка. L включает Fill напрямую; X включает Area Fill из других инструментов."
         },
         {
           "name": "Пипетка (I)",
-          "description": "Берёт цвет объекта под курсором и делает его текущим цветом кисти."
+          "description": "Берёт верхний отображаемый цвет под курсором и делает его текущим цветом кисти. Alt + короткое нажатие левой кнопки мыши берёт цвет без смены текущего инструмента и без записи истории."
         },
         {
-          "name": "Выделение объектов (S)",
-          "description": "Выбирает целые векторные объекты активного слоя щелчком или прямоугольной рамкой."
+          "name": "Selection (S / Q)",
+          "description": "S включает Selection; повторное S в Object mode циклически переключает Inside/Crossing без очистки текущего Object selection. Q включает Selection из других инструментов, а повторное Q при активном Selection переключает Object/Area."
         },
         {
-          "name": "Стирающее лассо (X)",
-          "description": "Обведите область, которую нужно стереть. Неполный контур можно отменить клавишей Esc."
+          "name": "Area Fill / Erase (X)",
+          "description": "Нажмите X один раз, чтобы активировать Area Fill, затем нажимайте X повторно для цикла Area Fill и Area Erase. Area Erase обводит область, которую нужно стереть. Неполный контур можно отменить клавишей Esc."
         },
         {
           "name": "Прямая линия",
@@ -40,8 +40,12 @@
           "description": "Ctrl + ЛКМ и движение вверх или вниз меняет размер кисти, ластика или заливки без рисования. Размер также доступен в верхней панели."
         },
         {
+          "name": "Brush / Fill по ПКМ",
+          "description": "При активной кисти или заливке щёлкните правой кнопкой по холсту, чтобы открыть возле курсора текущий RGB-цвет и общий Size. Они связаны с Palette и верхней панелью; настройка меню не создаёт штрих, лассо или шаг истории."
+        },
+        {
           "name": "Цвет и прозрачность",
-          "description": "Текущий выбор цвета изменяет только RGB. Новые объекты непрозрачные. Альфа старых объектов сохраняется в документе, но при отображении сводится с белым фоном."
+          "description": "Palette — перемещаемое и растягиваемое окно для текущего RGB-цвета. Picker внутри окна автоматически следует за шириной окна. Новые объекты непрозрачные. Альфа старых объектов сохраняется в документе, но при отображении сводится с белым фоном."
         }
       ]
     },
@@ -62,11 +66,11 @@
         },
         {
           "name": "Jump to depth",
-          "description": "Введите глубину от -10000 до 10000 и нажмите Go или Enter. Видимый центр сохраняется на новом уровне."
+          "description": "Откройте Navigation, введите глубину от -10000 до 10000 и нажмите Go или Enter. Видимый центр сохраняется на новом уровне."
         },
         {
           "name": "Tile X/Y jump",
-          "description": "Переходит к абсолютным координатам тайла на текущей глубине. Поддерживаются большие целые числа и запись вида 1e100. Origin возвращает к тайлу 0/0."
+          "description": "В окне Navigation переходит к абсолютным координатам тайла на текущей глубине. Поддерживаются большие целые числа и запись вида 1e100. Полные координаты можно выделить и скопировать; Origin возвращает к тайлу 0/0."
         },
         {
           "name": "Точный возврат",
@@ -86,16 +90,40 @@
           "description": "Inside выбирает только полностью попавшие внутрь рамки объекты. Crossing также выбирает линии и заливки, которых рамка коснулась."
         },
         {
+          "name": "Area selection",
+          "description": "Переключите Selection в Area, затем выберите Rectangle или Lasso. После отпускания контур остаётся на холсте и следует за pan, zoom и depth navigation. Он обрезает новые Brush, Eraser, Fill и Eraser Lasso при commit, но сам Area-контур остаётся временным UI-состоянием и не записывается в историю документа."
+        },
+        {
           "name": "Добавить или убрать из выделения",
           "description": "Shift + щелчок добавляет объект. Ctrl + щелчок переключает выбранность объекта."
         },
         {
           "name": "Перебор объектов под курсором",
-          "description": "Alt + щелчок или Alt + колесо перебирает перекрывающиеся объекты. Одно физическое деление колеса переключает один объект."
+          "description": "Alt + колесо перебирает перекрывающиеся объекты. Для стилуса в Object Selection работает Alt + вертикальный drag: вниз выбирает следующий объект, вверх предыдущий. Alt + короткое нажатие левой кнопки мыши остаётся быстрым выбором цвета."
         },
         {
           "name": "Перемещение",
           "description": "Потяните за любой выбранный объект. Все выбранные объекты перемещаются вместе и после отпускания сохраняются одной отменяемой командой."
+        },
+        {
+          "name": "Пропорциональный размер",
+          "description": "Потяните без модификаторов за один из четырёх квадратных углов общей рамки. Объекты масштабируются относительно противоположного угла; отпускание сохраняет одну отменяемую команду, Esc отменяет предварительный просмотр."
+        },
+        {
+          "name": "Поворот и отражение",
+          "description": "Потяните круглый handle над общей рамкой, чтобы повернуть выделение вокруг центра; удерживайте Shift для шага 15 градусов. Flip Horizontal и Flip Vertical в меню Selection зеркалят выбранные объекты вокруг центра рамки. Команды сохраняют редактируемые векторы и записывают одну отменяемую replacement-команду."
+        },
+        {
+          "name": "Recolor selected",
+          "description": "Применяет текущий непрозрачный RGB цвет к выбранным Paint и Fill как одну отменяемую replacement-команду. Erase и EraseArea не меняются, а выделение остаётся на новых перекрашенных копиях."
+        },
+        {
+          "name": "Freeze/Compact selected",
+          "description": "Упаковывает выбранный набор Object selection на активном видимом и разблокированном слое в одну операцию CompactBlock, включая разнесённые объекты и уже существующие compact blocks. Блок хранит векторный snapshot, не bitmap. Рендер раскрывает его sources обратно в общий paint order, а редактирование считает блок одним оптимизированным объектом: его можно выделять, перемещать, масштабировать, поворачивать, отражать, копировать, вставлять, переносить на другой слой и снова объединять с другими объектами."
+        },
+        {
+          "name": "Меню Selection по ПКМ",
+          "description": "При активном Selection щёлкните правой кнопкой по холсту, чтобы открыть возле курсора те же Object/Area, Inside/Crossing, Rectangle/Lasso, Deselect, Cut, Copy, Paste, Paste in place, Delete, Flip, Recolor и Freeze/Compact. Открытие меню не снимает выделение и не начинает рамку, перемещение, масштабирование или поворот."
         },
         {
           "name": "Порядок внутри слоя",
@@ -103,11 +131,11 @@
         },
         {
           "name": "Снять выделение",
-          "description": "Нажмите Esc. Прямоугольник выделения исчезает сразу после отпускания кнопки, а подсветка выбранных объектов остаётся."
+          "description": "Нажмите Esc или используйте Deselect. Object selection, Area selection и незавершённые жесты выделения очищаются без изменения истории документа."
         },
         {
           "name": "Ограничение текущего выделения",
-          "description": "Рамка выбирает целые векторные объекты и не обрезает их по своей границе."
+          "description": "Object-рамки выбирают целые векторные объекты и не обрезают их по своей границе. Area selection обрезает новые Brush и Eraser по центральной линии, а Fill и Eraser Lasso по polygon при commit; точная граница полной толщины stroke остаётся отдельным checkpoint."
         }
       ]
     },
@@ -169,7 +197,7 @@
         },
         {
           "name": "Закладки",
-          "description": "Add сохраняет текущую камеру под введённым именем. Open возвращает к позиции, Rename переименовывает, Delete удаляет закладку."
+          "description": "Кнопка Bookmarks в окне Navigation открывает закладки. Add сохраняет текущую камеру под введённым именем. Open возвращает к позиции, Rename переименовывает, Delete удаляет закладку."
         }
       ]
     },
@@ -178,7 +206,7 @@
       "items": [
         {
           "name": "Profile",
-          "description": "Performance, Balanced и Quality одновременно меняют только Tile resolution, Tile workers и Zoom settle ms. Custom появляется автоматически после ручного изменения одного из этих трёх параметров."
+          "description": "Performance, Balanced и Quality одновременно меняют почти все параметры скорости/качества: input spacing, fallback limits, Stroke fallback joins, Saved fallback ops, zoom settle, tile workers/resolution, auto-pause while drawing, deferred preview, rebuild policy, prefetch, edge quality, smoothing, PNG compression, Storage commit и Preview FPS. Custom появляется после ручного изменения любого управляемого поля. Ручной Pause tile generation, Cache size, Display, logging и Keep latest objects профилем не меняются."
         },
         {
           "name": "Brush input px",
@@ -190,11 +218,19 @@
         },
         {
           "name": "Fill fallback points",
-          "description": "Максимальное число точек сохранённой заливки, которую разрешено временно показывать вектором до готовности тайла. Меньше — выше FPS, но сложная заливка может временно исчезать до появления тайла."
+          "description": "Максимальное число точек производного временного vector fallback для сохранённой заливки до готовности тайла. Меньше — выше FPS и грубее временный fallback, но сохранённый raw-контур не меняется."
         },
         {
           "name": "Fill fallback depth",
           "description": "Максимальная разница глубины для временного векторного показа заливки. Меньше — ниже нагрузка при далёком масштабе, но заливка чаще ждёт готовый тайл."
+        },
+        {
+          "name": "Stroke fallback joins",
+          "description": "Управляет joins сохранённых strokes во временном no-tile vector fallback. Auto сохраняет capsule-joins и saved smoothing для коротких sparse strokes при просмотре, но во время активного рисования/ожидания тайлов использует быстрый one-shape raw polyline path без endpoint caps. Quality дольше сохраняет capsule-joins. Performance всегда использует быстрый raw one-shape path. На перегруженных no-tile сценах лимит кадра может временно перевести лишние segmented runs на быстрый path, чтобы избежать вылета или memory spike. Сохранённые точки документа и PNG-тайлы не меняются."
+        },
+        {
+          "name": "Saved fallback ops",
+          "description": "Лимит временного no-tile saved vector fallback. 0 означает Unlimited и рисует все видимые сохранённые операции. Значение больше 0 рисует только новейшие N операций до готовности тайлов, что ускоряет тяжёлую глубину, но старая часть рисунка может временно исчезать без тайлов. Performance ставит 1500; Balanced и Quality ставят Unlimited."
         },
         {
           "name": "Zoom settle ms",
@@ -245,8 +281,36 @@
           "description": "Fast меньше нагружает CPU, но создаёт более крупные файлы. Balanced — компромисс. Small сильнее сжимает и дольше записывает. Качество пикселей не меняется."
         },
         {
+          "name": "Storage commit",
+          "description": "Долговечность SQLite commit-ов текущего документа. Full сохраняет прежнее synchronous=FULL и лучше защищает от сбоя ОС или питания. Fast использует synchronous=NORMAL, чтобы уменьшить тяжёлые commit-паузы, но слабее защищает последние commit-ы при системном сбое. Performance ставит Fast; Balanced и Quality оставляют Full."
+        },
+        {
           "name": "Preview FPS",
           "description": "Частота фонового обновления черновика и ожидания тайлов. Меньше — ниже постоянная нагрузка, но обновление может выглядеть менее плавным. События пера и мыши по-прежнему обрабатываются сразу."
+        },
+        {
+          "name": "Keep latest objects",
+          "description": "Управляет ручным уплотнением старых объектов. Unlimited отключает кнопку Compact older now. Keep 5000, Keep 1000 и Keep 100 оставляют новейшие top-level объекты редактируемыми. Compact older now упаковывает старые объекты редактируемых слоёв только непрерывными layer/depth/paint-order участками. Рендер раскрывает CompactBlock sources в общий paint order, чтобы сохранить видимый порядок наложения."
+        },
+        {
+          "name": "Display: Show canvas overlay",
+          "description": "Главный переключатель текста поверх холста. Выключение скрывает overlay полностью, но не меняет документ, камеру, тайлы или производительность рисования."
+        },
+        {
+          "name": "Display: Overlay profile",
+          "description": "Minimal показывает только zoom и status. Standard дополнительно показывает число операций, FPS и активное состояние тайлов. Diagnostics включает все поля, в том числе depth и координаты. После ручного изменения появляется Custom."
+        },
+        {
+          "name": "Display: отдельные поля",
+          "description": "Depth, Zoom, Tile X/Y, Local X/Y, Operation count, FPS / frame time, Status и Tile / rebuild state можно включать независимо. Полные огромные координаты остаются в Navigation независимо от overlay."
+        },
+        {
+          "name": "Diagnostics: Session logging",
+          "description": "Writes JSON Lines session logs to local/logs/session-YYYYMMDD-HHMMSS.jsonl. Basic is the default. Off disables session writes. Detailed adds extra navigation-generation detail. Slow frames include tile phases plus saved fallback projection, derived smoothing/sampling, clipping, shape-paint timings, and saved fallback cache hit/miss counters. The app keeps the newest 20 session logs."
+        },
+        {
+          "name": "Diagnostics: Mark log",
+          "description": "Writes a manual marker to the current session log. F12 does the same and the status shows Log marker #N. When reporting FPS or zoom issues, send the marker number, what you did near it, and the .jsonl file."
         },
         {
           "name": "Reset",

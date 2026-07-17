@@ -1,20 +1,69 @@
-use crate::coords::{CameraAddress, ScreenAffine};
-use crate::model::{Bookmark, EditOperation, Layer, PaintOrderUpdate};
-use crate::spatial::OperationIndex;
-use crate::storage::{CanvasStore, HistoryChange, sort_operations_by_paint_order};
+use crate::coords::{CameraAddress, CanvasPoint, DEPTH_RATIO, ScreenAffine, TILE_PIXELS};
+use crate::model::{Bookmark, Color, EditKind, EditOperation, Layer, PaintOrderUpdate};
+use crate::settings::StorageCommitMode;
+use crate::spatial::{OperationIndex, operation_bounds};
+use crate::storage::{
+    CanvasStore, HistoryChange, OperationCommitStats, sort_operations_by_paint_order,
+};
 use crate::tile_cache::TileKey;
 use anyhow::{Context, Result, bail};
+use num_bigint::BigInt;
+use num_traits::{Euclid, FromPrimitive, ToPrimitive};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Instant;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct DocumentOperationCommitStats {
+    pub target_count: usize,
+    pub replacement_count: usize,
+    pub target_collect_ms: f64,
+    pub sort_targets_ms: f64,
+    pub replacement_build_ms: f64,
+    pub command_build_ms: f64,
+    pub storage_commit_ms: f64,
+    pub memory_prepare_ms: f64,
+    pub memory_replace_ms: f64,
+    pub memory_replace_fallback: bool,
+    pub memory_replace_fallback_reason: Option<&'static str>,
+    pub memory_replace: MemoryReplaceStats,
+    pub total_ms: f64,
+    pub storage: OperationCommitStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct MemoryReplaceStats {
+    pub replacement_count: usize,
+    pub compact_replacement_count: usize,
+    pub metadata_replacement_count: usize,
+    pub missing_operation_count: usize,
+    pub missing_render_count: usize,
+    pub position_map_ms: f64,
+    pub position_lookup_ms: f64,
+    pub bounds_ms: f64,
+    pub remove_operation_index_ms: f64,
+    pub remove_render_index_ms: f64,
+    pub assign_insert_ms: f64,
+    pub total_ms: f64,
+}
+
+enum RenderReplacementPlan {
+    Single(usize),
+    CompactSources(Vec<usize>),
+}
 
 pub struct CanvasDocument {
     store: CanvasStore,
     operations: Vec<EditOperation>,
+    render_operations: Vec<EditOperation>,
     layers: Vec<Layer>,
     revision: u64,
     max_sequence: i64,
     index: OperationIndex,
+    render_index: OperationIndex,
+    last_operation_commit_stats: Option<DocumentOperationCommitStats>,
 }
 
 impl CanvasDocument {
@@ -23,15 +72,20 @@ impl CanvasDocument {
         let operations = store.load_active_operations()?;
         let layers = store.load_layers()?;
         let index = OperationIndex::build(&operations);
+        let render_operations = build_render_operations(&operations);
+        let render_index = OperationIndex::build(&render_operations);
         let revision = store.content_revision()?;
         let max_sequence = store.active_max_sequence()?;
         Ok(Self {
             store,
             operations,
+            render_operations,
             layers,
             revision,
             max_sequence,
             index,
+            render_index,
+            last_operation_commit_stats: None,
         })
     }
 
@@ -65,6 +119,10 @@ impl CanvasDocument {
         self.store.root()
     }
 
+    pub fn set_storage_commit_mode(&self, mode: StorageCommitMode) -> Result<()> {
+        self.store.set_commit_mode(mode)
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -73,13 +131,21 @@ impl CanvasDocument {
         self.max_sequence
     }
 
+    pub fn last_operation_commit_stats(&self) -> Option<DocumentOperationCommitStats> {
+        self.last_operation_commit_stats
+    }
+
     pub fn operations_for_tile(&self, key: &TileKey) -> Vec<EditOperation> {
+        self.render_operations_for_tiles(std::slice::from_ref(key))
+    }
+
+    pub fn render_operations_for_tiles(&self, keys: &[TileKey]) -> Vec<EditOperation> {
         let visible_layers = self.visible_layer_ids();
         let mut operations: Vec<_> = self
-            .index
-            .query(key)
+            .render_index
+            .query_many(keys)
             .into_iter()
-            .filter_map(|index| self.operations.get(index).cloned())
+            .filter_map(|index| self.render_operations.get(index).cloned())
             .filter(|operation| visible_layers.contains(&operation.layer_id))
             .collect();
         self.sort_operations_for_render(&mut operations);
@@ -187,7 +253,7 @@ impl CanvasDocument {
         self.layers = self.store.load_layers()?;
         self.operations.extend(operations);
         sort_operations_by_paint_order(&mut self.operations);
-        self.index = OperationIndex::build(&self.operations);
+        self.rebuild_indexes();
         self.max_sequence = self.store.active_max_sequence()?;
         self.revision = revision;
         Ok(Some((layer, operation_count)))
@@ -229,9 +295,21 @@ impl CanvasDocument {
     pub fn commit(&mut self, mut operation: EditOperation) -> Result<()> {
         self.revision = self.store.commit(&mut operation)?;
         self.max_sequence = operation.sequence;
-        self.operations.push(operation);
-        let index = self.operations.len() - 1;
-        self.index.insert(index, &self.operations[index]);
+        self.append_committed_operation(operation);
+        Ok(())
+    }
+
+    pub fn commit_group(&mut self, mut operations: Vec<EditOperation>) -> Result<()> {
+        if operations.is_empty() {
+            return Ok(());
+        }
+        self.revision = self.store.commit_group(&mut operations)?;
+        self.max_sequence = operations
+            .last()
+            .map_or(self.max_sequence, |operation| operation.sequence);
+        self.operations.extend(operations);
+        sort_operations_by_paint_order(&mut self.operations);
+        self.rebuild_indexes();
         Ok(())
     }
 
@@ -256,7 +334,7 @@ impl CanvasDocument {
         let target_ids: HashSet<_> = targets.into_iter().collect();
         self.operations
             .retain(|operation| !target_ids.contains(&operation.id));
-        self.index = OperationIndex::build(&self.operations);
+        self.rebuild_indexes();
         Ok(target_ids.len())
     }
 
@@ -269,25 +347,29 @@ impl CanvasDocument {
         delta_y: f64,
         tombstone_layer_id: Uuid,
     ) -> Result<Vec<Uuid>> {
+        self.last_operation_commit_stats = None;
+        let total_start = Instant::now();
         if delta_x == 0.0 && delta_y == 0.0 {
             return Ok(Vec::new());
         }
+        let target_collect_start = Instant::now();
         let targets: Vec<_> = self
             .operations
             .iter()
             .filter(|operation| target_ids.contains(&operation.id))
             .cloned()
             .collect();
+        let target_collect_ms = target_collect_start.elapsed().as_secs_f64() * 1_000.0;
         if targets.is_empty() {
             return Ok(Vec::new());
         }
-
         let transaction_id = Uuid::new_v4();
         let mut tombstone = EditOperation::tombstone(
             targets.iter().map(|operation| operation.id).collect(),
             tombstone_layer_id,
         );
         tombstone.transaction_id = transaction_id;
+        let replacement_build_start = Instant::now();
         let mut replacements = Vec::with_capacity(targets.len());
         for source in &targets {
             let mut replacement = source.clone();
@@ -296,41 +378,79 @@ impl CanvasDocument {
             replacement.paint_order = Some(source.effective_paint_order());
             replacement.transaction_id = transaction_id;
             replacement.affects_before_sequence = None;
-            replacement.points = source
-                .points
-                .iter()
-                .map(|point| {
-                    point
-                        .translated_by_screen_delta(camera_depth, camera_zoom, delta_x, delta_y)
-                        .context("movement is not representable at the operation depth")
-                })
-                .collect::<Result<_>>()?;
+            translate_operation_by_screen_delta(
+                &mut replacement,
+                camera_depth,
+                camera_zoom,
+                delta_x,
+                delta_y,
+            )?;
             replacements.push(replacement);
         }
+        let replacement_build_ms = replacement_build_start.elapsed().as_secs_f64() * 1_000.0;
 
+        let command_build_start = Instant::now();
         let mut commands = Vec::with_capacity(replacements.len() + 1);
         commands.push(tombstone);
         commands.extend(replacements);
-        self.revision = self.store.commit_group(&mut commands)?;
+        let command_build_ms = command_build_start.elapsed().as_secs_f64() * 1_000.0;
+        let storage_commit_start = Instant::now();
+        let (revision, storage_stats) = self.store.commit_group_with_stats(&mut commands)?;
+        let storage_commit_ms = storage_commit_start.elapsed().as_secs_f64() * 1_000.0;
+        self.revision = revision;
         self.max_sequence = commands
             .last()
             .map_or(self.max_sequence, |operation| operation.sequence);
 
-        let removed_ids: HashSet<_> = targets.iter().map(|operation| operation.id).collect();
-        self.operations
-            .retain(|operation| !removed_ids.contains(&operation.id));
+        let memory_prepare_start = Instant::now();
         let replacement_ids: Vec<_> = commands
             .iter()
             .filter(|operation| !operation.is_tombstone())
             .map(|operation| operation.id)
             .collect();
-        self.operations.extend(
-            commands
-                .into_iter()
-                .filter(|operation| !operation.is_tombstone()),
-        );
-        sort_operations_by_paint_order(&mut self.operations);
-        self.index = OperationIndex::build(&self.operations);
+        let replacements = commands
+            .iter()
+            .filter(|operation| !operation.is_tombstone())
+            .cloned()
+            .collect::<Vec<_>>();
+        let indexed_replacements = targets
+            .iter()
+            .map(|operation| operation.id)
+            .zip(replacements.clone())
+            .collect::<Vec<_>>();
+        let memory_prepare_ms = memory_prepare_start.elapsed().as_secs_f64() * 1_000.0;
+        let memory_replace_start = Instant::now();
+        let (replace_stats, replace_fallback_reason) =
+            self.replace_operations_in_place(indexed_replacements);
+        if replace_fallback_reason.is_some() {
+            let removed_ids: HashSet<_> = targets.iter().map(|operation| operation.id).collect();
+            self.operations
+                .retain(|operation| !removed_ids.contains(&operation.id));
+            self.operations.extend(replacements);
+            sort_operations_by_paint_order(&mut self.operations);
+            self.rebuild_indexes();
+        }
+        let memory_replace_ms = memory_replace_start.elapsed().as_secs_f64() * 1_000.0;
+        let mut memory_replace = replace_stats;
+        if memory_replace.total_ms == 0.0 {
+            memory_replace.total_ms = memory_replace_ms;
+        }
+        self.last_operation_commit_stats = Some(DocumentOperationCommitStats {
+            target_count: targets.len(),
+            replacement_count: replacement_ids.len(),
+            target_collect_ms,
+            sort_targets_ms: 0.0,
+            replacement_build_ms,
+            command_build_ms,
+            storage_commit_ms,
+            memory_prepare_ms,
+            memory_replace_ms,
+            memory_replace_fallback: replace_fallback_reason.is_some(),
+            memory_replace_fallback_reason: replace_fallback_reason,
+            memory_replace,
+            total_ms: total_start.elapsed().as_secs_f64() * 1_000.0,
+            storage: storage_stats,
+        });
         Ok(replacement_ids)
     }
 
@@ -345,12 +465,15 @@ impl CanvasDocument {
         width_scale: f32,
         layer_id: Uuid,
     ) -> Result<Vec<Uuid>> {
+        self.last_operation_commit_stats = None;
+        let total_start = Instant::now();
         if target_ids.is_empty() || !width_scale.is_finite() || width_scale <= 0.0 {
             return Ok(Vec::new());
         }
         if !self.layer_is_editable(layer_id) {
             bail!("active layer is hidden or locked");
         }
+        let target_collect_start = Instant::now();
         let mut targets: Vec<_> = self
             .operations
             .iter()
@@ -359,10 +482,13 @@ impl CanvasDocument {
             })
             .cloned()
             .collect();
+        let target_collect_ms = target_collect_start.elapsed().as_secs_f64() * 1_000.0;
         if targets.len() != target_ids.len() {
             bail!("selection contains unavailable operations");
         }
+        let sort_targets_start = Instant::now();
         sort_operations_by_paint_order(&mut targets);
+        let sort_targets_ms = sort_targets_start.elapsed().as_secs_f64() * 1_000.0;
 
         let transaction_id = Uuid::new_v4();
         let mut tombstone = EditOperation::tombstone(
@@ -370,6 +496,7 @@ impl CanvasDocument {
             layer_id,
         );
         tombstone.transaction_id = transaction_id;
+        let replacement_build_start = Instant::now();
         let mut replacements = Vec::with_capacity(targets.len());
         for source in &targets {
             let mut replacement = source.clone();
@@ -378,20 +505,132 @@ impl CanvasDocument {
             replacement.paint_order = Some(source.effective_paint_order());
             replacement.transaction_id = transaction_id;
             replacement.affects_before_sequence = None;
-            let scaled_width = source.width_px * width_scale;
-            if !scaled_width.is_finite() {
-                bail!("scaled operation width is not finite");
-            }
-            replacement.width_px = scaled_width;
-            replacement.points = source
-                .points
-                .iter()
-                .map(|point| {
-                    transform
-                        .transform_canvas_point(point, camera, viewport_width, viewport_height)
-                        .context("transformed point is not representable at its operation depth")
-                })
-                .collect::<Result<_>>()?;
+            transform_operation_points(
+                &mut replacement,
+                camera,
+                viewport_width,
+                viewport_height,
+                transform,
+                width_scale,
+            )?;
+            replacements.push(replacement);
+        }
+        let replacement_build_ms = replacement_build_start.elapsed().as_secs_f64() * 1_000.0;
+
+        let command_build_start = Instant::now();
+        let mut commands = Vec::with_capacity(replacements.len() + 1);
+        commands.push(tombstone);
+        commands.extend(replacements);
+        let command_build_ms = command_build_start.elapsed().as_secs_f64() * 1_000.0;
+        let storage_commit_start = Instant::now();
+        let (revision, storage_stats) = self.store.commit_group_with_stats(&mut commands)?;
+        let storage_commit_ms = storage_commit_start.elapsed().as_secs_f64() * 1_000.0;
+        self.revision = revision;
+        self.max_sequence = commands
+            .last()
+            .map_or(self.max_sequence, |operation| operation.sequence);
+
+        let memory_prepare_start = Instant::now();
+        let replacement_ids = commands
+            .iter()
+            .filter(|operation| !operation.is_tombstone())
+            .map(|operation| operation.id)
+            .collect::<Vec<_>>();
+        let replacements = commands
+            .iter()
+            .filter(|operation| !operation.is_tombstone())
+            .cloned()
+            .collect::<Vec<_>>();
+        let indexed_replacements = targets
+            .iter()
+            .map(|operation| operation.id)
+            .zip(replacements.clone())
+            .collect::<Vec<_>>();
+        let memory_prepare_ms = memory_prepare_start.elapsed().as_secs_f64() * 1_000.0;
+        let memory_replace_start = Instant::now();
+        let (replace_stats, replace_fallback_reason) =
+            self.replace_operations_in_place(indexed_replacements);
+        if replace_fallback_reason.is_some() {
+            let removed_ids: HashSet<_> = targets.iter().map(|operation| operation.id).collect();
+            self.operations
+                .retain(|operation| !removed_ids.contains(&operation.id));
+            self.operations.extend(replacements);
+            sort_operations_by_paint_order(&mut self.operations);
+            self.rebuild_indexes();
+        }
+        let memory_replace_ms = memory_replace_start.elapsed().as_secs_f64() * 1_000.0;
+        let mut memory_replace = replace_stats;
+        if memory_replace.total_ms == 0.0 {
+            memory_replace.total_ms = memory_replace_ms;
+        }
+        self.last_operation_commit_stats = Some(DocumentOperationCommitStats {
+            target_count: targets.len(),
+            replacement_count: replacement_ids.len(),
+            target_collect_ms,
+            sort_targets_ms,
+            replacement_build_ms,
+            command_build_ms,
+            storage_commit_ms,
+            memory_prepare_ms,
+            memory_replace_ms,
+            memory_replace_fallback: replace_fallback_reason.is_some(),
+            memory_replace_fallback_reason: replace_fallback_reason,
+            memory_replace,
+            total_ms: total_start.elapsed().as_secs_f64() * 1_000.0,
+            storage: storage_stats,
+        });
+        Ok(replacement_ids)
+    }
+
+    pub fn recolor_operations(
+        &mut self,
+        target_ids: &HashSet<Uuid>,
+        layer_id: Uuid,
+        color: Color,
+    ) -> Result<Vec<(Uuid, Uuid)>> {
+        if target_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.layer_is_editable(layer_id) {
+            bail!("active layer is hidden or locked");
+        }
+        let mut selected: Vec<_> = self
+            .operations
+            .iter()
+            .filter(|operation| {
+                target_ids.contains(&operation.id) && operation.layer_id == layer_id
+            })
+            .cloned()
+            .collect();
+        if selected.len() != target_ids.len() {
+            bail!("selection contains unavailable operations");
+        }
+        selected.retain(|operation| matches!(operation.kind, EditKind::Paint | EditKind::Fill));
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+        sort_operations_by_paint_order(&mut selected);
+
+        let opaque_color = Color::rgba(color.r, color.g, color.b, u8::MAX);
+        let transaction_id = Uuid::new_v4();
+        let mut tombstone = EditOperation::tombstone(
+            selected.iter().map(|operation| operation.id).collect(),
+            layer_id,
+        );
+        tombstone.transaction_id = transaction_id;
+        let mut replacements = Vec::with_capacity(selected.len());
+        let mut id_map = Vec::with_capacity(selected.len());
+        for source in &selected {
+            let replacement_id = Uuid::new_v4();
+            let mut replacement = source.clone();
+            replacement.id = replacement_id;
+            replacement.sequence = 0;
+            replacement.paint_order = Some(source.effective_paint_order());
+            replacement.transaction_id = transaction_id;
+            replacement.affects_before_sequence = None;
+            replacement.color = opaque_color;
+            replacement.destructive = true;
+            id_map.push((source.id, replacement_id));
             replacements.push(replacement);
         }
 
@@ -403,22 +642,154 @@ impl CanvasDocument {
             .last()
             .map_or(self.max_sequence, |operation| operation.sequence);
 
-        let removed_ids: HashSet<_> = targets.iter().map(|operation| operation.id).collect();
+        let removed_ids: HashSet<_> = selected.iter().map(|operation| operation.id).collect();
         self.operations
             .retain(|operation| !removed_ids.contains(&operation.id));
-        let replacement_ids = commands
-            .iter()
-            .filter(|operation| !operation.is_tombstone())
-            .map(|operation| operation.id)
-            .collect::<Vec<_>>();
         self.operations.extend(
             commands
                 .into_iter()
                 .filter(|operation| !operation.is_tombstone()),
         );
         sort_operations_by_paint_order(&mut self.operations);
-        self.index = OperationIndex::build(&self.operations);
-        Ok(replacement_ids)
+        self.rebuild_indexes();
+        Ok(id_map)
+    }
+
+    pub fn compact_operations(
+        &mut self,
+        target_ids: &HashSet<Uuid>,
+        layer_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        if target_ids.is_empty() {
+            return Ok(None);
+        }
+        if !self.layer_is_editable(layer_id) {
+            bail!("active layer is hidden or locked");
+        }
+        let mut selected = self
+            .operations
+            .iter()
+            .filter(|operation| {
+                target_ids.contains(&operation.id) && operation.layer_id == layer_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected.len() != target_ids.len() {
+            bail!("selection contains unavailable operations");
+        }
+        if selected.iter().any(EditOperation::is_metadata_command) {
+            bail!("selection contains non-compactable operations");
+        }
+        sort_operations_by_paint_order(&mut selected);
+        let compact_sources = compact_snapshot_sources(&selected);
+        let depth = compact_anchor_depth(&compact_sources)?;
+
+        let transaction_id = Uuid::new_v4();
+        let mut tombstone = EditOperation::tombstone(
+            selected.iter().map(|operation| operation.id).collect(),
+            layer_id,
+        );
+        tombstone.transaction_id = transaction_id;
+        let mut block = EditOperation::compact_block(
+            layer_id,
+            compact_block_bounds(&compact_sources, depth)?,
+            compact_sources,
+        );
+        block.transaction_id = transaction_id;
+        block.paint_order = tombstone
+            .tombstone_targets
+            .iter()
+            .filter_map(|id| {
+                self.operations
+                    .iter()
+                    .find(|operation| operation.id == *id)
+                    .map(EditOperation::effective_paint_order)
+            })
+            .min();
+        let block_id = block.id;
+
+        let mut commands = vec![tombstone, block];
+        self.revision = self.store.commit_group(&mut commands)?;
+        self.max_sequence = commands
+            .last()
+            .map_or(self.max_sequence, |operation| operation.sequence);
+
+        let removed_ids = target_ids.clone();
+        self.operations
+            .retain(|operation| !removed_ids.contains(&operation.id));
+        self.operations.extend(
+            commands
+                .into_iter()
+                .filter(|operation| !operation.is_tombstone()),
+        );
+        sort_operations_by_paint_order(&mut self.operations);
+        self.rebuild_indexes();
+        Ok(Some(block_id))
+    }
+
+    pub fn compact_older_operations(&mut self, keep_latest: usize) -> Result<usize> {
+        let mut operations = self
+            .operations
+            .iter()
+            .filter(|operation| !operation.is_metadata_command())
+            .cloned()
+            .collect::<Vec<_>>();
+        if operations.len() <= keep_latest {
+            return Ok(0);
+        }
+        operations.sort_by_key(|operation| (operation.sequence, operation.effective_paint_order()));
+        let keep_ids = operations
+            .iter()
+            .rev()
+            .take(keep_latest)
+            .map(|operation| operation.id)
+            .collect::<HashSet<_>>();
+        operations.sort_by_key(|operation| {
+            (
+                self.layer_sort_order(operation.layer_id),
+                operation.effective_paint_order(),
+                operation.sequence,
+            )
+        });
+        let mut groups = Vec::<(Uuid, Vec<Uuid>)>::new();
+        let mut current_key = None::<(Uuid, i64)>;
+        let mut current_ids = Vec::<Uuid>::new();
+        for operation in operations {
+            let next_key = (!keep_ids.contains(&operation.id)
+                && self.layer_is_editable(operation.layer_id))
+            .then(|| (operation.layer_id, operation_compaction_depth(&operation)));
+            if next_key != current_key {
+                if current_ids.len() >= 2 {
+                    let layer_id = current_key
+                        .map(|(layer_id, _)| layer_id)
+                        .expect("compact run key");
+                    groups.push((layer_id, std::mem::take(&mut current_ids)));
+                } else {
+                    current_ids.clear();
+                }
+                current_key = next_key;
+            }
+            if next_key.is_some() {
+                current_ids.push(operation.id);
+            }
+        }
+        if current_ids.len() >= 2 {
+            let layer_id = current_key
+                .map(|(layer_id, _)| layer_id)
+                .expect("compact run key");
+            groups.push((layer_id, current_ids));
+        }
+
+        let mut compacted = 0usize;
+        for (layer_id, ids) in groups {
+            if self
+                .compact_operations(&ids.into_iter().collect(), layer_id)?
+                .is_some()
+            {
+                compacted += 1;
+            }
+        }
+        Ok(compacted)
     }
 
     pub fn move_operations_to_layer(
@@ -463,8 +834,8 @@ impl CanvasDocument {
             replacement.sequence = 0;
             replacement.paint_order = None;
             replacement.transaction_id = transaction_id;
-            replacement.layer_id = target_layer_id;
             replacement.affects_before_sequence = None;
+            set_operation_layer_recursive(&mut replacement, target_layer_id);
             replacements.push(replacement);
         }
 
@@ -493,7 +864,7 @@ impl CanvasDocument {
                 .filter(|operation| !operation.is_tombstone()),
         );
         sort_operations_by_paint_order(&mut self.operations);
-        self.index = OperationIndex::build(&self.operations);
+        self.rebuild_indexes();
         Ok(replacement_ids)
     }
 
@@ -560,7 +931,7 @@ impl CanvasDocument {
             }
         }
         sort_operations_by_paint_order(&mut self.operations);
-        self.index = OperationIndex::build(&self.operations);
+        self.rebuild_indexes();
         Ok(true)
     }
 
@@ -582,28 +953,21 @@ impl CanvasDocument {
         if source_operations.iter().any(EditOperation::is_tombstone) {
             anyhow::bail!("cannot paste history tombstone operations");
         }
-
         let mut sources = source_operations.to_vec();
         sort_operations_by_paint_order(&mut sources);
         let transaction_id = Uuid::new_v4();
         let mut pasted = Vec::with_capacity(sources.len());
         for source in sources {
             let mut operation = source;
-            operation.id = Uuid::new_v4();
-            operation.sequence = 0;
-            operation.paint_order = None;
-            operation.transaction_id = transaction_id;
-            operation.layer_id = target_layer_id;
-            operation.affects_before_sequence = None;
-            operation.points = operation
-                .points
-                .iter()
-                .map(|point| {
-                    point
-                        .translated_by_screen_delta(camera_depth, camera_zoom, delta_x, delta_y)
-                        .context("paste offset is not representable at the operation depth")
-                })
-                .collect::<Result<_>>()?;
+            prepare_pasted_operation(&mut operation, transaction_id, target_layer_id);
+            translate_operation_by_screen_delta(
+                &mut operation,
+                camera_depth,
+                camera_zoom,
+                delta_x,
+                delta_y,
+            )
+            .context("paste offset is not representable at the operation depth")?;
             pasted.push(operation);
         }
 
@@ -617,7 +981,7 @@ impl CanvasDocument {
             .collect::<Vec<_>>();
         self.operations.extend(pasted);
         sort_operations_by_paint_order(&mut self.operations);
-        self.index = OperationIndex::build(&self.operations);
+        self.rebuild_indexes();
         Ok(pasted_ids)
     }
 
@@ -670,7 +1034,7 @@ impl CanvasDocument {
                     .filter(|operation| !existing_ids.contains(&operation.id)),
             );
             sort_operations_by_paint_order(&mut self.operations);
-            self.index = OperationIndex::build(&self.operations);
+            self.rebuild_indexes();
         }
         Ok(())
     }
@@ -703,11 +1067,9 @@ impl CanvasDocument {
             .flat_map(|operation| operation.tombstone_targets.iter().copied())
             .collect();
         if tombstone_targets.is_empty() {
-            for operation in operations {
-                self.operations.push(operation);
-                let index = self.operations.len() - 1;
-                self.index.insert(index, &self.operations[index]);
-            }
+            self.operations.extend(operations);
+            sort_operations_by_paint_order(&mut self.operations);
+            self.rebuild_indexes();
         } else {
             self.operations
                 .retain(|operation| !tombstone_targets.contains(&operation.id));
@@ -717,37 +1079,206 @@ impl CanvasDocument {
                     .filter(|operation| !operation.is_tombstone()),
             );
             sort_operations_by_paint_order(&mut self.operations);
-            self.index = OperationIndex::build(&self.operations);
+            self.rebuild_indexes();
         }
         Ok(())
     }
 
     fn remove_operations(&mut self, operation_ids: &HashSet<Uuid>) {
-        let first_removed = self
-            .operations
-            .iter()
-            .position(|operation| operation_ids.contains(&operation.id));
-        let removed_are_tail = first_removed.is_some_and(|first_removed| {
-            self.operations[first_removed..]
-                .iter()
-                .all(|operation| operation_ids.contains(&operation.id))
-        });
-        if let Some(first_removed) = first_removed.filter(|_| removed_are_tail) {
-            let removed_indices: HashSet<_> = (first_removed..self.operations.len()).collect();
-            self.operations.truncate(first_removed);
-            self.index.remove_indices(&removed_indices);
-        } else {
-            self.operations
-                .retain(|operation| !operation_ids.contains(&operation.id));
-            self.index = OperationIndex::build(&self.operations);
-        }
+        self.operations
+            .retain(|operation| !operation_ids.contains(&operation.id));
+        self.rebuild_indexes();
     }
 
     fn reload_active_operations(&mut self) -> Result<()> {
         self.operations = self.store.load_active_operations()?;
-        self.index = OperationIndex::build(&self.operations);
+        self.rebuild_indexes();
         self.max_sequence = self.store.active_max_sequence()?;
         Ok(())
+    }
+
+    fn append_committed_operation(&mut self, operation: EditOperation) {
+        if operation_can_append_to_render_index(&operation, self.render_operations.last()) {
+            let operation_index = self.operations.len();
+            let render_operation_index = self.render_operations.len();
+            self.index.insert(operation_index, &operation);
+            self.render_index.insert(render_operation_index, &operation);
+            self.render_operations.push(operation.clone());
+            self.operations.push(operation);
+        } else {
+            self.operations.push(operation);
+            self.rebuild_indexes();
+        }
+    }
+
+    fn replace_operations_in_place(
+        &mut self,
+        replacements: Vec<(Uuid, EditOperation)>,
+    ) -> (MemoryReplaceStats, Option<&'static str>) {
+        let total_start = Instant::now();
+        let mut stats = MemoryReplaceStats {
+            replacement_count: replacements.len(),
+            ..MemoryReplaceStats::default()
+        };
+        if replacements.is_empty() {
+            return (stats, Some("empty_replacements"));
+        }
+        stats.compact_replacement_count = replacements
+            .iter()
+            .filter(|(_, operation)| operation.is_compact_block())
+            .count();
+        stats.metadata_replacement_count = replacements
+            .iter()
+            .filter(|(_, operation)| operation.is_metadata_command())
+            .count();
+        if stats.metadata_replacement_count > 0 {
+            return (stats, Some("metadata_replacement"));
+        }
+        let position_map_start = Instant::now();
+        let operation_position_by_id = self
+            .operations
+            .iter()
+            .enumerate()
+            .map(|(index, operation)| (operation.id, index))
+            .collect::<HashMap<_, _>>();
+        let render_position_by_id = self
+            .render_operations
+            .iter()
+            .enumerate()
+            .map(|(index, operation)| (operation.id, index))
+            .collect::<HashMap<_, _>>();
+        stats.position_map_ms = position_map_start.elapsed().as_secs_f64() * 1_000.0;
+        let mut operation_positions = Vec::with_capacity(replacements.len());
+        let mut render_plans = Vec::with_capacity(replacements.len());
+        let position_lookup_start = Instant::now();
+        for (old_id, replacement) in &replacements {
+            if let Some(operation_position) = operation_position_by_id.get(old_id).copied() {
+                operation_positions.push(operation_position);
+                if replacement.is_compact_block() {
+                    let old_operation = &self.operations[operation_position];
+                    if !old_operation.is_compact_block() {
+                        stats.total_ms = total_start.elapsed().as_secs_f64() * 1_000.0;
+                        return (stats, Some("compact_replacement_for_noncompact_source"));
+                    }
+                    let mut old_render_sources = Vec::new();
+                    collect_render_operations(old_operation, &mut old_render_sources);
+                    let mut source_positions = Vec::with_capacity(old_render_sources.len());
+                    for source in old_render_sources {
+                        if let Some(render_position) =
+                            render_position_by_id.get(&source.id).copied()
+                        {
+                            source_positions.push(render_position);
+                        } else {
+                            stats.missing_render_count += 1;
+                        }
+                    }
+                    render_plans.push(RenderReplacementPlan::CompactSources(source_positions));
+                } else if let Some(render_position) = render_position_by_id.get(old_id).copied() {
+                    render_plans.push(RenderReplacementPlan::Single(render_position));
+                } else {
+                    stats.missing_render_count += 1;
+                    render_plans.push(RenderReplacementPlan::CompactSources(Vec::new()));
+                }
+            } else {
+                stats.missing_operation_count += 1;
+                if !render_position_by_id.contains_key(old_id) {
+                    stats.missing_render_count += 1;
+                }
+            }
+        }
+        stats.position_lookup_ms = position_lookup_start.elapsed().as_secs_f64() * 1_000.0;
+        if stats.missing_operation_count > 0 && stats.missing_render_count > 0 {
+            stats.total_ms = total_start.elapsed().as_secs_f64() * 1_000.0;
+            return (stats, Some("missing_operation_and_render_positions"));
+        }
+        if stats.missing_operation_count > 0 {
+            stats.total_ms = total_start.elapsed().as_secs_f64() * 1_000.0;
+            return (stats, Some("missing_operation_positions"));
+        }
+        if stats.missing_render_count > 0 {
+            stats.total_ms = total_start.elapsed().as_secs_f64() * 1_000.0;
+            return (stats, Some("missing_render_positions"));
+        }
+
+        let operation_indices = operation_positions.iter().copied().collect::<HashSet<_>>();
+        let render_indices = render_plans
+            .iter()
+            .flat_map(|plan| match plan {
+                RenderReplacementPlan::Single(index) => std::slice::from_ref(index),
+                RenderReplacementPlan::CompactSources(indices) => indices.as_slice(),
+            })
+            .copied()
+            .collect::<HashSet<_>>();
+        let bounds_start = Instant::now();
+        let replacement_bounds = replacements
+            .iter()
+            .map(|(_, operation)| operation_bounds(operation))
+            .collect::<Vec<_>>();
+        stats.bounds_ms = bounds_start.elapsed().as_secs_f64() * 1_000.0;
+        let remove_operation_start = Instant::now();
+        self.index.remove_indices(&operation_indices);
+        stats.remove_operation_index_ms = remove_operation_start.elapsed().as_secs_f64() * 1_000.0;
+        let remove_render_start = Instant::now();
+        self.render_index.remove_indices(&render_indices);
+        stats.remove_render_index_ms = remove_render_start.elapsed().as_secs_f64() * 1_000.0;
+        let assign_insert_start = Instant::now();
+        for ((((_, replacement), operation_position), render_plan), bounds) in replacements
+            .into_iter()
+            .zip(operation_positions)
+            .zip(render_plans)
+            .zip(replacement_bounds)
+        {
+            self.operations[operation_position] = replacement.clone();
+            self.index
+                .insert_with_bounds(operation_position, &replacement, bounds.as_ref());
+            match render_plan {
+                RenderReplacementPlan::Single(render_position) => {
+                    self.render_operations[render_position] = replacement.clone();
+                    self.render_index.insert_with_bounds(
+                        render_position,
+                        &replacement,
+                        bounds.as_ref(),
+                    );
+                }
+                RenderReplacementPlan::CompactSources(source_positions) => {
+                    let mut render_sources = Vec::new();
+                    collect_render_operations(&replacement, &mut render_sources);
+                    sort_operations_by_paint_order(&mut render_sources);
+                    let mut render_sources = render_sources.into_iter();
+                    for render_position in source_positions {
+                        let Some(source) = render_sources.next() else {
+                            break;
+                        };
+                        self.render_operations[render_position] = source.clone();
+                        let source_bounds = operation_bounds(&source);
+                        self.render_index.insert_with_bounds(
+                            render_position,
+                            &source,
+                            source_bounds.as_ref(),
+                        );
+                    }
+                    for source in render_sources {
+                        let render_position = self.render_operations.len();
+                        let source_bounds = operation_bounds(&source);
+                        self.render_index.insert_with_bounds(
+                            render_position,
+                            &source,
+                            source_bounds.as_ref(),
+                        );
+                        self.render_operations.push(source);
+                    }
+                }
+            }
+        }
+        stats.assign_insert_ms = assign_insert_start.elapsed().as_secs_f64() * 1_000.0;
+        stats.total_ms = total_start.elapsed().as_secs_f64() * 1_000.0;
+        (stats, None)
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.index = OperationIndex::build(&self.operations);
+        self.render_operations = build_render_operations(&self.operations);
+        self.render_index = OperationIndex::build(&self.render_operations);
     }
 
     fn layer_orders(&self) -> HashMap<Uuid, i64> {
@@ -800,6 +1331,400 @@ impl CanvasDocument {
     }
 }
 
+fn compact_anchor_depth(operations: &[EditOperation]) -> Result<i64> {
+    if operations
+        .iter()
+        .any(|operation| operation.points.is_empty())
+    {
+        bail!("selection has no compactable geometry");
+    }
+    let Some(first_depth) = operations
+        .iter()
+        .find_map(|operation| operation.points.first().map(|point| point.depth))
+    else {
+        bail!("selection has no compactable geometry");
+    };
+    Ok(first_depth)
+}
+
+fn operation_compaction_depth(operation: &EditOperation) -> i64 {
+    if operation.is_compact_block() {
+        operation.native_depth
+    } else {
+        operation
+            .points
+            .first()
+            .map_or(operation.native_depth, |point| point.depth)
+    }
+}
+
+fn compact_snapshot_sources(operations: &[EditOperation]) -> Vec<EditOperation> {
+    let mut sources = Vec::new();
+    for operation in operations {
+        collect_compact_snapshot_sources(operation, &mut sources);
+    }
+    sources
+}
+
+fn build_render_operations(operations: &[EditOperation]) -> Vec<EditOperation> {
+    let mut render_operations = Vec::new();
+    for operation in operations {
+        collect_render_operations(operation, &mut render_operations);
+    }
+    sort_operations_by_paint_order(&mut render_operations);
+    render_operations
+}
+
+fn operation_can_append_to_render_index(
+    operation: &EditOperation,
+    last_render_operation: Option<&EditOperation>,
+) -> bool {
+    !operation.is_metadata_command()
+        && !operation.is_compact_block()
+        && last_render_operation.is_none_or(|last| {
+            operation_render_sort_key(last) <= operation_render_sort_key(operation)
+        })
+}
+
+fn operation_render_sort_key(operation: &EditOperation) -> (i64, i64) {
+    (operation.effective_paint_order(), operation.sequence)
+}
+
+fn collect_render_operations(operation: &EditOperation, operations: &mut Vec<EditOperation>) {
+    if operation.is_compact_block() {
+        for source in &operation.compact_sources {
+            collect_render_operations(source, operations);
+        }
+    } else {
+        operations.push(operation.clone());
+    }
+}
+
+fn collect_compact_snapshot_sources(operation: &EditOperation, sources: &mut Vec<EditOperation>) {
+    if operation.is_compact_block() {
+        for source in &operation.compact_sources {
+            collect_compact_snapshot_sources(source, sources);
+        }
+    } else {
+        sources.push(operation.clone());
+    }
+}
+
+fn compact_block_bounds(operations: &[EditOperation], depth: i64) -> Result<Vec<CanvasPoint>> {
+    let mut bounds = ContinuousBounds::new(depth);
+    for operation in operations {
+        accumulate_operation_bounds(operation, &mut bounds)?;
+    }
+    let Some((min_x, max_x, min_y, max_y)) = bounds.into_axes() else {
+        bail!("selection has no compactable geometry");
+    };
+    Ok(vec![
+        CanvasPoint::new(
+            depth,
+            min_x.tile.clone(),
+            min_y.tile.clone(),
+            min_x.local,
+            min_y.local,
+        ),
+        CanvasPoint::new(
+            depth,
+            max_x.tile.clone(),
+            min_y.tile,
+            max_x.local,
+            min_y.local,
+        ),
+        CanvasPoint::new(
+            depth,
+            max_x.tile.clone(),
+            max_y.tile.clone(),
+            max_x.local,
+            max_y.local,
+        ),
+        CanvasPoint::new(depth, min_x.tile, max_y.tile, min_x.local, max_y.local),
+    ])
+}
+
+#[derive(Debug, Clone)]
+struct AxisPoint {
+    tile: BigInt,
+    local: f64,
+}
+
+#[derive(Default)]
+struct ContinuousBounds {
+    depth: i64,
+    min_x: Option<AxisPoint>,
+    max_x: Option<AxisPoint>,
+    min_y: Option<AxisPoint>,
+    max_y: Option<AxisPoint>,
+}
+
+impl ContinuousBounds {
+    fn new(depth: i64) -> Self {
+        Self {
+            depth,
+            ..Self::default()
+        }
+    }
+
+    fn include(&mut self, point: &CanvasPoint, radius_tiles: f64) -> Result<()> {
+        let left = axis_to_depth(
+            point.depth,
+            shifted_axis(&point.tile_x, point.local_x, -radius_tiles)?,
+            self.depth,
+        )?;
+        let right = axis_to_depth(
+            point.depth,
+            shifted_axis(&point.tile_x, point.local_x, radius_tiles)?,
+            self.depth,
+        )?;
+        let top = axis_to_depth(
+            point.depth,
+            shifted_axis(&point.tile_y, point.local_y, -radius_tiles)?,
+            self.depth,
+        )?;
+        let bottom = axis_to_depth(
+            point.depth,
+            shifted_axis(&point.tile_y, point.local_y, radius_tiles)?,
+            self.depth,
+        )?;
+        include_min(&mut self.min_x, left.clone());
+        include_max(&mut self.max_x, right);
+        include_min(&mut self.min_y, top.clone());
+        include_max(&mut self.max_y, bottom);
+        Ok(())
+    }
+
+    fn into_axes(self) -> Option<(AxisPoint, AxisPoint, AxisPoint, AxisPoint)> {
+        Some((self.min_x?, self.max_x?, self.min_y?, self.max_y?))
+    }
+}
+
+fn accumulate_operation_bounds(
+    operation: &EditOperation,
+    bounds: &mut ContinuousBounds,
+) -> Result<()> {
+    if operation.is_compact_block() {
+        for source in &operation.compact_sources {
+            accumulate_operation_bounds(source, bounds)?;
+        }
+        return Ok(());
+    }
+    let radius_tiles = operation_radius_tiles(operation)?;
+    for point in &operation.points {
+        bounds.include(point, radius_tiles)?;
+    }
+    Ok(())
+}
+
+fn operation_radius_tiles(operation: &EditOperation) -> Result<f64> {
+    if operation.kind.is_area() {
+        return Ok(0.0);
+    }
+    let native_zoom = operation.native_zoom.max(1.0e-12);
+    let radius = f64::from(operation.width_px.max(0.0)) / (2.0 * TILE_PIXELS * native_zoom);
+    if radius.is_finite() {
+        Ok(radius)
+    } else {
+        bail!("operation width is not finite")
+    }
+}
+
+fn shifted_axis(tile: &BigInt, local: f64, delta: f64) -> Result<AxisPoint> {
+    let shifted = local + delta;
+    if !shifted.is_finite() {
+        bail!("compact bounds are not finite");
+    }
+    let whole = shifted.floor();
+    if whole < i64::MIN as f64 || whole > i64::MAX as f64 {
+        bail!("compact bounds exceed supported local offset");
+    }
+    Ok(AxisPoint {
+        tile: tile + BigInt::from(whole as i64),
+        local: shifted - whole,
+    })
+}
+
+fn axis_to_depth(source_depth: i64, axis: AxisPoint, target_depth: i64) -> Result<AxisPoint> {
+    let delta = target_depth.saturating_sub(source_depth);
+    if delta == 0 {
+        return Ok(axis);
+    }
+    let levels = delta.unsigned_abs();
+    let factor = depth_factor_bigint(levels)?;
+    let scale = depth_factor_f64(levels)?;
+    if delta > 0 {
+        let scaled_local = axis.local * scale;
+        if !scaled_local.is_finite() {
+            bail!("compact bounds depth conversion is not finite");
+        }
+        let whole = scaled_local.floor();
+        let whole = BigInt::from_f64(whole)
+            .context("compact bounds depth conversion exceeds supported precision")?;
+        Ok(AxisPoint {
+            tile: axis.tile * factor + whole,
+            local: scaled_local - scaled_local.floor(),
+        })
+    } else {
+        let quotient = axis.tile.div_euclid(&factor);
+        let remainder = axis
+            .tile
+            .rem_euclid(&factor)
+            .to_f64()
+            .context("compact bounds depth conversion exceeds supported precision")?;
+        Ok(AxisPoint {
+            tile: quotient,
+            local: (remainder + axis.local) / scale,
+        })
+    }
+}
+
+fn depth_factor_bigint(levels: u64) -> Result<BigInt> {
+    let exponent = u32::try_from(levels).context("compact bounds depth delta is too large")?;
+    Ok(BigInt::from(DEPTH_RATIO).pow(exponent))
+}
+
+fn depth_factor_f64(levels: u64) -> Result<f64> {
+    let exponent = i32::try_from(levels).context("compact bounds depth delta is too large")?;
+    let factor = (DEPTH_RATIO as f64).powi(exponent);
+    if factor.is_finite() {
+        Ok(factor)
+    } else {
+        bail!("compact bounds depth delta is too large")
+    }
+}
+
+fn include_min(target: &mut Option<AxisPoint>, candidate: AxisPoint) {
+    if target
+        .as_ref()
+        .is_none_or(|current| axis_less(&candidate, current))
+    {
+        *target = Some(candidate);
+    }
+}
+
+fn include_max(target: &mut Option<AxisPoint>, candidate: AxisPoint) {
+    if target
+        .as_ref()
+        .is_none_or(|current| axis_less(current, &candidate))
+    {
+        *target = Some(candidate);
+    }
+}
+
+fn axis_less(left: &AxisPoint, right: &AxisPoint) -> bool {
+    left.tile < right.tile || (left.tile == right.tile && left.local < right.local)
+}
+
+fn translate_operation_by_screen_delta(
+    operation: &mut EditOperation,
+    camera_depth: i64,
+    camera_zoom: f64,
+    delta_x: f64,
+    delta_y: f64,
+) -> Result<()> {
+    if operation.is_compact_block() {
+        for source in &mut operation.compact_sources {
+            translate_operation_by_screen_delta(
+                source,
+                camera_depth,
+                camera_zoom,
+                delta_x,
+                delta_y,
+            )?;
+        }
+        recompute_compact_block_bounds(operation)?;
+        return Ok(());
+    }
+    operation.points = operation
+        .points
+        .iter()
+        .map(|point| {
+            point
+                .translated_by_screen_delta(camera_depth, camera_zoom, delta_x, delta_y)
+                .context("movement is not representable at the operation depth")
+        })
+        .collect::<Result<_>>()?;
+    Ok(())
+}
+
+fn set_operation_layer_recursive(operation: &mut EditOperation, layer_id: Uuid) {
+    operation.layer_id = layer_id;
+    for source in &mut operation.compact_sources {
+        set_operation_layer_recursive(source, layer_id);
+    }
+}
+
+fn prepare_pasted_operation(
+    operation: &mut EditOperation,
+    transaction_id: Uuid,
+    target_layer_id: Uuid,
+) {
+    refresh_compact_source_identity(operation);
+    operation.id = Uuid::new_v4();
+    operation.sequence = 0;
+    operation.paint_order = None;
+    operation.transaction_id = transaction_id;
+    operation.affects_before_sequence = None;
+    set_operation_layer_recursive(operation, target_layer_id);
+}
+
+fn refresh_compact_source_identity(operation: &mut EditOperation) {
+    for source in &mut operation.compact_sources {
+        source.id = Uuid::new_v4();
+        source.transaction_id = Uuid::new_v4();
+        source.sequence = 0;
+        source.affects_before_sequence = None;
+        refresh_compact_source_identity(source);
+    }
+}
+
+fn transform_operation_points(
+    operation: &mut EditOperation,
+    camera: &CameraAddress,
+    viewport_width: f64,
+    viewport_height: f64,
+    transform: ScreenAffine,
+    width_scale: f32,
+) -> Result<()> {
+    if operation.is_compact_block() {
+        for source in &mut operation.compact_sources {
+            transform_operation_points(
+                source,
+                camera,
+                viewport_width,
+                viewport_height,
+                transform,
+                width_scale,
+            )?;
+        }
+        recompute_compact_block_bounds(operation)?;
+        return Ok(());
+    }
+    let scaled_width = operation.width_px * width_scale;
+    if !scaled_width.is_finite() {
+        bail!("scaled operation width is not finite");
+    }
+    operation.width_px = scaled_width;
+    operation.points = operation
+        .points
+        .iter()
+        .map(|point| {
+            transform
+                .transform_canvas_point(point, camera, viewport_width, viewport_height)
+                .context("transformed point is not representable at its operation depth")
+        })
+        .collect::<Result<_>>()?;
+    Ok(())
+}
+
+fn recompute_compact_block_bounds(operation: &mut EditOperation) -> Result<()> {
+    let depth = compact_anchor_depth(&operation.compact_sources)?;
+    operation.points = compact_block_bounds(&operation.compact_sources, depth)?;
+    operation.native_depth = depth;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::CanvasDocument;
@@ -807,7 +1732,7 @@ mod tests {
     use crate::model::{Color, EditKind, EditOperation, Layer};
     use crate::tile_cache::TileKey;
     use num_bigint::BigInt;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -868,6 +1793,70 @@ mod tests {
                 .map(|operation| operation.id)
                 .collect::<Vec<_>>(),
             vec![first_id, second_id, third_id]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn append_commit_is_immediately_queryable_without_reopen() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let first = operation();
+        let first_id = first.id;
+        document.commit(first)?;
+        let second = operation();
+        let second_id = second.id;
+        document.commit(second)?;
+
+        let key = TileKey {
+            depth: 0,
+            x: 0.into(),
+            y: 0.into(),
+            lod: 0,
+        };
+        let render_ids = document
+            .render_operations_for_tiles(std::slice::from_ref(&key))
+            .into_iter()
+            .map(|operation| operation.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(render_ids, vec![first_id, second_id]);
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_order_commit_falls_back_to_sorted_render_index() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let mut first = operation();
+        first.paint_order = Some(10);
+        let first_id = first.id;
+        document.commit(first)?;
+        let mut second = operation();
+        second.paint_order = Some(0);
+        let second_id = second.id;
+        document.commit(second)?;
+
+        let key = TileKey {
+            depth: 0,
+            x: 0.into(),
+            y: 0.into(),
+            lod: 0,
+        };
+        let render_ids = document
+            .render_operations_for_tiles(std::slice::from_ref(&key))
+            .into_iter()
+            .map(|operation| operation.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(render_ids, vec![second_id, first_id]);
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id]
         );
         Ok(())
     }
@@ -1014,6 +2003,631 @@ mod tests {
     }
 
     #[test]
+    fn compact_selected_survives_reopen_and_round_trips_history() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let root = temporary.path().join("test.esketch");
+        let mut document = CanvasDocument::open(&root)?;
+        let first = operation();
+        let first_id = first.id;
+        document.commit(first)?;
+        let mut second = operation();
+        second.points[0].local_x = 0.6;
+        second.points[1].local_x = 0.8;
+        let second_id = second.id;
+        document.commit(second)?;
+
+        let block_id = document
+            .compact_operations(
+                &HashSet::from([first_id, second_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("compact block");
+        assert_eq!(document.operations().len(), 1);
+        let block = &document.operations()[0];
+        assert_eq!(block.id, block_id);
+        assert!(block.is_compact_block());
+        assert_eq!(block.compact_sources.len(), 2);
+        assert_eq!(block.points[0].tile_x, BigInt::from(0));
+        assert!(block.points[0].local_x > 0.09);
+        assert!(block.points[2].local_x < 0.81);
+
+        assert!(document.undo()?);
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<HashSet<_>>(),
+            HashSet::from([first_id, second_id])
+        );
+        assert!(document.redo()?);
+        assert_eq!(document.operations().len(), 1);
+        assert!(document.operations()[0].is_compact_block());
+        drop(document);
+
+        let document = CanvasDocument::open(&root)?;
+        assert_eq!(document.operations().len(), 1);
+        assert_eq!(document.operations()[0].id, block_id);
+        assert_eq!(document.operations()[0].compact_sources.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_block_move_transforms_snapshot_and_bounds() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let first = operation();
+        let first_id = first.id;
+        document.commit(first)?;
+        let second = operation();
+        let second_id = second.id;
+        document.commit(second)?;
+        let block_id = document
+            .compact_operations(
+                &HashSet::from([first_id, second_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("compact block");
+
+        let replacement_ids = document.move_operations(
+            &HashSet::from([block_id]),
+            0,
+            1.0,
+            512.0,
+            0.0,
+            crate::model::DEFAULT_LAYER_ID,
+        )?;
+
+        assert_eq!(replacement_ids.len(), 1);
+        let stats = document
+            .last_operation_commit_stats()
+            .expect("operation commit stats");
+        assert!(!stats.memory_replace_fallback);
+        assert_eq!(stats.memory_replace.compact_replacement_count, 1);
+        assert_eq!(stats.memory_replace.missing_render_count, 0);
+        let moved = &document.operations()[0];
+        assert!(moved.is_compact_block());
+        assert_eq!(moved.compact_sources.len(), 2);
+        assert!(
+            moved
+                .compact_sources
+                .iter()
+                .flat_map(|source| source.points.iter())
+                .all(|point| point.tile_x == BigInt::from(1))
+        );
+        assert_eq!(moved.points[0].tile_x, BigInt::from(1));
+        assert_eq!(moved.points[2].tile_x, BigInt::from(1));
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_compact_and_plain_move_uses_fast_memory_replace() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let first = operation();
+        let first_id = first.id;
+        document.commit(first)?;
+        let second = operation();
+        let second_id = second.id;
+        document.commit(second)?;
+        let block_id = document
+            .compact_operations(
+                &HashSet::from([first_id, second_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("compact block");
+        let third = operation();
+        let third_id = third.id;
+        document.commit(third)?;
+
+        let replacement_ids = document.move_operations(
+            &HashSet::from([block_id, third_id]),
+            0,
+            1.0,
+            512.0,
+            0.0,
+            crate::model::DEFAULT_LAYER_ID,
+        )?;
+
+        assert_eq!(replacement_ids.len(), 2);
+        let stats = document
+            .last_operation_commit_stats()
+            .expect("operation commit stats");
+        assert!(!stats.memory_replace_fallback);
+        assert_eq!(stats.memory_replace.replacement_count, 2);
+        assert_eq!(stats.memory_replace.compact_replacement_count, 1);
+        assert_eq!(stats.memory_replace.missing_operation_count, 0);
+        assert_eq!(stats.memory_replace.missing_render_count, 0);
+        let key = TileKey {
+            depth: 0,
+            x: BigInt::from(1),
+            y: BigInt::from(0),
+            lod: 0,
+        };
+        assert!(
+            document
+                .render_operations_for_tiles(std::slice::from_ref(&key))
+                .len()
+                >= 3
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_block_transform_scales_snapshot_width_and_bounds() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let first = operation();
+        let first_id = first.id;
+        document.commit(first)?;
+        let second = operation();
+        let second_id = second.id;
+        document.commit(second)?;
+        let block_id = document
+            .compact_operations(
+                &HashSet::from([first_id, second_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("compact block");
+        let transform = ScreenAffine::uniform_scale(0.0, 0.0, 2.0).expect("valid scale");
+
+        let replacement_ids = document.transform_operations(
+            &HashSet::from([block_id]),
+            &CameraAddress::default(),
+            512.0,
+            512.0,
+            transform,
+            2.0,
+            crate::model::DEFAULT_LAYER_ID,
+        )?;
+
+        assert_eq!(replacement_ids.len(), 1);
+        let scaled = &document.operations()[0];
+        assert!(scaled.is_compact_block());
+        assert!(
+            scaled
+                .compact_sources
+                .iter()
+                .all(|source| (source.width_px - 10.0).abs() < f32::EPSILON)
+        );
+        assert!(scaled.points[2].local_x > 0.6);
+        assert!(scaled.points[2].local_y > 0.8);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_selected_flattens_existing_compact_blocks() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let first = operation();
+        let first_id = first.id;
+        document.commit(first)?;
+        let second = operation();
+        let second_id = second.id;
+        document.commit(second)?;
+        let block_id = document
+            .compact_operations(
+                &HashSet::from([first_id, second_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("compact block");
+        let third = operation();
+        let third_id = third.id;
+        document.commit(third)?;
+
+        let merged_id = document
+            .compact_operations(
+                &HashSet::from([block_id, third_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("merged compact block");
+
+        assert_eq!(document.operations().len(), 1);
+        let merged = &document.operations()[0];
+        assert_eq!(merged.id, merged_id);
+        assert!(merged.is_compact_block());
+        assert_eq!(merged.compact_sources.len(), 3);
+        assert!(
+            merged
+                .compact_sources
+                .iter()
+                .all(|source| !source.is_compact_block())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_selected_merges_two_existing_compact_blocks() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let first = operation();
+        let first_id = first.id;
+        document.commit(first)?;
+        let second = operation();
+        let second_id = second.id;
+        document.commit(second)?;
+        let first_block_id = document
+            .compact_operations(
+                &HashSet::from([first_id, second_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("first compact block");
+        let mut third = operation();
+        third.points[0].tile_x = BigInt::from(5);
+        third.points[1].tile_x = BigInt::from(5);
+        let third_id = third.id;
+        document.commit(third)?;
+        let mut fourth = operation();
+        fourth.points[0].tile_x = BigInt::from(6);
+        fourth.points[1].tile_x = BigInt::from(6);
+        let fourth_id = fourth.id;
+        document.commit(fourth)?;
+        let second_block_id = document
+            .compact_operations(
+                &HashSet::from([third_id, fourth_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("second compact block");
+
+        let merged_id = document
+            .compact_operations(
+                &HashSet::from([first_block_id, second_block_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("merged compact block");
+
+        assert_eq!(document.operations().len(), 1);
+        let merged = &document.operations()[0];
+        assert_eq!(merged.id, merged_id);
+        assert!(merged.is_compact_block());
+        assert_eq!(merged.compact_sources.len(), 4);
+        assert!(
+            merged
+                .compact_sources
+                .iter()
+                .all(|source| !source.is_compact_block())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_block_paste_translates_snapshot_and_bounds() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let first = operation();
+        let first_id = first.id;
+        document.commit(first)?;
+        let second = operation();
+        let second_id = second.id;
+        document.commit(second)?;
+        let block_id = document
+            .compact_operations(
+                &HashSet::from([first_id, second_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("compact block");
+        let block = document
+            .operations()
+            .iter()
+            .find(|operation| operation.id == block_id)
+            .cloned()
+            .expect("active block");
+
+        let pasted_ids = document.paste_operations(
+            &[block],
+            crate::model::DEFAULT_LAYER_ID,
+            0,
+            1.0,
+            512.0,
+            0.0,
+        )?;
+
+        assert_eq!(pasted_ids.len(), 1);
+        let pasted = document
+            .operations()
+            .iter()
+            .find(|operation| operation.id == pasted_ids[0])
+            .expect("pasted block");
+        assert!(pasted.is_compact_block());
+        assert_eq!(pasted.compact_sources.len(), 2);
+        assert!(
+            pasted
+                .compact_sources
+                .iter()
+                .flat_map(|source| source.points.iter())
+                .all(|point| point.tile_x == BigInt::from(1))
+        );
+        assert_eq!(pasted.points[0].tile_x, BigInt::from(1));
+        assert_eq!(pasted.points[2].tile_x, BigInt::from(1));
+        Ok(())
+    }
+
+    #[test]
+    fn compact_block_move_to_layer_updates_snapshot_layers() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let first = operation();
+        let first_id = first.id;
+        document.commit(first)?;
+        let second = operation();
+        let second_id = second.id;
+        document.commit(second)?;
+        let block_id = document
+            .compact_operations(
+                &HashSet::from([first_id, second_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("compact block");
+        let target_layer = document.create_layer("Target")?;
+
+        let replacement_ids = document.move_operations_to_layer(
+            &HashSet::from([block_id]),
+            crate::model::DEFAULT_LAYER_ID,
+            target_layer.id,
+        )?;
+
+        assert_eq!(replacement_ids.len(), 1);
+        let moved = document
+            .operations()
+            .iter()
+            .find(|operation| operation.id == replacement_ids[0])
+            .expect("moved block");
+        assert!(moved.is_compact_block());
+        assert_eq!(moved.layer_id, target_layer.id);
+        assert!(
+            moved
+                .compact_sources
+                .iter()
+                .all(|source| source.layer_id == target_layer.id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_selected_allows_disjoint_non_contiguous_objects() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let first = operation();
+        let first_id = first.id;
+        document.commit(first)?;
+        let mut middle = operation();
+        middle.points[0].tile_x = BigInt::from(5);
+        middle.points[1].tile_x = BigInt::from(5);
+        let middle_id = middle.id;
+        document.commit(middle)?;
+        let mut third = operation();
+        third.points[0].tile_x = BigInt::from(10);
+        third.points[1].tile_x = BigInt::from(10);
+        let third_id = third.id;
+        document.commit(third)?;
+
+        let block_id = document
+            .compact_operations(
+                &HashSet::from([first_id, third_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("compact block");
+
+        assert_eq!(document.operations().len(), 2);
+        let block = document
+            .operations()
+            .iter()
+            .find(|operation| operation.id == block_id)
+            .expect("compact block remains active");
+        assert!(block.is_compact_block());
+        assert_eq!(block.compact_sources.len(), 2);
+        assert_eq!(block.points[0].tile_x, BigInt::from(0));
+        assert_eq!(block.points[2].tile_x, BigInt::from(10));
+        assert!(
+            document
+                .operations()
+                .iter()
+                .any(|operation| operation.id == middle_id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_selected_allows_mixed_geometry_depths() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let coarse = operation();
+        let coarse_id = coarse.id;
+        document.commit(coarse)?;
+        let mut fine = operation();
+        fine.native_depth = 1;
+        fine.points = vec![
+            CanvasPoint::new(1, BigInt::from(16), BigInt::from(0), 0.1, 0.2),
+            CanvasPoint::new(1, BigInt::from(16), BigInt::from(0), 0.3, 0.4),
+        ];
+        let fine_id = fine.id;
+        document.commit(fine)?;
+
+        let block_id = document
+            .compact_operations(
+                &HashSet::from([coarse_id, fine_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("compact block");
+
+        assert_eq!(document.operations().len(), 1);
+        let block = &document.operations()[0];
+        assert_eq!(block.id, block_id);
+        assert!(block.is_compact_block());
+        assert_eq!(block.native_depth, 0);
+        assert_eq!(block.compact_sources.len(), 2);
+        assert!(block.compact_sources.iter().any(|source| {
+            source
+                .points
+                .iter()
+                .all(|point| point.depth == 1 && point.tile_x == BigInt::from(16))
+        }));
+        assert_eq!(block.points[0].depth, 0);
+        assert_eq!(block.points[2].depth, 0);
+        assert_eq!(block.points[2].tile_x, BigInt::from(2));
+        Ok(())
+    }
+
+    #[test]
+    fn compact_older_operations_keeps_latest_objects_editable() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            let mut source = operation();
+            source.points[0].tile_x = BigInt::from(index);
+            source.points[1].tile_x = BigInt::from(index);
+            ids.push(source.id);
+            document.commit(source)?;
+        }
+
+        let compacted = document.compact_older_operations(2)?;
+
+        assert_eq!(compacted, 1);
+        assert_eq!(document.operations().len(), 3);
+        assert!(
+            document
+                .operations()
+                .iter()
+                .any(|operation| operation.id == ids[3])
+        );
+        assert!(
+            document
+                .operations()
+                .iter()
+                .any(|operation| operation.id == ids[4])
+        );
+        let block = document
+            .operations()
+            .iter()
+            .find(|operation| operation.is_compact_block())
+            .expect("older objects compacted");
+        assert_eq!(block.compact_sources.len(), 3);
+        assert!(
+            block
+                .compact_sources
+                .iter()
+                .all(|source| ids[..3].contains(&source.id))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_older_operations_splits_unrepresentable_depth_ranges() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        for depth in [0, 0, 1_000, 1_000, 2_000, 2_000, 3_000] {
+            let mut source = operation();
+            source.native_depth = depth;
+            source.points = vec![
+                CanvasPoint::new(depth, BigInt::from(0), BigInt::from(0), 0.1, 0.2),
+                CanvasPoint::new(depth, BigInt::from(0), BigInt::from(0), 0.3, 0.4),
+            ];
+            document.commit(source)?;
+        }
+
+        let compacted = document.compact_older_operations(1)?;
+
+        assert_eq!(compacted, 3);
+        assert_eq!(document.operations().len(), 4);
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .filter(|operation| operation.is_compact_block())
+                .count(),
+            3
+        );
+        assert!(
+            document
+                .operations()
+                .iter()
+                .filter(|operation| operation.is_compact_block())
+                .all(|operation| operation.compact_sources.len() == 2)
+        );
+        assert!(
+            document
+                .operations()
+                .iter()
+                .any(|operation| !operation.is_compact_block() && operation.native_depth == 3_000)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_older_operations_preserves_interleaved_depth_order() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let mut ids_by_depth = Vec::new();
+        for depth in [0, 1, 0, 1, 0] {
+            let mut source = operation();
+            source.native_depth = depth;
+            source.points = vec![
+                CanvasPoint::new(depth, BigInt::from(0), BigInt::from(0), 0.1, 0.2),
+                CanvasPoint::new(depth, BigInt::from(0), BigInt::from(0), 0.3, 0.4),
+            ];
+            ids_by_depth.push((source.id, depth));
+            document.commit(source)?;
+        }
+
+        let compacted = document.compact_older_operations(1)?;
+
+        assert_eq!(compacted, 0);
+        assert_eq!(document.operations().len(), 5);
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| (operation.id, operation.native_depth))
+                .collect::<Vec<_>>(),
+            ids_by_depth
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn render_operations_expand_compact_blocks_into_global_paint_order() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let bottom = operation();
+        let bottom_id = bottom.id;
+        document.commit(bottom)?;
+        let middle = operation();
+        let middle_id = middle.id;
+        document.commit(middle)?;
+        let top = operation();
+        let top_id = top.id;
+        document.commit(top)?;
+
+        document.compact_operations(
+            &HashSet::from([bottom_id, top_id]),
+            crate::model::DEFAULT_LAYER_ID,
+        )?;
+        let key = TileKey {
+            depth: 0,
+            x: 0.into(),
+            y: 0.into(),
+            lod: 0,
+        };
+
+        let render_ids = document
+            .render_operations_for_tiles(std::slice::from_ref(&key))
+            .into_iter()
+            .map(|operation| operation.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(render_ids, vec![bottom_id, middle_id, top_id]);
+        assert_eq!(document.operations().len(), 2);
+        assert!(
+            document
+                .operations()
+                .iter()
+                .any(|operation| operation.is_compact_block())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn selected_move_is_one_persisted_history_transaction() -> anyhow::Result<()> {
         let temporary = TempDir::new()?;
         let root = temporary.path().join("test.esketch");
@@ -1142,6 +2756,292 @@ mod tests {
         assert!(document.redo()?);
         assert_eq!(document.operations()[0].id, replacement_ids[0]);
         assert_eq!(document.operations()[0].width_px, 10.0);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_rotate_is_one_persisted_history_transaction() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let root = temporary.path().join("test.esketch");
+        let mut document = CanvasDocument::open(&root)?;
+        let source = operation();
+        let source_id = source.id;
+        let source_points = source.points.clone();
+        document.commit(source)?;
+        let camera = CameraAddress::default();
+        let before: Vec<_> = source_points
+            .iter()
+            .map(|point| {
+                camera
+                    .canvas_to_screen(point, 512.0, 512.0)
+                    .expect("source projects")
+            })
+            .collect();
+        let transform = ScreenAffine::rotation(256.0, 256.0, std::f64::consts::FRAC_PI_2)
+            .expect("valid rotate");
+
+        let replacement_ids = document.transform_operations(
+            &HashSet::from([source_id]),
+            &camera,
+            512.0,
+            512.0,
+            transform,
+            1.0,
+            crate::model::DEFAULT_LAYER_ID,
+        )?;
+
+        assert_eq!(replacement_ids.len(), 1);
+        assert_eq!(document.max_sequence(), 3);
+        assert_eq!(document.revision(), 2);
+        let replacement = &document.operations()[0];
+        assert_eq!(replacement.id, replacement_ids[0]);
+        assert_eq!(replacement.width_px, 5.0);
+        for (point, before) in replacement.points.iter().zip(before) {
+            let after = camera
+                .canvas_to_screen(point, 512.0, 512.0)
+                .expect("replacement projects");
+            assert!((after.0 - (256.0 - (before.1 - 256.0))).abs() < 0.001);
+            assert!((after.1 - (256.0 + (before.0 - 256.0))).abs() < 0.001);
+        }
+        drop(document);
+
+        let mut document = CanvasDocument::open(&root)?;
+        assert_eq!(document.operations()[0].id, replacement_ids[0]);
+        assert!(document.undo()?);
+        assert_eq!(document.operations()[0].id, source_id);
+        assert!(document.redo()?);
+        assert_eq!(document.operations()[0].id, replacement_ids[0]);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_flip_mirrors_screen_geometry_without_scaling_width() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let source = operation();
+        let source_id = source.id;
+        let source_points = source.points.clone();
+        document.commit(source)?;
+        let camera = CameraAddress::default();
+        let before: Vec<_> = source_points
+            .iter()
+            .map(|point| {
+                camera
+                    .canvas_to_screen(point, 512.0, 512.0)
+                    .expect("source projects")
+            })
+            .collect();
+
+        let horizontal = ScreenAffine::flip_horizontal(256.0, 256.0).expect("valid flip");
+        let replacement_ids = document.transform_operations(
+            &HashSet::from([source_id]),
+            &camera,
+            512.0,
+            512.0,
+            horizontal,
+            1.0,
+            crate::model::DEFAULT_LAYER_ID,
+        )?;
+        assert_eq!(document.operations()[0].width_px, 5.0);
+        for (point, before) in document.operations()[0].points.iter().zip(&before) {
+            let after = camera
+                .canvas_to_screen(point, 512.0, 512.0)
+                .expect("replacement projects");
+            assert!((after.0 - (512.0 - before.0)).abs() < 0.001);
+            assert!((after.1 - before.1).abs() < 0.001);
+        }
+
+        assert!(document.undo()?);
+        let vertical = ScreenAffine::flip_vertical(256.0, 256.0).expect("valid flip");
+        document.transform_operations(
+            &HashSet::from([source_id]),
+            &camera,
+            512.0,
+            512.0,
+            vertical,
+            1.0,
+            crate::model::DEFAULT_LAYER_ID,
+        )?;
+        assert!(
+            !document
+                .operations()
+                .iter()
+                .any(|operation| { replacement_ids.contains(&operation.id) })
+        );
+        assert_eq!(document.operations()[0].width_px, 5.0);
+        for (point, before) in document.operations()[0].points.iter().zip(&before) {
+            let after = camera
+                .canvas_to_screen(point, 512.0, 512.0)
+                .expect("replacement projects");
+            assert!((after.0 - before.0).abs() < 0.001);
+            assert!((after.1 - (512.0 - before.1)).abs() < 0.001);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selected_recolor_replaces_only_paint_and_fill() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let root = temporary.path().join("test.esketch");
+        let mut document = CanvasDocument::open(&root)?;
+        let old_color = Color::rgba(10, 20, 30, 128);
+        let new_color = Color::rgba(200, 40, 90, 160);
+        let mut selected = HashSet::new();
+        let mut original_ids = Vec::new();
+        for kind in [
+            EditKind::Paint,
+            EditKind::Fill,
+            EditKind::Erase,
+            EditKind::EraseArea,
+        ] {
+            let operation = EditOperation::draft(kind, 0, 1.0, operation().points, old_color, 7.0);
+            selected.insert(operation.id);
+            original_ids.push((kind, operation.id, operation.points.clone()));
+            document.commit(operation)?;
+        }
+        let original_orders = document
+            .operations()
+            .iter()
+            .map(|operation| (operation.id, operation.effective_paint_order()))
+            .collect::<HashMap<_, _>>();
+
+        let replacements =
+            document.recolor_operations(&selected, crate::model::DEFAULT_LAYER_ID, new_color)?;
+
+        assert_eq!(replacements.len(), 2);
+        assert_eq!(document.revision(), 5);
+        assert_eq!(document.max_sequence(), 7);
+        let replacement_map = replacements.iter().copied().collect::<HashMap<_, _>>();
+        for (kind, original_id, original_points) in &original_ids {
+            let expected_id = replacement_map
+                .get(original_id)
+                .copied()
+                .unwrap_or(*original_id);
+            let operation = document
+                .operations()
+                .iter()
+                .find(|operation| operation.id == expected_id)
+                .expect("operation remains active");
+            assert_eq!(operation.kind, *kind);
+            assert_eq!(&operation.points, original_points);
+            assert_eq!(operation.width_px, 7.0);
+            assert_eq!(operation.layer_id, crate::model::DEFAULT_LAYER_ID);
+            match kind {
+                EditKind::Paint | EditKind::Fill => {
+                    assert_ne!(operation.id, *original_id);
+                    assert_eq!(operation.color, Color::rgba(200, 40, 90, 255));
+                    assert_eq!(
+                        operation.effective_paint_order(),
+                        original_orders[original_id]
+                    );
+                    assert!(operation.destructive);
+                }
+                EditKind::Erase | EditKind::EraseArea => {
+                    assert_eq!(operation.id, *original_id);
+                    assert_eq!(operation.color, old_color);
+                }
+                EditKind::CompactBlock => unreachable!("test does not create compact blocks"),
+            }
+        }
+        drop(document);
+
+        let mut document = CanvasDocument::open(&root)?;
+        assert!(replacements.iter().all(|(_, replacement_id)| {
+            document
+                .operations()
+                .iter()
+                .any(|operation| operation.id == *replacement_id)
+        }));
+        assert!(document.undo()?);
+        assert!(original_ids.iter().all(|(_, original_id, _)| {
+            document
+                .operations()
+                .iter()
+                .any(|operation| operation.id == *original_id)
+        }));
+        assert!(document.redo()?);
+        assert!(replacements.iter().all(|(_, replacement_id)| {
+            document
+                .operations()
+                .iter()
+                .any(|operation| operation.id == *replacement_id)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_recolor_rejects_invalid_selection_without_partial_commit() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let source = operation();
+        let source_id = source.id;
+        document.commit(source)?;
+        let other_layer = document.create_layer("Other")?;
+        let mut other = operation();
+        other.layer_id = other_layer.id;
+        let other_id = other.id;
+        document.commit(other)?;
+        let color = Color::rgba(200, 40, 90, 255);
+
+        let error = document
+            .recolor_operations(
+                &HashSet::from([source_id, other_id]),
+                crate::model::DEFAULT_LAYER_ID,
+                color,
+            )
+            .expect_err("mixed layer selection is rejected");
+        assert!(error.to_string().contains("unavailable"));
+        assert_eq!(document.revision(), 2);
+        assert_eq!(document.operations()[0].id, source_id);
+
+        let error = document
+            .recolor_operations(
+                &HashSet::from([source_id, Uuid::new_v4()]),
+                crate::model::DEFAULT_LAYER_ID,
+                color,
+            )
+            .expect_err("stale selection is rejected");
+        assert!(error.to_string().contains("unavailable"));
+        assert_eq!(document.revision(), 2);
+
+        assert!(document.set_layer_locked(crate::model::DEFAULT_LAYER_ID, true)?);
+        let error = document
+            .recolor_operations(
+                &HashSet::from([source_id]),
+                crate::model::DEFAULT_LAYER_ID,
+                color,
+            )
+            .expect_err("locked layer is rejected");
+        assert!(error.to_string().contains("hidden or locked"));
+        assert_eq!(document.revision(), 2);
+        assert_eq!(document.operations()[0].id, source_id);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_recolor_ignores_erase_only_selection_without_history() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let erase = EditOperation::draft(
+            EditKind::Erase,
+            0,
+            1.0,
+            operation().points,
+            Color::WHITE,
+            7.0,
+        );
+        let erase_id = erase.id;
+        document.commit(erase)?;
+
+        let replacements = document.recolor_operations(
+            &HashSet::from([erase_id]),
+            crate::model::DEFAULT_LAYER_ID,
+            Color::rgba(200, 40, 90, 255),
+        )?;
+
+        assert!(replacements.is_empty());
+        assert_eq!(document.revision(), 1);
+        assert_eq!(document.operations()[0].id, erase_id);
         Ok(())
     }
 
