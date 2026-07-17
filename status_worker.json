@@ -446,9 +446,9 @@
                              "execution_result":  "Implemented: ordinary saved no-tile fallback operations now use operation_may_intersect_screen_rect before ProjectedGeometryCache::project_operation, so definitely offscreen operations are skipped before point projection. CompactBlock handling and draft painting are unchanged. Early screen-cull skips are included in fallback_skipped_operations. .esketch, saved operations, history, SQLite, raster tiles, tile cache identity, settings, presets, selection, and input behavior are unchanged."
                          },
     "recommended_next_action":  {
-                                    "type":  "commit_or_publish",
+                                    "type":  "continue_optimization",
                                     "target":  "Working tree and portable release artifacts",
-                                    "intent":  "Commit tracked source/docs/release changes plus src/session_log.rs and the refreshed portable zip; keep local runtime data and stale 7z archives out of the commit; push branch Rust to origin."
+                                    "intent":  "The verified optimization/README checkpoint has been pushed to origin/Rust. Continue with the next bounded general optimization checkpoint when requested."
                                 },
     "latest_check":  {
                          "updated_at_utc":  "2026-07-17T03:55:00Z",
@@ -467,7 +467,8 @@
                                        "User manually confirmed the latest checkpoint works.",
                                        "Portable executable refreshed without needing to close a running process.",
                                        "GitHub preparation: README.md was rewritten as a concise bilingual Russian/English project front page covering overview, main features, controls, settings, data safety, and build commands.",
-                                       "GitHub preparation: release/EndlessSketch-Rust/EndlessSketch-Rust.zip was refreshed from the latest exe/help contents with SHA-256 66445DF005A06CE6D98B39FFCF59D94C364022292EC791E741E7C1931E98CCB5. 7z was not refreshed because 7z is not available in PATH; local runtime data and stale archives should stay out of the commit unless explicitly requested."
+                                       "GitHub preparation: release/EndlessSketch-Rust/EndlessSketch-Rust.zip was refreshed from the latest exe/help contents with SHA-256 66445DF005A06CE6D98B39FFCF59D94C364022292EC791E741E7C1931E98CCB5. 7z was not refreshed because 7z is not available in PATH; local runtime data and stale archives should stay out of the commit unless explicitly requested.",
+                                       "Published to GitHub: after rebasing over origin/Rust through remote commit 3d28b13, commit c2faebb (Optimize dense fallback rendering and update README) was pushed to origin/Rust."
                                    ]
                      },
     "test_file_statuses":  {
@@ -478,6 +479,7 @@
                                "release_build":  "Passed cargo build --release; portable executable refreshed with SHA-256 0FF1665996E8BBA762742D81CB86250EDD3F0853567414AE9027A7FBF658A4CF.",
                                "portable_zip":  "release/EndlessSketch-Rust/EndlessSketch-Rust.zip refreshed from endless-sketch.exe and help/, SHA-256 66445DF005A06CE6D98B39FFCF59D94C364022292EC791E741E7C1931E98CCB5. Existing 7z archives were not refreshed because 7z is unavailable in PATH.",
                                "readme":  "README.md rewritten in UTF-8 as a bilingual Russian/English GitHub front page with overview, feature list, controls, settings/data notes, and build/check commands.",
+                               "github_push":  "Pushed commit c2faebb to origin/Rust after resolving rebase conflicts in favor of the verified local checkpoint. Local untracked desktop-shot.png, release/EndlessSketch-Rust/local/, local.7z, and stale EndlessSketch-Rust-1.7z were not committed.",
                                "gui_smoke":  "User manually confirmed the saved fallback screen-cull checkpoint works; no additional GUI smoke was run by the agent.",
                                "million_stroke_stress":  "Passed at radius 1000 across 2001 depth bands: about 275ms generation, 1.33s indexing, 3.02s for 147 individual tile queries, and 1.65s for three batched viewport queries."
                            }
