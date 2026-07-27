@@ -13,7 +13,7 @@
         },
         {
           "name": "Ластик (E)",
-          "description": "В векторном режиме вычитает штрих из существующих линий Paint активного visible/unlocked слоя в пределах Depth capture. Цели фиксируются при нажатии, пустой жест не создаёт историю, одно Undo восстанавливает весь результат. Размер общий с кистью; Fill и CompactBlock пока не затрагиваются."
+          "description": "Удаляет более старое содержимое под штрихом. Размер общий с кистью."
         },
         {
           "name": "Area Fill (L / X)",
@@ -29,7 +29,7 @@
         },
         {
           "name": "Area Fill / Erase (X)",
-          "description": "Нажмите X один раз, чтобы активировать Area Fill, затем нажимайте X повторно для цикла Area Fill и Area Erase. В векторном режиме Area Erase вычитает замкнутую область из существующих линий Paint активного visible/unlocked слоя в пределах Depth capture. Цели фиксируются при нажатии; пустая область не создаёт историю, одно Undo восстанавливает весь результат. Fill и CompactBlock пока не затрагиваются. Неполный контур можно отменить клавишей Esc."
+          "description": "Нажмите X один раз, чтобы активировать Area Fill, затем нажимайте X повторно для цикла Area Fill и Area Erase. Area Erase обводит область, которую нужно стереть. Неполный контур можно отменить клавишей Esc."
         },
         {
           "name": "Прямая линия",
@@ -176,10 +176,6 @@
           "description": "Новые объекты создаются только в активном слое. Выделение объектов также ищет только в нём."
         },
         {
-          "name": "Захват глубины",
-          "description": "Depth capture ±N в окне Layers ограничивает Object Selection полным native-depth диапазоном вокруг текущей глубины камеры. Auto по умолчанию включён и следует за Vector depth radius. При выключенном Auto ручной радиус не может превысить векторный. Mixed-depth CompactBlock выбирается только целиком; изменение эффективного радиуса или переход через границу depth очищает текущее Object Selection."
-        },
-        {
           "name": "Видимость и блокировка",
           "description": "Первый флажок скрывает слой, второй запрещает его редактирование. Скрытый или заблокированный активный слой не принимает рисование и выделение."
         },
@@ -210,7 +206,7 @@
       "items": [
         {
           "name": "Profile",
-          "description": "Performance, Balanced и Quality одновременно меняют основные параметры скорости/качества, включая Vector depth radius (1/2/4). При включённом Depth capture Auto эффективный радиус следует за ним; при выключенном Auto ручной радиус остаётся независимым в пределах векторного. Custom появляется после изменения управляемого поля. Distant tiles, сам Auto, ручной Pause tile generation, Cache size, Display, logging и Keep latest objects профилем не меняются."
+          "description": "Performance, Balanced и Quality одновременно меняют почти все параметры скорости/качества: input spacing, fallback limits, Stroke fallback joins, Saved fallback ops, zoom settle, tile workers/resolution, auto-pause while drawing, deferred preview, rebuild policy, prefetch, edge quality, smoothing, PNG compression, Storage commit и Preview FPS. Custom появляется после ручного изменения любого управляемого поля. Ручной Pause tile generation, Cache size, Display, logging и Keep latest objects профилем не меняются."
         },
         {
           "name": "Brush input px",
@@ -245,20 +241,12 @@
           "description": "Число фоновых потоков генерации тайлов. Больше потоков быстрее перестраивают изображение на мощном CPU, но сильнее отнимают ресурсы у интерфейса и других программ."
         },
         {
-          "name": "Distant tiles",
-          "description": "Использует прежний whole-scene PNG-тайл, когда непустой viewport не содержит nearby editable operation активного visible/unlocked слоя. Другие видимые слои входят в тайл, но не удерживают векторный режим. Пустой viewport не создаёт tile jobs. В distant_tile Selection, Eraser и Area Erase read-only; Brush и Fill доступны и после commit возвращают векторный режим."
-        },
-        {
-          "name": "Vector depth radius",
-          "description": "Радиус ±N относительно глубины камеры для векторного отображения. Если полный native-depth span editable operation активного visible/unlocked слоя помещается в радиус, весь viewport работает как vectors_near без подмешивания PNG. CompactBlock остаётся атомарным. Диапазон 0–32, по умолчанию ±2. Performance/Balanced/Quality ставят 1/2/4."
-        },
-        {
           "name": "Tile resolution",
           "description": "Физический размер PNG каждого тайла. 64–256 px быстрее и экономнее, но заметнее пиксели. 512 px — стандартный баланс. 1024–2048 px дают больше деталей, но требуют больше CPU, памяти, диска и времени загрузки."
         },
         {
           "name": "Pause tile generation",
-          "description": "Полностью останавливает создание новых PNG-тайлов. Рисование, сохранение векторов, Undo/Redo и резервные копии продолжают работать. Дальний режим использует vector fallback, а близкий всегда остаётся векторным."
+          "description": "Полностью останавливает создание новых PNG-тайлов. Рисование, сохранение векторов, Undo/Redo и резервные копии продолжают работать. На холсте остаётся векторное отображение и уже готовые тайлы."
         },
         {
           "name": "Pause tile generation while drawing",
