@@ -166,3 +166,6 @@ cython_debug/
 *.esketch/
 *.esketch
 target/
+
+AGENTS.md
+status_worker.json
