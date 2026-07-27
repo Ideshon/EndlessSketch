@@ -67,8 +67,10 @@ asks to remove or update it.
 - Important paths: `Cargo.toml`, `src/app.rs`, `src/coords.rs`,
   `src/storage.rs`, `src/raster.rs`, `README.md`,
   `docs/project-implementation-plan.md`.
-- Branch context: local branch `Rust` tracks `origin/Rust`; both currently point
-  to commit `5c41662` before publication of the working checkpoints below.
+- Branch context: feature commit `42b6a6e` is published on
+  `agent/depth-tiles-vector-eraser` in draft PR
+  `https://github.com/Ideshon/EndlessSketch/pull/19`, targeting default branch
+  `Rust` at `5c41662`.
 
 ## Validated product baseline
 
@@ -135,7 +137,8 @@ The detailed completed-checkpoint history lives in
   multi-layer checkpoints in `docs/project-implementation-plan.md`.
 - Publication status: GitHub authentication was verified through the Windows
   keyring; the completed scope is published from
-  `agent/depth-tiles-vector-eraser` toward default branch `Rust` as a draft PR.
+  `agent/depth-tiles-vector-eraser` toward default branch `Rust` as draft PR
+  `#19`.
 - Intended Git scope: all tracked implementation/documentation/portable changes
   plus new `AGENTS.md`, excluding protected `status_worker.json`,
   `desktop-shot.png`, `.7z` archives, and `release/EndlessSketch-Rust/local/`.
