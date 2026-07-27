@@ -12,6 +12,7 @@ use num_traits::{Euclid, FromPrimitive, ToPrimitive};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -49,6 +50,13 @@ pub struct MemoryReplaceStats {
     pub total_ms: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibleDepthMode {
+    Empty,
+    Near,
+    Distant,
+}
+
 enum RenderReplacementPlan {
     Single(usize),
     CompactSources(Vec<usize>),
@@ -57,7 +65,7 @@ enum RenderReplacementPlan {
 pub struct CanvasDocument {
     store: CanvasStore,
     operations: Vec<EditOperation>,
-    render_operations: Vec<EditOperation>,
+    render_operations: Vec<Arc<EditOperation>>,
     layers: Vec<Layer>,
     revision: u64,
     max_sequence: i64,
@@ -74,6 +82,7 @@ impl CanvasDocument {
         let index = OperationIndex::build(&operations);
         let render_operations = build_render_operations(&operations);
         let render_index = OperationIndex::build(&render_operations);
+        let render_operations = render_operations.into_iter().map(Arc::new).collect();
         let revision = store.content_revision()?;
         let max_sequence = store.active_max_sequence()?;
         Ok(Self {
@@ -140,29 +149,24 @@ impl CanvasDocument {
     }
 
     pub fn render_operations_for_tiles(&self, keys: &[TileKey]) -> Vec<EditOperation> {
-        let visible_layers = self.visible_layer_ids();
-        let mut operations: Vec<_> = self
-            .render_index
-            .query_many(keys)
+        self.render_operation_indices_for_tiles(keys)
             .into_iter()
-            .filter_map(|index| self.render_operations.get(index).cloned())
-            .filter(|operation| visible_layers.contains(&operation.layer_id))
-            .collect();
-        self.sort_operations_for_render(&mut operations);
-        operations
+            .filter_map(|index| self.render_operations.get(index))
+            .map(|operation| operation.as_ref().clone())
+            .collect()
     }
 
-    pub fn operation_indices_for_tiles(&self, keys: &[TileKey]) -> Vec<usize> {
-        let mut indices = self.index.query_many(keys);
+    pub fn render_operation_indices_for_tiles(&self, keys: &[TileKey]) -> Vec<usize> {
+        let mut indices = self.render_index.query_many(keys);
         let visible_layers = self.visible_layer_ids();
         indices.retain(|index| {
-            self.operations
+            self.render_operations
                 .get(*index)
                 .is_some_and(|operation| visible_layers.contains(&operation.layer_id))
         });
         let layer_orders = self.layer_orders();
         indices.sort_by_key(|index| {
-            self.operations
+            self.render_operations
                 .get(*index)
                 .map_or((i64::MIN, i64::MIN, i64::MIN), |operation| {
                     (
@@ -178,19 +182,86 @@ impl CanvasDocument {
         indices
     }
 
-    pub fn operation_ids_for_tiles(&self, keys: &[TileKey]) -> Vec<Uuid> {
-        self.index.query_many_ids(keys)
+    pub fn render_operations_by_indices(&self, indices: &[usize]) -> Vec<Arc<EditOperation>> {
+        indices
+            .iter()
+            .filter_map(|index| self.render_operations.get(*index).cloned())
+            .collect()
     }
 
-    pub fn operation_ids_for_tiles_in_layers(
+    pub fn editable_operation_ids_for_tiles(
         &self,
         keys: &[TileKey],
-        eligible_layers: &HashSet<Uuid>,
+        active_layer_id: Uuid,
+        camera_depth: i64,
+        depth_radius: i64,
     ) -> Vec<Uuid> {
-        self.index.query_many_ids_in_layers(keys, eligible_layers)
+        if !self.layer_is_editable(active_layer_id) {
+            return Vec::new();
+        }
+        let depth_radius = depth_radius.max(0);
+        let min_depth = camera_depth.saturating_sub(depth_radius);
+        let max_depth = camera_depth.saturating_add(depth_radius);
+        self.index
+            .query_many(keys)
+            .into_iter()
+            .filter_map(|index| self.operations.get(index))
+            .filter(|operation| operation.layer_id == active_layer_id)
+            .filter(|operation| {
+                operation_depth_span(operation)
+                    .is_some_and(|(min, max)| min >= min_depth && max <= max_depth)
+            })
+            .map(|operation| operation.id)
+            .collect()
+    }
+
+    pub fn visible_depth_mode_for_tiles(
+        &self,
+        keys: &[TileKey],
+        active_layer_id: Uuid,
+        camera_depth: i64,
+        depth_radius: i64,
+    ) -> VisibleDepthMode {
+        let depth_radius = depth_radius.max(0);
+        let min_depth = camera_depth.saturating_sub(depth_radius);
+        let max_depth = camera_depth.saturating_add(depth_radius);
+        if self.layer_is_editable(active_layer_id)
+            && self
+                .index
+                .query_many(keys)
+                .into_iter()
+                .filter_map(|index| self.operations.get(index))
+                .any(|operation| {
+                    operation.layer_id == active_layer_id
+                        && operation_depth_span(operation)
+                            .is_some_and(|(min, max)| min >= min_depth && max <= max_depth)
+                })
+        {
+            return VisibleDepthMode::Near;
+        }
+
+        let visible_layers = self.visible_layer_ids();
+        let mut has_visible_content = false;
+        for index in self.render_index.query_many(keys) {
+            let Some(operation) = self.render_operations.get(index) else {
+                continue;
+            };
+            if !visible_layers.contains(&operation.layer_id) {
+                continue;
+            }
+            has_visible_content = true;
+        }
+        if has_visible_content {
+            VisibleDepthMode::Distant
+        } else {
+            VisibleDepthMode::Empty
+        }
     }
 
     pub fn save_draft(&self, operation: &EditOperation) -> Result<()> {
+        if operation.kind == EditKind::Erase {
+            return Ok(());
+        }
         self.store.save_draft(operation)
     }
 
@@ -338,6 +409,88 @@ impl CanvasDocument {
         Ok(target_ids.len())
     }
 
+    pub fn commit_paint_subtraction(
+        &mut self,
+        changes: Vec<(Uuid, Vec<Vec<CanvasPoint>>)>,
+        layer_id: Uuid,
+    ) -> Result<Option<Vec<Uuid>>> {
+        if changes.is_empty() {
+            return Ok(None);
+        }
+        if !self.layer_is_editable(layer_id) {
+            bail!("active layer is hidden or locked");
+        }
+
+        let mut seen = HashSet::with_capacity(changes.len());
+        let mut targets = Vec::with_capacity(changes.len());
+        for (source_id, runs) in changes {
+            if !seen.insert(source_id) {
+                bail!("paint subtraction contains a duplicate target");
+            }
+            let source = self
+                .operations
+                .iter()
+                .find(|operation| operation.id == source_id)
+                .context("paint subtraction target is unavailable")?;
+            if source.layer_id != layer_id || source.kind != EditKind::Paint {
+                bail!("paint subtraction target is not editable Paint");
+            }
+            if runs.iter().any(|run| {
+                run.is_empty()
+                    || run
+                        .iter()
+                        .any(|point| !point.local_x.is_finite() || !point.local_y.is_finite())
+            }) {
+                bail!("paint subtraction produced invalid geometry");
+            }
+            if runs.len() == 1 && runs[0] == source.points {
+                continue;
+            }
+            targets.push((source.clone(), runs));
+        }
+        if targets.is_empty() {
+            return Ok(None);
+        }
+        targets.sort_by_key(|(source, _)| (source.effective_paint_order(), source.sequence));
+
+        let transaction_id = Uuid::new_v4();
+        let mut tombstone = EditOperation::tombstone(
+            targets.iter().map(|(source, _)| source.id).collect(),
+            layer_id,
+        );
+        tombstone.transaction_id = transaction_id;
+        let mut commands = vec![tombstone];
+        for (source, runs) in &targets {
+            for points in runs {
+                let mut replacement = source.clone();
+                replacement.id = Uuid::new_v4();
+                replacement.sequence = 0;
+                replacement.paint_order = Some(source.effective_paint_order());
+                replacement.transaction_id = transaction_id;
+                replacement.affects_before_sequence = None;
+                replacement.points = points.clone();
+                commands.push(replacement);
+            }
+        }
+
+        self.revision = self.store.commit_group(&mut commands)?;
+        self.max_sequence = commands
+            .last()
+            .map_or(self.max_sequence, |operation| operation.sequence);
+        let removed_ids: HashSet<_> = targets.iter().map(|(source, _)| source.id).collect();
+        self.operations
+            .retain(|operation| !removed_ids.contains(&operation.id));
+        let replacement_ids = commands
+            .iter()
+            .skip(1)
+            .map(|operation| operation.id)
+            .collect::<Vec<_>>();
+        self.operations.extend(commands.into_iter().skip(1));
+        sort_operations_by_paint_order(&mut self.operations);
+        self.rebuild_indexes();
+        Ok(Some(replacement_ids))
+    }
+
     pub fn move_operations(
         &mut self,
         target_ids: &HashSet<Uuid>,
@@ -378,6 +531,7 @@ impl CanvasDocument {
             replacement.paint_order = Some(source.effective_paint_order());
             replacement.transaction_id = transaction_id;
             replacement.affects_before_sequence = None;
+            refresh_compact_source_geometry_ids(&mut replacement);
             translate_operation_by_screen_delta(
                 &mut replacement,
                 camera_depth,
@@ -505,6 +659,7 @@ impl CanvasDocument {
             replacement.paint_order = Some(source.effective_paint_order());
             replacement.transaction_id = transaction_id;
             replacement.affects_before_sequence = None;
+            refresh_compact_source_geometry_ids(&mut replacement);
             transform_operation_points(
                 &mut replacement,
                 camera,
@@ -1098,12 +1253,15 @@ impl CanvasDocument {
     }
 
     fn append_committed_operation(&mut self, operation: EditOperation) {
-        if operation_can_append_to_render_index(&operation, self.render_operations.last()) {
+        if operation_can_append_to_render_index(
+            &operation,
+            self.render_operations.last().map(Arc::as_ref),
+        ) {
             let operation_index = self.operations.len();
             let render_operation_index = self.render_operations.len();
             self.index.insert(operation_index, &operation);
             self.render_index.insert(render_operation_index, &operation);
-            self.render_operations.push(operation.clone());
+            self.render_operations.push(Arc::new(operation.clone()));
             self.operations.push(operation);
         } else {
             self.operations.push(operation);
@@ -1230,15 +1388,12 @@ impl CanvasDocument {
         {
             self.operations[operation_position] = replacement.clone();
             self.index
-                .insert_with_bounds(operation_position, &replacement, bounds.as_ref());
+                .insert_with_bounds(operation_position, bounds.as_ref());
             match render_plan {
                 RenderReplacementPlan::Single(render_position) => {
-                    self.render_operations[render_position] = replacement.clone();
-                    self.render_index.insert_with_bounds(
-                        render_position,
-                        &replacement,
-                        bounds.as_ref(),
-                    );
+                    self.render_operations[render_position] = Arc::new(replacement.clone());
+                    self.render_index
+                        .insert_with_bounds(render_position, bounds.as_ref());
                 }
                 RenderReplacementPlan::CompactSources(source_positions) => {
                     let mut render_sources = Vec::new();
@@ -1249,23 +1404,17 @@ impl CanvasDocument {
                         let Some(source) = render_sources.next() else {
                             break;
                         };
-                        self.render_operations[render_position] = source.clone();
+                        self.render_operations[render_position] = Arc::new(source.clone());
                         let source_bounds = operation_bounds(&source);
-                        self.render_index.insert_with_bounds(
-                            render_position,
-                            &source,
-                            source_bounds.as_ref(),
-                        );
+                        self.render_index
+                            .insert_with_bounds(render_position, source_bounds.as_ref());
                     }
                     for source in render_sources {
                         let render_position = self.render_operations.len();
                         let source_bounds = operation_bounds(&source);
-                        self.render_index.insert_with_bounds(
-                            render_position,
-                            &source,
-                            source_bounds.as_ref(),
-                        );
-                        self.render_operations.push(source);
+                        self.render_index
+                            .insert_with_bounds(render_position, source_bounds.as_ref());
+                        self.render_operations.push(Arc::new(source));
                     }
                 }
             }
@@ -1277,8 +1426,9 @@ impl CanvasDocument {
 
     fn rebuild_indexes(&mut self) {
         self.index = OperationIndex::build(&self.operations);
-        self.render_operations = build_render_operations(&self.operations);
-        self.render_index = OperationIndex::build(&self.render_operations);
+        let render_operations = build_render_operations(&self.operations);
+        self.render_index = OperationIndex::build(&render_operations);
+        self.render_operations = render_operations.into_iter().map(Arc::new).collect();
     }
 
     fn layer_orders(&self) -> HashMap<Uuid, i64> {
@@ -1294,20 +1444,6 @@ impl CanvasDocument {
             .filter(|layer| layer.visible)
             .map(|layer| layer.id)
             .collect()
-    }
-
-    fn sort_operations_for_render(&self, operations: &mut [EditOperation]) {
-        let layer_orders = self.layer_orders();
-        operations.sort_by_key(|operation| {
-            (
-                layer_orders
-                    .get(&operation.layer_id)
-                    .copied()
-                    .unwrap_or(i64::MIN),
-                operation.effective_paint_order(),
-                operation.sequence,
-            )
-        });
     }
 
     pub fn checkpoint(&self) -> Result<()> {
@@ -1356,6 +1492,27 @@ fn operation_compaction_depth(operation: &EditOperation) -> i64 {
             .first()
             .map_or(operation.native_depth, |point| point.depth)
     }
+}
+
+fn operation_depth_span(operation: &EditOperation) -> Option<(i64, i64)> {
+    if operation.is_compact_block() {
+        return operation
+            .compact_sources
+            .iter()
+            .filter_map(operation_depth_span)
+            .fold(None, |span, (min, max)| {
+                Some(span.map_or((min, max), |(old_min, old_max): (i64, i64)| {
+                    (old_min.min(min), old_max.max(max))
+                }))
+            });
+    }
+    let mut min = operation.native_depth;
+    let mut max = operation.native_depth;
+    for point in &operation.points {
+        min = min.min(point.depth);
+        max = max.max(point.depth);
+    }
+    Some((min, max))
 }
 
 fn compact_snapshot_sources(operations: &[EditOperation]) -> Vec<EditOperation> {
@@ -1679,6 +1836,13 @@ fn refresh_compact_source_identity(operation: &mut EditOperation) {
     }
 }
 
+fn refresh_compact_source_geometry_ids(operation: &mut EditOperation) {
+    for source in &mut operation.compact_sources {
+        source.id = Uuid::new_v4();
+        refresh_compact_source_geometry_ids(source);
+    }
+}
+
 fn transform_operation_points(
     operation: &mut EditOperation,
     camera: &CameraAddress,
@@ -1727,12 +1891,13 @@ fn recompute_compact_block_bounds(operation: &mut EditOperation) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::CanvasDocument;
+    use super::{CanvasDocument, VisibleDepthMode};
     use crate::coords::{CameraAddress, CanvasPoint, ScreenAffine};
     use crate::model::{Color, EditKind, EditOperation, Layer};
     use crate::tile_cache::TileKey;
     use num_bigint::BigInt;
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -1821,6 +1986,240 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(render_ids, vec![first_id, second_id]);
+        Ok(())
+    }
+
+    #[test]
+    fn editable_query_filters_viewport_layer_lock_and_complete_depth_span() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let mut ids_by_depth = HashMap::new();
+        for depth in [-3, -2, 0, 2, 3] {
+            let mut source = operation();
+            source.native_depth = depth;
+            source.points = vec![
+                CanvasPoint::new(depth, 0.into(), 0.into(), 0.1, 0.2),
+                CanvasPoint::new(depth, 0.into(), 0.into(), 0.3, 0.4),
+            ];
+            ids_by_depth.insert(depth, source.id);
+            document.commit(source)?;
+        }
+        let other_layer = document.create_layer("Other")?;
+        let mut other = operation();
+        other.layer_id = other_layer.id;
+        let other_id = other.id;
+        document.commit(other)?;
+        let key = TileKey {
+            depth: 0,
+            x: 0.into(),
+            y: 0.into(),
+            lod: 0,
+        };
+
+        let editable = document
+            .editable_operation_ids_for_tiles(
+                std::slice::from_ref(&key),
+                crate::model::DEFAULT_LAYER_ID,
+                0,
+                2,
+            )
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            editable,
+            HashSet::from([ids_by_depth[&-2], ids_by_depth[&0], ids_by_depth[&2]])
+        );
+        assert!(!editable.contains(&other_id));
+
+        let exact_negative_depth = document.editable_operation_ids_for_tiles(
+            std::slice::from_ref(&key),
+            crate::model::DEFAULT_LAYER_ID,
+            -2,
+            0,
+        );
+        assert_eq!(exact_negative_depth, vec![ids_by_depth[&-2]]);
+
+        document.set_layer_locked(crate::model::DEFAULT_LAYER_ID, true)?;
+        assert!(
+            document
+                .editable_operation_ids_for_tiles(
+                    std::slice::from_ref(&key),
+                    crate::model::DEFAULT_LAYER_ID,
+                    0,
+                    2,
+                )
+                .is_empty()
+        );
+        document.set_layer_locked(crate::model::DEFAULT_LAYER_ID, false)?;
+        document.set_layer_visibility(crate::model::DEFAULT_LAYER_ID, false)?;
+        assert!(
+            document
+                .editable_operation_ids_for_tiles(
+                    std::slice::from_ref(&key),
+                    crate::model::DEFAULT_LAYER_ID,
+                    0,
+                    2,
+                )
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn visible_depth_mode_distinguishes_empty_near_distant_and_hidden() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let key = TileKey {
+            depth: 0,
+            x: 0.into(),
+            y: 0.into(),
+            lod: 0,
+        };
+        assert_eq!(
+            document.visible_depth_mode_for_tiles(
+                std::slice::from_ref(&key),
+                crate::model::DEFAULT_LAYER_ID,
+                0,
+                2,
+            ),
+            VisibleDepthMode::Empty
+        );
+
+        let mut source = operation();
+        source.native_depth = 3;
+        source.points = vec![
+            CanvasPoint::new(3, 0.into(), 0.into(), 0.1, 0.2),
+            CanvasPoint::new(3, 0.into(), 0.into(), 0.3, 0.4),
+        ];
+        document.commit(source)?;
+        assert_eq!(
+            document.visible_depth_mode_for_tiles(
+                std::slice::from_ref(&key),
+                crate::model::DEFAULT_LAYER_ID,
+                0,
+                2,
+            ),
+            VisibleDepthMode::Distant
+        );
+        assert_eq!(
+            document.visible_depth_mode_for_tiles(
+                std::slice::from_ref(&key),
+                crate::model::DEFAULT_LAYER_ID,
+                0,
+                3,
+            ),
+            VisibleDepthMode::Near
+        );
+
+        let other_layer = document.create_layer("Other")?;
+        let mut other = operation();
+        other.layer_id = other_layer.id;
+        document.commit(other)?;
+        assert_eq!(
+            document.visible_depth_mode_for_tiles(
+                std::slice::from_ref(&key),
+                crate::model::DEFAULT_LAYER_ID,
+                0,
+                2,
+            ),
+            VisibleDepthMode::Distant
+        );
+        assert_eq!(
+            document
+                .visible_depth_mode_for_tiles(std::slice::from_ref(&key), other_layer.id, 0, 2,),
+            VisibleDepthMode::Near
+        );
+
+        document.set_layer_visibility(other_layer.id, false)?;
+        document.set_layer_locked(crate::model::DEFAULT_LAYER_ID, true)?;
+        assert_eq!(
+            document.visible_depth_mode_for_tiles(
+                std::slice::from_ref(&key),
+                crate::model::DEFAULT_LAYER_ID,
+                0,
+                3,
+            ),
+            VisibleDepthMode::Distant
+        );
+        document.set_layer_locked(crate::model::DEFAULT_LAYER_ID, false)?;
+        document.set_layer_visibility(crate::model::DEFAULT_LAYER_ID, false)?;
+        assert_eq!(
+            document.visible_depth_mode_for_tiles(
+                std::slice::from_ref(&key),
+                crate::model::DEFAULT_LAYER_ID,
+                0,
+                3,
+            ),
+            VisibleDepthMode::Empty
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn editable_query_keeps_mixed_depth_compact_block_atomic() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let coarse = operation();
+        let coarse_id = coarse.id;
+        document.commit(coarse)?;
+        let mut fine = operation();
+        fine.native_depth = 3;
+        fine.points = vec![
+            CanvasPoint::new(3, 0.into(), 0.into(), 0.1, 0.2),
+            CanvasPoint::new(3, 0.into(), 0.into(), 0.3, 0.4),
+        ];
+        let fine_id = fine.id;
+        document.commit(fine)?;
+        let block_id = document
+            .compact_operations(
+                &HashSet::from([coarse_id, fine_id]),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("compact block");
+        let key = TileKey {
+            depth: 0,
+            x: 0.into(),
+            y: 0.into(),
+            lod: 0,
+        };
+
+        assert!(
+            document
+                .editable_operation_ids_for_tiles(
+                    std::slice::from_ref(&key),
+                    crate::model::DEFAULT_LAYER_ID,
+                    0,
+                    2,
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            document.visible_depth_mode_for_tiles(
+                std::slice::from_ref(&key),
+                crate::model::DEFAULT_LAYER_ID,
+                0,
+                2,
+            ),
+            VisibleDepthMode::Distant
+        );
+        assert_eq!(
+            document.editable_operation_ids_for_tiles(
+                std::slice::from_ref(&key),
+                crate::model::DEFAULT_LAYER_ID,
+                0,
+                3,
+            ),
+            vec![block_id]
+        );
+        assert_eq!(
+            document.visible_depth_mode_for_tiles(
+                std::slice::from_ref(&key),
+                crate::model::DEFAULT_LAYER_ID,
+                0,
+                3,
+            ),
+            VisibleDepthMode::Near
+        );
         Ok(())
     }
 
@@ -2003,6 +2402,124 @@ mod tests {
     }
 
     #[test]
+    fn erase_draft_is_not_recovered_as_a_legacy_operation() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let root = temporary.path().join("test.esketch");
+        let document = CanvasDocument::open(&root)?;
+        let mut erase = operation();
+        erase.kind = EditKind::Erase;
+        document.save_draft(&erase)?;
+        drop(document);
+
+        let document = CanvasDocument::open(&root)?;
+        assert!(document.operations().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn paint_subtraction_split_is_one_persisted_history_transaction() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let root = temporary.path().join("test.esketch");
+        let mut document = CanvasDocument::open(&root)?;
+        let mut source = operation();
+        source.points = vec![
+            CanvasPoint::new(0, 0.into(), 0.into(), 0.1, 0.2),
+            CanvasPoint::new(0, 0.into(), 0.into(), 0.3, 0.4),
+            CanvasPoint::new(0, 0.into(), 0.into(), 0.6, 0.5),
+            CanvasPoint::new(0, 0.into(), 0.into(), 0.8, 0.7),
+        ];
+        let source_id = source.id;
+        let source_points = source.points.clone();
+        document.commit(source)?;
+
+        assert!(
+            document
+                .commit_paint_subtraction(
+                    vec![(source_id, vec![source_points.clone()])],
+                    crate::model::DEFAULT_LAYER_ID,
+                )?
+                .is_none()
+        );
+        assert_eq!(document.revision(), 1);
+        assert_eq!(document.max_sequence(), 1);
+
+        let runs = vec![source_points[..2].to_vec(), source_points[2..].to_vec()];
+        let replacement_ids = document
+            .commit_paint_subtraction(
+                vec![(source_id, runs.clone())],
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("split changes the source");
+
+        assert_eq!(replacement_ids.len(), 2);
+        assert_eq!(document.revision(), 2);
+        assert_eq!(document.max_sequence(), 4);
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.points.clone())
+                .collect::<Vec<_>>(),
+            runs
+        );
+        assert!(document.operations().iter().all(|operation| {
+            replacement_ids.contains(&operation.id)
+                && operation.effective_paint_order() == 1
+                && operation.width_px == 5.0
+                && operation.color == Color::BLACK
+        }));
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.transaction_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            1
+        );
+        drop(document);
+
+        let mut document = CanvasDocument::open(&root)?;
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<Vec<_>>(),
+            replacement_ids
+        );
+        assert!(document.undo()?);
+        assert_eq!(document.operations().len(), 1);
+        assert_eq!(document.operations()[0].id, source_id);
+        assert_eq!(document.operations()[0].points, source_points);
+        assert!(document.redo()?);
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<Vec<_>>(),
+            replacement_ids
+        );
+
+        let full_delete = document
+            .commit_paint_subtraction(
+                replacement_ids
+                    .iter()
+                    .map(|operation_id| (*operation_id, Vec::new()))
+                    .collect(),
+                crate::model::DEFAULT_LAYER_ID,
+            )?
+            .expect("full subtraction still commits a tombstone");
+        assert!(full_delete.is_empty());
+        assert!(document.operations().is_empty());
+        assert_eq!(document.revision(), 5);
+        assert!(document.undo()?);
+        assert_eq!(document.operations().len(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn compact_selected_survives_reopen_and_round_trips_history() -> anyhow::Result<()> {
         let temporary = TempDir::new()?;
         let root = temporary.path().join("test.esketch");
@@ -2068,6 +2585,11 @@ mod tests {
                 crate::model::DEFAULT_LAYER_ID,
             )?
             .expect("compact block");
+        let original_source_ids = document.operations()[0]
+            .compact_sources
+            .iter()
+            .map(|source| source.id)
+            .collect::<HashSet<_>>();
 
         let replacement_ids = document.move_operations(
             &HashSet::from([block_id]),
@@ -2088,6 +2610,12 @@ mod tests {
         let moved = &document.operations()[0];
         assert!(moved.is_compact_block());
         assert_eq!(moved.compact_sources.len(), 2);
+        assert!(
+            moved
+                .compact_sources
+                .iter()
+                .all(|source| !original_source_ids.contains(&source.id))
+        );
         assert!(
             moved
                 .compact_sources
@@ -2358,6 +2886,11 @@ mod tests {
                 crate::model::DEFAULT_LAYER_ID,
             )?
             .expect("compact block");
+        let original_source_ids = document.operations()[0]
+            .compact_sources
+            .iter()
+            .map(|source| source.id)
+            .collect::<HashSet<_>>();
         let target_layer = document.create_layer("Target")?;
 
         let replacement_ids = document.move_operations_to_layer(
@@ -2374,6 +2907,14 @@ mod tests {
             .expect("moved block");
         assert!(moved.is_compact_block());
         assert_eq!(moved.layer_id, target_layer.id);
+        assert_eq!(
+            moved
+                .compact_sources
+                .iter()
+                .map(|source| source.id)
+                .collect::<HashSet<_>>(),
+            original_source_ids
+        );
         assert!(
             moved
                 .compact_sources
@@ -2610,13 +3151,21 @@ mod tests {
             lod: 0,
         };
 
-        let render_ids = document
-            .render_operations_for_tiles(std::slice::from_ref(&key))
-            .into_iter()
+        let indices = document.render_operation_indices_for_tiles(std::slice::from_ref(&key));
+        let first_lookup = document.render_operations_by_indices(&indices);
+        let second_lookup = document.render_operations_by_indices(&indices);
+        let render_ids = first_lookup
+            .iter()
             .map(|operation| operation.id)
             .collect::<Vec<_>>();
 
         assert_eq!(render_ids, vec![bottom_id, middle_id, top_id]);
+        assert!(
+            first_lookup
+                .iter()
+                .zip(&second_lookup)
+                .all(|(first, second)| Arc::ptr_eq(first, second))
+        );
         assert_eq!(document.operations().len(), 2);
         assert!(
             document
@@ -3372,7 +3921,7 @@ mod tests {
         assert!(document.operations_for_tile(&key).is_empty());
         assert!(
             document
-                .operation_indices_for_tiles(std::slice::from_ref(&key))
+                .render_operation_indices_for_tiles(std::slice::from_ref(&key))
                 .is_empty()
         );
 

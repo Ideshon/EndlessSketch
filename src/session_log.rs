@@ -521,7 +521,11 @@ mod tests {
                     "fallback_fill_shape_count": 24,
                     "fallback_segmented_strokes": 3,
                     "fallback_fast_strokes": 4,
+                    "fallback_visible_cache_hits": 1,
+                    "fallback_visible_cache_misses": 0,
                     "fallback_project_ms": 5.0,
+                    "fallback_visible_operations_ms": 1.5,
+                    "fallback_projection_loop_ms": 3.5,
                     "fallback_derive_ms": 6.0,
                     "fallback_clip_ms": 7.0,
                     "fallback_shape_paint_ms": 8.0
@@ -536,7 +540,11 @@ mod tests {
         assert_eq!(perf["fallback_fill_shape_count"], 24);
         assert_eq!(perf["fallback_segmented_strokes"], 3);
         assert_eq!(perf["fallback_fast_strokes"], 4);
+        assert_eq!(perf["fallback_visible_cache_hits"], 1);
+        assert_eq!(perf["fallback_visible_cache_misses"], 0);
         assert_eq!(perf["fallback_project_ms"], 5.0);
+        assert_eq!(perf["fallback_visible_operations_ms"], 1.5);
+        assert_eq!(perf["fallback_projection_loop_ms"], 3.5);
         assert_eq!(perf["fallback_derive_ms"], 6.0);
         assert_eq!(perf["fallback_clip_ms"], 7.0);
         assert_eq!(perf["fallback_shape_paint_ms"], 8.0);
@@ -562,7 +570,11 @@ mod tests {
                     "fallback_fill_shape_count": 88,
                     "fallback_segmented_strokes": 11,
                     "fallback_fast_strokes": 12,
+                    "fallback_visible_cache_hits": 0,
+                    "fallback_visible_cache_misses": 1,
                     "fallback_project_ms": 13.0,
+                    "fallback_visible_operations_ms": 4.0,
+                    "fallback_projection_loop_ms": 9.0,
                     "fallback_derive_ms": 14.0,
                     "fallback_clip_ms": 15.0,
                     "fallback_shape_paint_ms": 16.0
@@ -577,7 +589,11 @@ mod tests {
         assert_eq!(perf["fallback_fill_shape_count"], 88);
         assert_eq!(perf["fallback_segmented_strokes"], 11);
         assert_eq!(perf["fallback_fast_strokes"], 12);
+        assert_eq!(perf["fallback_visible_cache_hits"], 0);
+        assert_eq!(perf["fallback_visible_cache_misses"], 1);
         assert_eq!(perf["fallback_project_ms"], 13.0);
+        assert_eq!(perf["fallback_visible_operations_ms"], 4.0);
+        assert_eq!(perf["fallback_projection_loop_ms"], 9.0);
         assert_eq!(perf["fallback_derive_ms"], 14.0);
         assert_eq!(perf["fallback_clip_ms"], 15.0);
         assert_eq!(perf["fallback_shape_paint_ms"], 16.0);

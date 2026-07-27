@@ -1,7 +1,7 @@
 use crate::coords::{CameraAddress, DEPTH_RATIO, TILE_PIXELS};
 use crate::model::EditOperation;
 use crate::tile_cache::TileKey;
-use egui::{Pos2, Rect};
+use eframe::egui::{Pos2, Rect};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -31,6 +31,9 @@ impl ProjectedGeometryCache {
         viewport: Rect,
     ) -> Option<ProjectionFrame> {
         let should_reset = self.anchor.as_ref().is_none_or(|anchor| {
+            if anchor.depth != camera.depth {
+                return true;
+            }
             let Some((center_x, center_y)) =
                 anchor.canvas_to_screen(&camera.center_point(), 0.0, 0.0)
             else {
@@ -112,7 +115,7 @@ impl ProjectedGeometryCache {
 pub struct VisibleOperationCache {
     revision: Option<u64>,
     tiles: Vec<TileKey>,
-    indices: Vec<usize>,
+    indices: Arc<[usize]>,
 }
 
 impl VisibleOperationCache {
@@ -121,48 +124,19 @@ impl VisibleOperationCache {
         revision: u64,
         tiles: &[TileKey],
         query: impl FnOnce() -> Vec<usize>,
-    ) -> &[usize] {
+    ) -> Arc<[usize]> {
         if self.revision != Some(revision) || self.tiles != tiles {
             self.revision = Some(revision);
             self.tiles = tiles.to_vec();
-            self.indices = query();
+            self.indices = Arc::from(query());
         }
-        &self.indices
+        Arc::clone(&self.indices)
     }
 
     pub fn clear(&mut self) {
         self.revision = None;
         self.tiles.clear();
-        self.indices.clear();
-    }
-}
-
-#[derive(Default)]
-pub struct VisibleRenderOperationCache {
-    revision: Option<u64>,
-    tiles: Vec<TileKey>,
-    operations: Arc<[EditOperation]>,
-}
-
-impl VisibleRenderOperationCache {
-    pub fn get_or_update(
-        &mut self,
-        revision: u64,
-        tiles: &[TileKey],
-        query: impl FnOnce() -> Vec<EditOperation>,
-    ) -> Arc<[EditOperation]> {
-        if self.revision != Some(revision) || self.tiles != tiles {
-            self.revision = Some(revision);
-            self.tiles = tiles.to_vec();
-            self.operations = Arc::<[EditOperation]>::from(query());
-        }
-        Arc::clone(&self.operations)
-    }
-
-    pub fn clear(&mut self) {
-        self.revision = None;
-        self.tiles.clear();
-        self.operations = Arc::<[EditOperation]>::default();
+        self.indices = Arc::default();
     }
 }
 
@@ -259,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_geometry_survives_representable_depth_change_and_resets_after_large_pan() {
+    fn projected_geometry_resets_on_depth_change_and_after_large_pan() {
         let operation = operation();
         let viewport = Rect::from_min_max(Pos2::ZERO, Pos2::new(1280.0, 720.0));
         let mut cache = ProjectedGeometryCache::default();
@@ -275,12 +249,12 @@ mod tests {
         cache
             .begin_frame(&deeper, viewport)
             .expect("depth-change frame");
-        assert_eq!(cache.cached_operation_count(), 1);
+        assert_eq!(cache.cached_operation_count(), 0);
         assert_matches_direct_projection(&mut cache, &deeper, viewport, &operation);
         assert_eq!(cache.cached_operation_count(), 1);
 
         let mut moderately_distant = deeper.clone();
-        moderately_distant.tile_x += 10 * DEPTH_RATIO;
+        moderately_distant.tile_x += 10;
         cache
             .begin_frame(&moderately_distant, viewport)
             .expect("moderately distant frame");
@@ -289,7 +263,7 @@ mod tests {
         assert_eq!(cache.cached_operation_count(), 1);
 
         let mut distant = deeper.clone();
-        distant.tile_x += (MAX_ANCHOR_TILE_DISTANCE + 1) * DEPTH_RATIO;
+        distant.tile_x += MAX_ANCHOR_TILE_DISTANCE + 1;
         let frame = cache
             .begin_frame(&distant, viewport)
             .expect("distant frame");
@@ -302,6 +276,77 @@ mod tests {
             .begin_frame(&distant, viewport)
             .expect("distant y frame");
         assert_eq!(cache.cached_operation_count(), 0);
+    }
+
+    #[test]
+    fn projected_geometry_keeps_current_depth_curves_exact_across_positive_and_negative_depths() {
+        let viewport = Rect::from_min_max(Pos2::ZERO, Pos2::new(1_706.656_3, 991.343_75));
+        let viewport_width = f64::from(viewport.width());
+        let viewport_height = f64::from(viewport.height());
+        let mut cache = ProjectedGeometryCache::default();
+        let mut camera = CameraAddress::default();
+        assert_matches_direct_projection(&mut cache, &camera, viewport, &operation());
+
+        for expected_depth in 1..=20 {
+            camera.zoom_at(
+                DEPTH_RATIO as f64,
+                849.333_312_988_281_2,
+                482.0,
+                viewport_width,
+                viewport_height,
+            );
+            assert_eq!(camera.depth, expected_depth);
+            let points = [
+                (668.666_687_011_718_8, 482.666_656_494_140_6),
+                (823.333_312_988_281_2, 377.333_343_505_859_4),
+                (1_052.666_625_976_562_5, 641.333_312_988_281_2),
+                (1_252.666_625_976_562_5, 489.333_343_505_859_4),
+            ]
+            .into_iter()
+            .map(|(x, y)| camera.screen_to_canvas(x, y, viewport_width, viewport_height))
+            .collect();
+            let current_curve = EditOperation::draft(
+                EditKind::Paint,
+                camera.depth,
+                camera.zoom,
+                points,
+                Color::BLACK,
+                5.0,
+            );
+            assert_matches_direct_projection(&mut cache, &camera, viewport, &current_curve);
+        }
+
+        cache.clear();
+        camera = CameraAddress::default();
+        assert_matches_direct_projection(&mut cache, &camera, viewport, &operation());
+        for level in 1..=25 {
+            camera.zoom_at(
+                1.0 / DEPTH_RATIO as f64,
+                849.333_312_988_281_2,
+                482.0,
+                viewport_width,
+                viewport_height,
+            );
+            assert_eq!(camera.depth, -level);
+            let points = [
+                (668.666_687_011_718_8, 482.666_656_494_140_6),
+                (823.333_312_988_281_2, 377.333_343_505_859_4),
+                (1_052.666_625_976_562_5, 641.333_312_988_281_2),
+                (1_252.666_625_976_562_5, 489.333_343_505_859_4),
+            ]
+            .into_iter()
+            .map(|(x, y)| camera.screen_to_canvas(x, y, viewport_width, viewport_height))
+            .collect();
+            let current_curve = EditOperation::draft(
+                EditKind::Paint,
+                camera.depth,
+                camera.zoom,
+                points,
+                Color::BLACK,
+                5.0,
+            );
+            assert_matches_direct_projection(&mut cache, &camera, viewport, &current_curve);
+        }
     }
 
     #[test]
@@ -321,17 +366,16 @@ mod tests {
         };
         let mut queries = 0;
 
-        assert_eq!(
-            cache.get_or_update(1, std::slice::from_ref(&first), || {
-                queries += 1;
-                vec![1, 2]
-            }),
-            &[1, 2]
-        );
-        cache.get_or_update(1, std::slice::from_ref(&first), || {
+        let cached = cache.get_or_update(1, std::slice::from_ref(&first), || {
+            queries += 1;
+            vec![1, 2]
+        });
+        assert_eq!(cached.as_ref(), &[1, 2]);
+        let repeated = cache.get_or_update(1, std::slice::from_ref(&first), || {
             queries += 1;
             vec![9]
         });
+        assert!(Arc::ptr_eq(&cached, &repeated));
         cache.get_or_update(1, &[first.clone(), second], || {
             queries += 1;
             vec![2, 3]
@@ -342,41 +386,7 @@ mod tests {
         });
 
         assert_eq!(queries, 3);
-        assert_eq!(cache.indices, vec![4]);
-    }
-
-    #[test]
-    fn visible_render_operation_cache_reuses_shared_slice_on_hits() {
-        let mut cache = VisibleRenderOperationCache::default();
-        let tile = TileKey {
-            depth: 0,
-            x: 0.into(),
-            y: 0.into(),
-            lod: 0,
-        };
-        let operation = operation();
-        let mut queries = 0;
-
-        let first = cache.get_or_update(1, std::slice::from_ref(&tile), || {
-            queries += 1;
-            vec![operation.clone()]
-        });
-        let second = cache.get_or_update(1, std::slice::from_ref(&tile), || {
-            queries += 1;
-            Vec::new()
-        });
-
-        assert_eq!(queries, 1);
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(second.len(), 1);
-
-        let third = cache.get_or_update(2, std::slice::from_ref(&tile), || {
-            queries += 1;
-            Vec::new()
-        });
-        assert_eq!(queries, 2);
-        assert!(!Arc::ptr_eq(&second, &third));
-        assert!(third.is_empty());
+        assert_eq!(cache.indices.as_ref(), &[4]);
     }
 
     #[test]

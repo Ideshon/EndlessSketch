@@ -13,7 +13,7 @@
         },
         {
           "name": "Eraser (E)",
-          "description": "Removes older content under the stroke. It uses the same size control as the Brush."
+          "description": "In vector mode, subtracts its stroke from existing Paint lines on the active visible/unlocked layer inside Depth capture. Targets are fixed on pointer down, an empty gesture adds no history, and one Undo restores the whole result. It shares Brush size; Fill and CompactBlock are not affected yet."
         },
         {
           "name": "Area Fill (L / X)",
@@ -29,7 +29,7 @@
         },
         {
           "name": "Area Fill / Erase (X)",
-          "description": "Press X once to activate Area Fill, then press X again to cycle Area Fill and Area Erase. Area Erase traces the area to erase. Press Esc to cancel an unfinished contour."
+          "description": "Press X once to activate Area Fill, then press X again to cycle Area Fill and Area Erase. In vector mode, Area Erase subtracts its closed area from existing Paint lines on the active visible/unlocked layer inside Depth capture. Targets are fixed on pointer down, an empty area adds no history, and one Undo restores the whole result. Fill and CompactBlock are not affected yet. Press Esc to cancel an unfinished contour."
         },
         {
           "name": "Straight line",
@@ -176,6 +176,10 @@
           "description": "New objects are created only on the active layer. Object Selection searches only that layer."
         },
         {
+          "name": "Depth capture",
+          "description": "Depth capture ±N in Layers limits Object Selection to the complete native-depth span around the current camera depth. Auto is enabled by default and follows Vector depth radius. With Auto off, the manual radius cannot exceed the vector radius. A mixed-depth CompactBlock is selected only as a whole; changing the effective radius or crossing a depth boundary clears the current Object Selection."
+        },
+        {
           "name": "Visibility and lock",
           "description": "The first checkbox hides a layer; the second prevents edits. A hidden or locked active layer rejects drawing and selection."
         },
@@ -206,7 +210,7 @@
       "items": [
         {
           "name": "Profile",
-          "description": "Performance, Balanced, and Quality now change most speed/quality settings together: input spacing, fallback limits, Stroke fallback joins, Saved fallback ops, zoom settle, tile workers/resolution, auto-pause while drawing, deferred preview, rebuild policy, prefetch, edge quality, smoothing, PNG compression, Storage commit, and Preview FPS. Custom appears after any managed field is edited. Manual Pause tile generation, Cache size, Display, logging, and Keep latest objects remain independent."
+          "description": "Performance, Balanced, and Quality change most speed/quality settings together, including Vector depth radius (1/2/4). With Depth capture Auto enabled, its effective radius follows that value; with Auto off, the manual radius remains independent within the vector boundary. Custom appears after any managed field is edited. Distant tiles, Auto itself, manual Pause tile generation, Cache size, Display, logging, and Keep latest objects remain independent."
         },
         {
           "name": "Brush input px",
@@ -241,12 +245,20 @@
           "description": "Number of background tile-rendering threads. More workers rebuild faster on a powerful CPU but compete more strongly with the UI and other applications."
         },
         {
+          "name": "Distant tiles",
+          "description": "Uses the existing whole-scene PNG tile when a non-empty viewport has no nearby editable operation on the active visible/unlocked layer. Other visible layers are included in the tile but do not keep vector mode active. Empty views create no tile jobs. In distant_tile mode Selection, Eraser, and Area Erase are read-only; Brush and Fill remain available and return the view to vectors after commit."
+        },
+        {
+          "name": "Vector depth radius",
+          "description": "Camera-relative radius ±N for vector display. If the complete native-depth span of an editable operation on the active visible/unlocked layer fits the radius, the whole viewport is vectors_near and cached PNG is not mixed in. CompactBlock stays atomic. Range 0–32; default ±2. Performance/Balanced/Quality set 1/2/4."
+        },
+        {
           "name": "Tile resolution",
           "description": "Physical PNG size of each tile. 64–256 px is faster and smaller but looks more pixelated. 512 px is the normal balance. 1024–2048 px adds detail at higher CPU, memory, disk, and upload cost."
         },
         {
           "name": "Pause tile generation",
-          "description": "Stops all new PNG tile work. Drawing, vector saves, Undo/Redo, and backups continue. The canvas uses vector display and any tiles already available."
+          "description": "Stops all new PNG tile work. Drawing, vector saves, Undo/Redo, and backups continue. Distant views use vector fallback while paused; nearby views are always vector-rendered."
         },
         {
           "name": "Pause tile generation while drawing",
