@@ -4,6 +4,7 @@ pub const RENDER_SIMPLIFICATION_TOLERANCE_PX: f32 = 0.25;
 const MAX_JITTER_PREFILTER_POINTS: usize = 8192;
 const JITTER_PREFILTER_CHUNK_POINTS: usize = 64;
 const JITTER_PREFILTER_CHUNK_LENGTH_PX: f32 = 32.0;
+const COLLINEAR_RELATIVE_TOLERANCE: f32 = 1.0e-4;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GeometryClipRect {
@@ -32,7 +33,7 @@ pub fn simplify_render_points(points: &[(f32, f32)], closed: bool) -> Vec<(f32, 
     simplify_render_points_with_tolerance(points, closed, RENDER_SIMPLIFICATION_TOLERANCE_PX)
 }
 
-fn simplify_render_points_with_tolerance(
+pub(crate) fn simplify_render_points_with_tolerance(
     points: &[(f32, f32)],
     closed: bool,
     tolerance: f32,
@@ -286,6 +287,11 @@ pub fn smooth_stroke_points_stable(points: &[(f32, f32)], passes: usize) -> Vec<
         return points.to_vec();
     }
 
+    let collapsed = collapse_collinear_points(points, false);
+    let points = collapsed.as_slice();
+    if points.len() <= 2 {
+        return collapsed;
+    }
     let parameters = curve_parameters(passes);
     let mut smoothed = Vec::with_capacity(points.len() * stable_corner_steps(passes));
     smoothed.push(points[0]);
@@ -343,6 +349,11 @@ pub fn smooth_closed_points_stable(points: &[(f32, f32)], passes: usize) -> Vec<
         return ring.to_vec();
     }
 
+    let collapsed = collapse_collinear_points(ring, true);
+    let ring = collapsed.as_slice();
+    if ring.len() < 3 {
+        return collapsed;
+    }
     let parameters = curve_parameters(passes);
     let mut smoothed = Vec::with_capacity(ring.len() * stable_corner_steps(passes));
     for index in 0..ring.len() {
@@ -356,6 +367,57 @@ pub fn smooth_closed_points_stable(points: &[(f32, f32)], passes: usize) -> Vec<
         );
     }
     smoothed
+}
+
+fn collapse_collinear_points(points: &[(f32, f32)], closed: bool) -> Vec<(f32, f32)> {
+    let mut source = points;
+    if closed && source.len() > 1 && source.first() == source.last() {
+        source = &source[..source.len() - 1];
+    }
+    let minimum = if closed { 3 } else { 2 };
+    if source.len() <= minimum {
+        return source.to_vec();
+    }
+
+    let mut collapsed = Vec::with_capacity(source.len());
+    for &point in source {
+        collapsed.push(point);
+        while collapsed.len() >= 3 {
+            let end = collapsed.len() - 1;
+            if !collinear_middle_is_redundant(
+                collapsed[end - 2],
+                collapsed[end - 1],
+                collapsed[end],
+            ) {
+                break;
+            }
+            collapsed.remove(end - 1);
+        }
+    }
+
+    if closed {
+        while collapsed.len() > minimum {
+            let removable = (0..collapsed.len()).find(|&index| {
+                let len = collapsed.len();
+                collinear_middle_is_redundant(
+                    collapsed[(index + len - 1) % len],
+                    collapsed[index],
+                    collapsed[(index + 1) % len],
+                )
+            });
+            let Some(index) = removable else {
+                break;
+            };
+            collapsed.remove(index);
+        }
+    }
+    collapsed
+}
+
+fn collinear_middle_is_redundant(start: (f32, f32), middle: (f32, f32), end: (f32, f32)) -> bool {
+    let baseline = point_distance_squared(start, end).sqrt();
+    baseline > f32::EPSILON
+        && distance_to_segment(middle, start, end) <= baseline * COLLINEAR_RELATIVE_TOLERANCE
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -654,6 +716,49 @@ mod tests {
             assert!((x * 4.0 - scaled_x).abs() < 0.001);
             assert!((y * 4.0 - scaled_y).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn stable_smoothing_ignores_linear_stall_interpolation() {
+        let sparse = [(0.0, 0.0), (16.0, 16.0), (32.0, 0.0)];
+        let interpolated = [
+            (0.0, 0.0),
+            (4.0, 4.0),
+            (8.0, 8.0),
+            (12.0, 12.0),
+            (16.0, 16.0),
+            (20.0, 12.0),
+            (24.0, 8.0),
+            (28.0, 4.0),
+            (32.0, 0.0),
+        ];
+        assert_eq!(
+            smooth_stroke_points_stable(&interpolated, 2),
+            smooth_stroke_points_stable(&sparse, 2)
+        );
+
+        let sparse_ring = [
+            (0.0, 0.0),
+            (16.0, 0.0),
+            (16.0, 16.0),
+            (0.0, 16.0),
+            (0.0, 0.0),
+        ];
+        let interpolated_ring = [
+            (0.0, 0.0),
+            (8.0, 0.0),
+            (16.0, 0.0),
+            (16.0, 8.0),
+            (16.0, 16.0),
+            (8.0, 16.0),
+            (0.0, 16.0),
+            (0.0, 8.0),
+            (0.0, 0.0),
+        ];
+        assert_eq!(
+            smooth_closed_points_stable(&interpolated_ring, 2),
+            smooth_closed_points_stable(&sparse_ring, 2)
+        );
     }
 
     #[test]

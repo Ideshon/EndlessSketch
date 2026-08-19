@@ -59,7 +59,7 @@
 - Большое значение уменьшает число входных точек, но не меняет максимальную длину интерполированного сегмента.
 - Разрывы всегда делятся на участки не длиннее `8 px`, а release endpoint сохраняется независимо от выбранной плотности.
 - Визуальная разница между значениями может быть небольшой: линейная интерполяция сохраняет траекторию, а видимая округлость управляется `Smoothing`.
-- На Windows перед spacing и интерполяцией восстанавливается до `64` промежуточных mouse-history samples между UI-кадрами. При недоступности системной истории используются обычные egui events.
+- На Windows при рисовании отдельный cursor sampler каждые `2 ms` читает фактическую экранную позицию независимо от UI FPS, хранит только изменившиеся точки в порядке получения и останавливается при физическом отпускании primary button. Нативные ordered Touch events остаются приоритетными. Повреждённая mixed-device история `GetMouseMovePointsEx` больше не используется; обычные egui events остаются fallback.
 - Комбинация минимального `0.75 px` и `Smoothing: Off` намеренно сохраняет каждый целочисленный sample; на толстой диагональной линии это может давать острые vector joins. Для обычного рисования используйте больший Input либо включённый Smoothing.
 
 Этот параметр не является силой сглаживания: внешний вид готового тайла настраивается отдельным `Smoothing`.
@@ -96,7 +96,7 @@
 - Значения: `Auto`, `Quality`, `Performance`.
 - По умолчанию: `Auto`.
 - Управляет joins только во временном no-tile vector fallback для сохранённых Brush/Eraser strokes. Cached PNG tiles, live input, сохранённые точки и формат `.esketch` не меняются.
-- `Auto` рисует короткие сохранённые sparse strokes до `128` экранных точек segmented capsule-joins, когда нет активного draft. Во время рисования, ожидания тайлов или tile pause уже сохранённые фоновые strokes временно используют быстрый one-shape raw polyline path без saved smoothing и endpoint caps, чтобы снизить input latency.
+- `Auto` рисует короткие сохранённые sparse strokes до `128` экранных точек segmented capsule-joins, когда нет активного draft. Во время рисования или ожидания тайлов уже сохранённые фоновые strokes временно используют быстрый one-shape raw polyline path без saved smoothing и endpoint caps, чтобы снизить input latency. Ручная пауза tile generation сама по себе не отключает качественный idle fallback.
 - `Quality` сохраняет segmented capsule-joins для сохранённых strokes до `512` экранных точек даже во время рисования.
 - `Performance` всегда использует быстрый one-shape raw polyline path без saved smoothing и endpoint caps.
 - Dense strokes выше выбранного лимита всегда остаются на быстром polyline path.
@@ -245,7 +245,7 @@
 - `Balanced` (по умолчанию): jitter tolerance `0.9 px`, средний радиус и шаг адаптивной quadratic-кривой.
 - `Strong`: jitter tolerance `1.5 px`, широкий радиус, более чувствительное обнаружение поворотов и наиболее частая тесселяция.
 
-При включённом уровне сначала удаляются малые отклонения в пределах указанного screen-space допуска, затем строятся адаптивные кривые. Error-bounded RDP работает окнами не больше `64` точек или `32 px` пути и никогда не увеличивает число входных точек. Smoothing применяется при растеризации Brush, Eraser и замкнутого Fill, к единственному активному live draft и к сохранённому full/retained fallback до готовности тайла. Сохранённые точки не изменяются. Для ограничения нагрузки fallback остаётся исходным при более чем `4096` входных или `8192` сглаженных точках; Brush сглаживается до clipping, чтобы clipping не менял форму кривой при zoom/depth navigation.
+При включённом уровне сначала удаляются малые отклонения в пределах указанного screen-space допуска, затем строятся адаптивные кривые. Error-bounded RDP работает окнами не больше `64` точек или `32 px` пути и никогда не увеличивает число входных точек. Перед стабильным saved/raster smoothing также сворачиваются только геометрически избыточные точки на одном прямом отрезке: линейная интерполяция при пропущенном кадре больше не превращает редкий ввод стилуса в мелкие угловатые joins. Smoothing применяется при растеризации Brush, Eraser и новых свободных замкнутых Fill, к единственному активному live draft и к сохранённому full/retained fallback до готовности тайла. Fill-фрагменты после Area clipping или vector erasing сохраняют точные polygon boundaries и повторно не сглаживаются. Старые операции без нового совместимого признака также остаются неизменными. Сохранённые raw points не изменяются. Для ограничения нагрузки fallback остаётся исходным при более чем `4096` входных или `8192` сглаженных точках; Brush сглаживается до clipping, чтобы clipping не менял форму кривой при zoom/depth navigation.
 
 ## Фиксированная оптимизация геометрии
 
@@ -280,7 +280,7 @@
 
 ### Area Fill/Erase mode
 
-`X` активирует общий Area tool и при повторном нажатии переключает `Fill/Erase`; toolbar и preview явно показывают destructive режим. Area Erase фиксирует существующие Paint активного visible/unlocked слоя в пределах Depth capture при pointer down и на release записывает surviving runs одной append-only transaction. Пустой результат не меняет history/revision. Fill и CompactBlock пока не вычитаются; переключатель scope `Active layer` / `All unlocked layers` остаётся будущим этапом. Старые сохранённые `EraseArea` продолжают открываться и рендериться, но новые Area Erase их не создают.
+`X` активирует общий Area tool и при повторном нажатии переключает `Fill/Erase`; toolbar и preview явно показывают destructive режим. Area Erase фиксирует Paint, Fill groups и CompactBlock активного visible/unlocked слоя в пределах Depth capture при pointer down и на release записывает все replacements одной append-only transaction. Пустой результат не меняет history/revision; CompactBlock редактируется рекурсивно без раскрытия в UI. Переключатель scope `Active layer` / `All unlocked layers` остаётся будущим этапом. Старые сохранённые `EraseArea` продолжают открываться и рендериться, но новые Area Erase их не создают.
 
 ### Canvas overlay / Display
 

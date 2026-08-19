@@ -1,5 +1,8 @@
 use crate::coords::CameraAddress;
-use crate::model::{Bookmark, DEFAULT_LAYER_ID, EditOperation, Layer};
+use crate::model::{
+    Bookmark, DEFAULT_LAYER_ID, EditOperation, Layer, remap_fill_group_ids,
+    set_operation_layer_recursive,
+};
 use crate::settings::StorageCommitMode;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -312,6 +315,7 @@ impl CanvasStore {
                 duplicate
             })
             .collect::<Vec<_>>();
+        remap_fill_group_ids(&mut operations);
         let payload = encode_layer_history(&LayerHistoryPayload {
             before,
             after: after.clone(),
@@ -445,7 +449,7 @@ impl CanvasStore {
                 replacement.sequence = 0;
                 replacement.paint_order = None;
                 replacement.transaction_id = transaction_id;
-                replacement.layer_id = destination.id;
+                set_operation_layer_recursive(&mut replacement, destination.id);
                 replacement.affects_before_sequence = None;
                 replacement
             })
