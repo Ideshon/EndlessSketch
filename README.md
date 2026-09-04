@@ -1,4 +1,4 @@
-<img width="818" height="440" alt="EndlessSketch preview" src="https://github.com/user-attachments/assets/a060edf8-ba10-4036-8d44-b97f9bc50a44" />
+<img width="1280" height="777" alt="EndlessSketch_100202_1457" src="https://github.com/user-attachments/assets/34f585ee-f25b-4be6-a48d-2a74782eb9ef" />
 
 # EndlessSketch
 
