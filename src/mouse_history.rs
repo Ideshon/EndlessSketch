@@ -1,12 +1,17 @@
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
 use eframe::egui::Pos2;
 
-const HISTORY_CAPACITY: usize = 64;
+const CURSOR_SAMPLE_INTERVAL_MS: u64 = 2;
+const CURSOR_SAMPLE_CAPACITY: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MouseSample {
     x: i32,
     y: i32,
-    time: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -14,59 +19,170 @@ pub struct NativeWindow(isize);
 
 #[derive(Default)]
 pub struct MouseHistory {
-    marker: Option<MouseSample>,
+    sampler: Option<CursorSampler>,
+    last_mode: MouseHistoryMode,
+    last_sample_count: usize,
+}
+
+#[derive(Default)]
+enum MouseHistoryMode {
+    #[default]
+    Unavailable,
+    CursorSampler,
+    TouchEvents,
+}
+
+struct CursorSampler {
+    samples: Arc<Mutex<VecDeque<MouseSample>>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl CursorSampler {
+    fn drain(&self) -> Option<Vec<MouseSample>> {
+        let mut samples = self.samples.lock().ok()?;
+        Some(samples.drain(..).collect())
+    }
+}
+
+impl Drop for CursorSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl MouseHistory {
-    pub fn begin(&mut self, window: Option<NativeWindow>, position: Pos2, pixels_per_point: f32) {
-        self.marker = window
-            .and_then(|window| query_history(window, position, pixels_per_point))
-            .and_then(|samples| samples.first().copied());
+    pub fn begin(&mut self, window: Option<NativeWindow>, _position: Pos2, pixels_per_point: f32) {
+        self.reset();
+        self.last_mode = MouseHistoryMode::Unavailable;
+        self.last_sample_count = 0;
+        if window.is_some()
+            && pixels_per_point.is_finite()
+            && pixels_per_point > f32::EPSILON
+            && let Some(sampler) = start_cursor_sampler()
+        {
+            self.sampler = Some(sampler);
+            self.last_mode = MouseHistoryMode::CursorSampler;
+        }
     }
 
     pub fn positions_since(
         &mut self,
         window: Option<NativeWindow>,
-        position: Pos2,
+        _position: Pos2,
         pixels_per_point: f32,
     ) -> Option<Vec<Pos2>> {
         let window = window?;
-        let samples = query_history(window, position, pixels_per_point)?;
-        let newest = samples.first().copied()?;
-        let Some(marker) = self.marker else {
-            self.marker = Some(newest);
+        if !pixels_per_point.is_finite() || pixels_per_point <= f32::EPSILON {
             return None;
-        };
-        let Some(chronological) = samples_after_marker(&samples, marker) else {
-            self.marker = Some(newest);
+        }
+        let samples = self.sampler.as_ref()?.drain()?;
+        let points = samples
+            .into_iter()
+            .filter_map(|sample| sample_to_egui(window, sample, pixels_per_point))
+            .fold(Vec::new(), |mut points, point| {
+                if points.last() != Some(&point) {
+                    points.push(point);
+                }
+                points
+            });
+        if points.is_empty() {
             return None;
-        };
-
-        self.marker = Some(newest);
-        Some(
-            chronological
-                .into_iter()
-                .filter_map(|sample| sample_to_egui(window, sample, pixels_per_point))
-                .fold(Vec::new(), |mut points, point| {
-                    if points.last() != Some(&point) {
-                        points.push(point);
-                    }
-                    points
-                }),
-        )
+        }
+        self.last_sample_count = self.last_sample_count.saturating_add(points.len());
+        Some(points)
     }
 
     pub fn reset(&mut self) {
-        self.marker = None;
+        self.sampler = None;
+    }
+
+    pub fn record_touch_events(&mut self, sample_count: usize) {
+        self.reset();
+        self.last_mode = MouseHistoryMode::TouchEvents;
+        self.last_sample_count = self.last_sample_count.saturating_add(sample_count);
+    }
+
+    pub fn diagnostics(&self) -> (&'static str, usize) {
+        let mode = match self.last_mode {
+            MouseHistoryMode::Unavailable => "unavailable",
+            MouseHistoryMode::CursorSampler => "cursor_sampler",
+            MouseHistoryMode::TouchEvents => "touch_events",
+        };
+        (mode, self.last_sample_count)
     }
 }
 
-fn samples_after_marker(
-    newest_first: &[MouseSample],
-    marker: MouseSample,
-) -> Option<Vec<MouseSample>> {
-    let marker_index = newest_first.iter().position(|sample| *sample == marker)?;
-    Some(newest_first[..marker_index].iter().rev().copied().collect())
+fn push_changed_sample(samples: &mut VecDeque<MouseSample>, sample: MouseSample) {
+    if samples.back() == Some(&sample) {
+        return;
+    }
+    if samples.len() == CURSOR_SAMPLE_CAPACITY {
+        samples.pop_front();
+    }
+    samples.push_back(sample);
+}
+
+#[cfg(target_os = "windows")]
+fn start_cursor_sampler() -> Option<CursorSampler> {
+    use std::thread;
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let samples = Arc::new(Mutex::new(VecDeque::with_capacity(512)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_samples = Arc::clone(&samples);
+    let worker_stop = Arc::clone(&stop);
+    let worker = thread::Builder::new()
+        .name("endless-sketch-cursor-sampler".to_owned())
+        .spawn(move || {
+            let mut saw_primary_down = false;
+            let mut initial_up_checks = 0;
+            while !worker_stop.load(Ordering::Acquire) {
+                // SAFETY: GetAsyncKeyState reads process-independent key state.
+                let primary_down =
+                    unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON)) } as u16 & 0x8000 != 0;
+                if !primary_down {
+                    if saw_primary_down || initial_up_checks >= 4 {
+                        break;
+                    }
+                    initial_up_checks += 1;
+                    thread::sleep(Duration::from_millis(CURSOR_SAMPLE_INTERVAL_MS));
+                    continue;
+                }
+                saw_primary_down = true;
+                let mut point = POINT::default();
+                // SAFETY: point is valid writable memory for GetCursorPos.
+                if unsafe { GetCursorPos(&mut point) } != 0
+                    && let Ok(mut samples) = worker_samples.lock()
+                {
+                    push_changed_sample(
+                        &mut samples,
+                        MouseSample {
+                            x: point.x,
+                            y: point.y,
+                        },
+                    );
+                }
+                thread::sleep(Duration::from_millis(CURSOR_SAMPLE_INTERVAL_MS));
+            }
+        })
+        .ok()?;
+    Some(CursorSampler {
+        samples,
+        stop,
+        worker: Some(worker),
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_cursor_sampler() -> Option<CursorSampler> {
+    None
 }
 
 pub fn native_window(frame: &eframe::Frame) -> Option<NativeWindow> {
@@ -90,73 +206,6 @@ fn native_window_impl(_frame: &eframe::Frame) -> Option<NativeWindow> {
 }
 
 #[cfg(target_os = "windows")]
-fn query_history(
-    window: NativeWindow,
-    position: Pos2,
-    pixels_per_point: f32,
-) -> Option<Vec<MouseSample>> {
-    use std::mem::size_of;
-    use windows_sys::Win32::Foundation::POINT;
-    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GMMP_USE_DISPLAY_POINTS, GetMouseMovePointsEx, MOUSEMOVEPOINT,
-    };
-
-    if !pixels_per_point.is_finite() || pixels_per_point <= f32::EPSILON {
-        return None;
-    }
-    let hwnd = window.0 as windows_sys::Win32::Foundation::HWND;
-    let mut screen = POINT {
-        x: (position.x * pixels_per_point).round() as i32,
-        y: (position.y * pixels_per_point).round() as i32,
-    };
-    // SAFETY: hwnd belongs to the active eframe window and screen points to valid memory.
-    if unsafe { ClientToScreen(hwnd, &mut screen) } == 0 {
-        return None;
-    }
-
-    let input = MOUSEMOVEPOINT {
-        x: screen.x & 0x0000_FFFF,
-        y: screen.y & 0x0000_FFFF,
-        ..Default::default()
-    };
-    let mut output = [MOUSEMOVEPOINT::default(); HISTORY_CAPACITY];
-    // SAFETY: input and the fixed-size output buffer are valid for the requested count.
-    let count = unsafe {
-        GetMouseMovePointsEx(
-            size_of::<MOUSEMOVEPOINT>() as u32,
-            &input,
-            output.as_mut_ptr(),
-            HISTORY_CAPACITY as i32,
-            GMMP_USE_DISPLAY_POINTS,
-        )
-    };
-    if count <= 0 {
-        return None;
-    }
-
-    Some(
-        output[..count as usize]
-            .iter()
-            .map(|point| MouseSample {
-                x: sign_extend_display_coordinate(point.x),
-                y: sign_extend_display_coordinate(point.y),
-                time: point.time,
-            })
-            .collect(),
-    )
-}
-
-#[cfg(not(target_os = "windows"))]
-fn query_history(
-    _window: NativeWindow,
-    _position: Pos2,
-    _pixels_per_point: f32,
-) -> Option<Vec<MouseSample>> {
-    None
-}
-
-#[cfg(target_os = "windows")]
 fn sample_to_egui(
     window: NativeWindow,
     sample: MouseSample,
@@ -170,7 +219,7 @@ fn sample_to_egui(
         x: sample.x,
         y: sample.y,
     };
-    // SAFETY: hwnd belongs to the active eframe window and client points to valid memory.
+    // SAFETY: hwnd belongs to the active eframe window and client is writable memory.
     if unsafe { ScreenToClient(hwnd, &mut client) } == 0 {
         return None;
     }
@@ -189,43 +238,33 @@ fn sample_to_egui(
     None
 }
 
-fn sign_extend_display_coordinate(coordinate: i32) -> i32 {
-    let coordinate = coordinate & 0x0000_FFFF;
-    if coordinate > i16::MAX as i32 {
-        coordinate - 65_536
-    } else {
-        coordinate
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{MouseSample, samples_after_marker, sign_extend_display_coordinate};
+    use std::collections::VecDeque;
 
-    fn sample(x: i32, time: u32) -> MouseSample {
-        MouseSample { x, y: x * 2, time }
-    }
+    use super::{CURSOR_SAMPLE_CAPACITY, MouseSample, push_changed_sample};
 
     #[test]
-    fn display_coordinates_are_sign_extended_from_sixteen_bits() {
-        assert_eq!(sign_extend_display_coordinate(12_345), 12_345);
-        assert_eq!(sign_extend_display_coordinate(0xFFFF), -1);
-        assert_eq!(sign_extend_display_coordinate(0x8000), i16::MIN as i32);
-        assert_eq!(sign_extend_display_coordinate(0x1_FFFE), -2);
-    }
-
-    #[test]
-    fn history_keeps_only_new_samples_in_chronological_order() {
-        let history = [sample(5, 50), sample(4, 40), sample(3, 30), sample(2, 20)];
-
+    fn cursor_sampler_keeps_changed_positions_in_order_and_bounded() {
+        let mut samples = VecDeque::new();
+        push_changed_sample(&mut samples, MouseSample { x: 1, y: 2 });
+        push_changed_sample(&mut samples, MouseSample { x: 1, y: 2 });
+        push_changed_sample(&mut samples, MouseSample { x: 3, y: 4 });
         assert_eq!(
-            samples_after_marker(&history, sample(3, 30)),
-            Some(vec![sample(4, 40), sample(5, 50)])
+            samples.iter().copied().collect::<Vec<_>>(),
+            vec![MouseSample { x: 1, y: 2 }, MouseSample { x: 3, y: 4 }]
         );
-        assert_eq!(
-            samples_after_marker(&history, sample(5, 50)),
-            Some(Vec::new())
-        );
-        assert_eq!(samples_after_marker(&history, sample(1, 10)), None);
+
+        for coordinate in 0..=CURSOR_SAMPLE_CAPACITY {
+            push_changed_sample(
+                &mut samples,
+                MouseSample {
+                    x: coordinate as i32 + 10,
+                    y: 0,
+                },
+            );
+        }
+        assert_eq!(samples.len(), CURSOR_SAMPLE_CAPACITY);
+        assert_eq!(samples.back().map(|sample| sample.x), Some(16_394));
     }
 }

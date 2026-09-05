@@ -10,21 +10,24 @@ The English description is below.
 
 EndlessSketch хранит рисунок не как одну большую картинку, а как последовательность сжатых векторных операций. Камера работает с иерархической глубиной, `BigInt`-адресами тайлов и локальными координатами, поэтому у холста нет обычной прямоугольной границы и практического лимита по расстоянию.
 
-PNG-тайлы являются только кэшем: их можно удалить и перестроить из векторного источника. Пока тайлы не готовы или генерация отключена, приложение показывает no-tile vector fallback, чтобы рисунок оставался видимым во время навигации и рисования.
+PNG-тайлы являются только кэшем: их можно удалить и перестроить из векторного источника. Если активный visible/unlocked слой содержит редактируемые операции в пределах `Vector depth radius ±N`, вся сцена рисуется векторами без tile jobs. Иначе непустая сцена использует read-only whole-scene тайлы; пустой viewport тайлы не создаёт.
 
 Документ хранится как папка `.esketch` с `manifest.json`, `canvas.sqlite3`, `backups/`, `assets/` и восстанавливаемым `cache/`. Старые `.ess/.esp` файлы не импортируются и не изменяются.
+
+Последняя сборка добавляет атомарное векторное стирание Paint/Fill/CompactBlock, постоянную Area Selection, расширенное объектное редактирование и более стабильный ввод Windows-стилуса. Краткая история изменений находится в [CHANGELOG.md](CHANGELOG.md).
 
 ## Основные функции
 
 - Практически бесконечная навигация по глубине и координатам, включая прямой переход к `BigInt` Tile X/Y.
-- Brush, Eraser, Lasso Fill, Eraser Lasso, Eyedropper.
-- Object Selection: клик, rectangle Inside/Crossing, overlap cycling, move, scale, rotate, flip, copy/cut/paste/delete, reorder и перенос на слой.
+- Brush, векторные Eraser и Eraser Lasso для Paint/Fill/CompactBlock, Lasso Fill, Eyedropper.
+- Object Selection: клик, rectangle Inside/Crossing, overlap cycling, `Depth capture ±N` с Auto-связью с векторным радиусом, move, scale, rotate, flip, copy/cut/paste/delete, reorder и перенос на слой.
 - Area Selection: временная rectangle/lasso-маска, которая следует за pan/zoom/depth и обрезает новые Brush/Eraser/Fill/Area Erase операции при сохранении.
 - Слои: создание, переименование, видимость, блокировка, порядок, duplicate/delete, merge down и перенос выделения между слоями.
 - Undo/redo для рисования и metadata-операций в общей истории.
 - Recolor выбранных Paint/Fill операций без изменения геометрии.
 - CompactBlock/Freeze для упаковки старых объектов с сохранением векторного источника.
-- Настройки производительности: профили Performance/Balanced/Quality, разрешение тайлов, workers, rebuild policy, prefetch, edge quality, smoothing, PNG compression, cache budget, fallback joins и storage commit mode.
+- Независимая от FPS выборка Windows-курсора для стилуса с приоритетом нативной pen history; ложная смешанная история мыши не используется.
+- Настройки производительности: профили Performance/Balanced/Quality, distant-only tiles и vector depth radius, разрешение тайлов, workers, rebuild policy, prefetch, edge quality, smoothing, PNG compression, cache budget, fallback joins и storage commit mode.
 - Диагностика FPS: JSON Lines session logs, маркеры `F12`, timings фаз кадра, счётчики fallback projection/cache/paint.
 - Portable-сборка в `release/EndlessSketch-Rust`.
 
@@ -51,6 +54,7 @@ PNG-тайлы являются только кэшем: их можно уда�
 Для тяжёлых сцен полезны:
 
 - `Performance profile`: быстро переключает большую часть speed/quality параметров.
+- `Distant tiles` и `Vector depth radius`: заменяют только целиком дальнюю сцену тайлом; близкий viewport остаётся векторным.
 - `Pause tile generation`: останавливает фоновые tile jobs, не мешая сохранению векторов.
 - `Stroke fallback joins`: управляет качеством no-tile fallback joins.
 - `Saved fallback operation limit`: может ограничить стоимость временного fallback в режиме Performance.
@@ -64,6 +68,7 @@ PNG-тайлы являются только кэшем: их можно уда�
 ```powershell
 cargo run --release
 cargo run --release -- "D:\Drawings\canvas.esketch"
+cargo build --release
 ```
 
 Проверки:
@@ -87,21 +92,24 @@ EndlessSketch is an experimental Windows drawing application for a practically e
 
 EndlessSketch does not store the canvas as one large bitmap. The authoritative document is a compressed vector operation log. The camera uses hierarchical depth levels, `BigInt` tile addresses, and local normalized coordinates, so there is no ordinary rectangular scene boundary or practical coordinate limit.
 
-PNG tiles are disposable cache data. They can be deleted and rebuilt from the vector source. While tiles are missing, outdated, or paused, the app uses a no-tile vector fallback so the drawing remains visible during navigation and drawing.
+PNG tiles are disposable cache data. If the active visible/unlocked layer has editable operations inside `Vector depth radius ±N`, the whole scene is drawn as vectors without tile jobs. Otherwise a non-empty scene uses read-only whole-scene tiles; an empty viewport does not create tiles.
 
 A document is a `.esketch` directory with `manifest.json`, `canvas.sqlite3`, `backups/`, `assets/`, and a recoverable `cache/`. Legacy `.ess/.esp` files are not imported or modified.
+
+The latest build adds atomic vector erasing for Paint/Fill/CompactBlock, persistent Area Selection, expanded object editing, and more stable Windows stylus input. See [CHANGELOG.md](CHANGELOG.md) for the short release history.
 
 ## Main Features
 
 - Practically endless navigation across depth and coordinates, including direct jumps to `BigInt` Tile X/Y.
-- Brush, Eraser, Lasso Fill, Eraser Lasso, and Eyedropper.
-- Object Selection: click, rectangle Inside/Crossing, overlap cycling, move, scale, rotate, flip, copy/cut/paste/delete, reorder, and move to layer.
+- Brush, vector Eraser and Eraser Lasso for Paint/Fill/CompactBlock, Lasso Fill, and Eyedropper.
+- Object Selection: click, rectangle Inside/Crossing, overlap cycling, `Depth capture ±N` with Auto linkage to the vector radius, move, scale, rotate, flip, copy/cut/paste/delete, reorder, and move to layer.
 - Area Selection: a temporary rectangle/lasso mask that follows pan/zoom/depth and clips newly committed Brush/Eraser/Fill/Area Erase operations.
 - Layers: create, rename, visibility, lock, ordering, duplicate/delete, merge down, and moving a selection between layers.
 - Unified undo/redo for drawing and layer/object metadata.
 - Recolor selected Paint/Fill operations without changing geometry.
 - CompactBlock/Freeze for packing older objects while preserving vector source data.
-- Performance settings: Performance/Balanced/Quality profiles, tile resolution, worker count, rebuild policy, prefetch, edge quality, smoothing, PNG compression, cache budget, fallback joins, and storage commit mode.
+- UI-FPS-independent Windows cursor sampling for stylus input, with native pen history preferred and corrupt mixed mouse history ignored.
+- Performance settings: Performance/Balanced/Quality profiles, distant-only tiles and vector depth radius, tile resolution, worker count, rebuild policy, prefetch, edge quality, smoothing, PNG compression, cache budget, fallback joins, and storage commit mode.
 - FPS diagnostics: JSON Lines session logs, `F12` markers, frame phase timings, and fallback projection/cache/paint counters.
 - Portable build under `release/EndlessSketch-Rust`.
 
@@ -128,6 +136,7 @@ Settings are stored next to the executable in `local/settings.json`. `.esketch` 
 Useful settings for heavy scenes:
 
 - `Performance profile`: quickly changes most speed/quality settings.
+- `Distant tiles` and `Vector depth radius`: replace only an entirely distant scene with tiles; nearby views remain vector-rendered.
 - `Pause tile generation`: stops background tile jobs without blocking vector saves.
 - `Stroke fallback joins`: controls no-tile fallback join quality.
 - `Saved fallback operation limit`: can cap temporary fallback cost in Performance mode.
@@ -141,6 +150,7 @@ Requires Rust stable MSVC and Visual Studio Build Tools with the C++ workload.
 ```powershell
 cargo run --release
 cargo run --release -- "D:\Drawings\canvas.esketch"
+cargo build --release
 ```
 
 Checks:

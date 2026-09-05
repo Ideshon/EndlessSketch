@@ -1,6 +1,7 @@
 use crate::coords::CameraAddress;
 use crate::coords::CanvasPoint;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 pub const DEFAULT_LAYER_ID: Uuid = Uuid::from_u128(1);
@@ -121,6 +122,8 @@ pub struct EditOperation {
     pub paint_order: Option<i64>,
     #[serde(default)]
     pub transaction_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_group_id: Option<Uuid>,
     #[serde(default = "default_layer_id")]
     pub layer_id: Uuid,
     pub kind: EditKind,
@@ -129,6 +132,8 @@ pub struct EditOperation {
     pub points: Vec<CanvasPoint>,
     pub color: Color,
     pub width_px: f32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub smooth_area: bool,
     pub destructive: bool,
     pub affects_before_sequence: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -156,6 +161,7 @@ impl EditOperation {
             sequence: 0,
             paint_order: None,
             transaction_id: id,
+            fill_group_id: None,
             layer_id: DEFAULT_LAYER_ID,
             kind,
             native_depth,
@@ -163,6 +169,7 @@ impl EditOperation {
             points,
             color,
             width_px,
+            smooth_area: false,
             destructive,
             affects_before_sequence: None,
             tombstone_targets: Vec::new(),
@@ -180,6 +187,7 @@ impl EditOperation {
             sequence: 0,
             paint_order: None,
             transaction_id: id,
+            fill_group_id: None,
             layer_id,
             kind: EditKind::Erase,
             native_depth: 0,
@@ -187,6 +195,7 @@ impl EditOperation {
             points: Vec::new(),
             color: Color::WHITE,
             width_px: 0.0,
+            smooth_area: false,
             destructive: true,
             affects_before_sequence: None,
             tombstone_targets: targets,
@@ -202,6 +211,7 @@ impl EditOperation {
             sequence: 0,
             paint_order: None,
             transaction_id: id,
+            fill_group_id: None,
             layer_id,
             kind: EditKind::Paint,
             native_depth: 0,
@@ -209,6 +219,7 @@ impl EditOperation {
             points: Vec::new(),
             color: Color::WHITE,
             width_px: 0.0,
+            smooth_area: false,
             destructive: false,
             affects_before_sequence: None,
             tombstone_targets: Vec::new(),
@@ -228,6 +239,7 @@ impl EditOperation {
             sequence: 0,
             paint_order: None,
             transaction_id: id,
+            fill_group_id: None,
             layer_id,
             kind: EditKind::CompactBlock,
             native_depth: points.first().map_or(0, |point| point.depth),
@@ -235,6 +247,7 @@ impl EditOperation {
             points,
             color: Color::BLACK,
             width_px: 0.0,
+            smooth_area: false,
             destructive: false,
             affects_before_sequence: None,
             tombstone_targets: Vec::new(),
@@ -249,6 +262,12 @@ impl EditOperation {
         }
         if self.layer_id.is_nil() {
             self.layer_id = DEFAULT_LAYER_ID;
+        }
+        if self.kind != EditKind::Fill || self.fill_group_id.is_some_and(|id| id.is_nil()) {
+            self.fill_group_id = None;
+        }
+        if self.kind != EditKind::Fill {
+            self.smooth_area = false;
         }
         self.tombstone_targets
             .retain(|target_id| *target_id != self.id);
@@ -285,6 +304,20 @@ impl EditOperation {
         self.paint_order.unwrap_or(self.sequence)
     }
 
+    pub fn object_group_id(&self) -> Uuid {
+        self.fill_group_id.unwrap_or(self.id)
+    }
+
+    pub fn shares_fill_group_with(&self, other: &Self) -> bool {
+        self.kind == EditKind::Fill
+            && other.kind == EditKind::Fill
+            && self.fill_group_id.is_some()
+            && self.fill_group_id == other.fill_group_id
+            && self.layer_id == other.layer_id
+            && self.color == other.color
+            && self.effective_paint_order() == other.effective_paint_order()
+    }
+
     pub fn visible_color(&self, background: Color) -> Color {
         if self.kind.is_erase() {
             background
@@ -295,6 +328,33 @@ impl EditOperation {
 
     pub fn opaque_visible_color(&self, background: Color) -> Color {
         self.visible_color(background).flattened_over(background)
+    }
+}
+
+pub(crate) fn remap_fill_group_ids(operations: &mut [EditOperation]) {
+    fn remap(operation: &mut EditOperation, ids: &mut HashMap<Uuid, Uuid>) {
+        if let Some(group_id) = operation.fill_group_id {
+            operation.fill_group_id = Some(*ids.entry(group_id).or_insert_with(Uuid::new_v4));
+        }
+        for source in &mut operation.compact_sources {
+            remap(source, ids);
+        }
+    }
+
+    let mut ids = HashMap::new();
+    for operation in operations {
+        remap(operation, &mut ids);
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+pub(crate) fn set_operation_layer_recursive(operation: &mut EditOperation, layer_id: Uuid) {
+    operation.layer_id = layer_id;
+    for source in &mut operation.compact_sources {
+        set_operation_layer_recursive(source, layer_id);
     }
 }
 
@@ -350,5 +410,32 @@ mod tests {
         assert_eq!(operation.id, id);
         assert_eq!(operation.transaction_id, id);
         assert_eq!(operation.layer_id, DEFAULT_LAYER_ID);
+    }
+
+    #[test]
+    fn fill_group_identity_round_trips_and_legacy_payload_defaults_to_none() {
+        let mut operation =
+            EditOperation::draft(EditKind::Fill, 0, 1.0, Vec::new(), Color::BLACK, 0.0);
+        let group_id = Uuid::new_v4();
+        operation.fill_group_id = Some(group_id);
+        operation.smooth_area = true;
+
+        let mut payload = serde_json::to_value(&operation).unwrap();
+        let decoded: EditOperation = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(decoded.fill_group_id, Some(group_id));
+        assert!(decoded.smooth_area);
+        assert_eq!(decoded.object_group_id(), group_id);
+
+        payload.as_object_mut().unwrap().remove("fill_group_id");
+        payload.as_object_mut().unwrap().remove("smooth_area");
+        let legacy: EditOperation = serde_json::from_value(payload).unwrap();
+        assert_eq!(legacy.fill_group_id, None);
+        assert!(!legacy.smooth_area);
+        assert_eq!(legacy.object_group_id(), legacy.id);
+
+        let mut invalid = operation;
+        invalid.kind = EditKind::Paint;
+        invalid.normalize_metadata();
+        assert_eq!(invalid.fill_group_id, None);
     }
 }

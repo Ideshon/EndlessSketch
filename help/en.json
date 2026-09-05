@@ -13,7 +13,7 @@
         },
         {
           "name": "Eraser (E)",
-          "description": "Removes older content under the stroke. It uses the same size control as the Brush."
+          "description": "In vector mode, subtracts its stroke from Paint, Fill, and vector sources inside CompactBlock on the active visible/unlocked layer inside Depth capture. Targets are fixed on pointer down, an empty gesture adds no history, and one Undo restores the whole result. It shares Brush size; fragments of one Fill remain one object."
         },
         {
           "name": "Area Fill (L / X)",
@@ -29,7 +29,7 @@
         },
         {
           "name": "Area Fill / Erase (X)",
-          "description": "Press X once to activate Area Fill, then press X again to cycle Area Fill and Area Erase. Area Erase traces the area to erase. Press Esc to cancel an unfinished contour."
+          "description": "Press X once to activate Area Fill, then press X again to cycle Area Fill and Area Erase. In vector mode, Area Erase subtracts its closed area from Paint, Fill, and vector sources inside CompactBlock on the active visible/unlocked layer inside Depth capture. Targets are fixed on pointer down, an empty area adds no history, and one Undo restores the whole result. Press Esc to cancel an unfinished contour."
         },
         {
           "name": "Straight line",
@@ -119,7 +119,7 @@
         },
         {
           "name": "Freeze/Compact selected",
-          "description": "Packs the selected Object set on the active visible unlocked layer into one CompactBlock operation, including separated objects and existing compact blocks. The block stores a vector snapshot, not a bitmap. Rendering expands its sources back into the global paint order, while editing treats the block as one optimized object: it can be selected, moved, scaled, rotated, flipped, copied, pasted, moved to another layer, and compacted again with other objects."
+          "description": "Packs the selected Object set on the active visible unlocked layer into one CompactBlock operation, including separated objects and existing compact blocks. The block stores a vector snapshot, not a bitmap. Rendering expands its sources back into the global paint order, while editing treats the block as one optimized object: it can be selected, moved, scaled, rotated, flipped, copied, pasted, moved to another layer, and compacted again with other objects. Both erasers recursively edit stored Paint/Fill sources without unpacking the block in the UI."
         },
         {
           "name": "Right-click Selection menu",
@@ -176,6 +176,10 @@
           "description": "New objects are created only on the active layer. Object Selection searches only that layer."
         },
         {
+          "name": "Depth capture",
+          "description": "Depth capture ±N in Layers limits Object Selection to the complete native-depth span around the current camera depth. Auto is enabled by default and follows Vector depth radius. With Auto off, the manual radius cannot exceed the vector radius. A mixed-depth CompactBlock is selected only as a whole; changing the effective radius or crossing a depth boundary clears the current Object Selection."
+        },
+        {
           "name": "Visibility and lock",
           "description": "The first checkbox hides a layer; the second prevents edits. A hidden or locked active layer rejects drawing and selection."
         },
@@ -206,11 +210,11 @@
       "items": [
         {
           "name": "Profile",
-          "description": "Performance, Balanced, and Quality now change most speed/quality settings together: input spacing, fallback limits, Stroke fallback joins, Saved fallback ops, zoom settle, tile workers/resolution, auto-pause while drawing, deferred preview, rebuild policy, prefetch, edge quality, smoothing, PNG compression, Storage commit, and Preview FPS. Custom appears after any managed field is edited. Manual Pause tile generation, Cache size, Display, logging, and Keep latest objects remain independent."
+          "description": "Performance, Balanced, and Quality change most speed/quality settings together, including Vector depth radius (1/2/4). With Depth capture Auto enabled, its effective radius follows that value; with Auto off, the manual radius remains independent within the vector boundary. Custom appears after any managed field is edited. Distant tiles, Auto itself, manual Pause tile generation, Cache size, Display, logging, and Keep latest objects remain independent."
         },
         {
           "name": "Brush input px",
-          "description": "Minimum distance between accepted Brush and Eraser points. A smaller value follows fast movement more accurately but stores more points, increasing document size and processing load. A larger value stores fewer points but can lose small turns. This is not smoothing strength."
+          "description": "Minimum distance between accepted Brush and Eraser points. On Windows, changed cursor positions are sampled independently of UI FPS while the primary button is physically down; native ordered Touch events remain preferred. A smaller value stores more of those points, increasing document size and processing load. A larger value stores fewer points but can lose small turns. This is not smoothing strength."
         },
         {
           "name": "Fill input px",
@@ -226,7 +230,7 @@
         },
         {
           "name": "Stroke fallback joins",
-          "description": "Controls saved-stroke joins in temporary no-tile vector fallback. Auto preserves capsule joins and saved smoothing for short sparse saved strokes while viewing, but uses a fast one-shape raw polyline path without endpoint caps during active drawing or tile waiting. Quality keeps capsule joins longer. Performance always uses the fast raw one-shape path. On overloaded no-tile scenes, a frame budget can temporarily downgrade extra segmented runs to the fast path to avoid crashes or memory spikes. Stored document points and PNG tiles do not change."
+          "description": "Controls saved-stroke joins in temporary no-tile vector fallback. Auto preserves capsule joins and saved smoothing for short sparse saved strokes while viewing, but uses a fast one-shape raw polyline path without endpoint caps during active drawing or tile waiting. A manual tile-generation pause alone keeps the idle quality path. Quality keeps capsule joins longer. Performance always uses the fast raw one-shape path. On overloaded no-tile scenes, a frame budget can temporarily downgrade extra segmented runs to the fast path to avoid crashes or memory spikes. Stored document points and PNG tiles do not change."
         },
         {
           "name": "Saved fallback ops",
@@ -241,12 +245,20 @@
           "description": "Number of background tile-rendering threads. More workers rebuild faster on a powerful CPU but compete more strongly with the UI and other applications."
         },
         {
+          "name": "Distant tiles",
+          "description": "Uses the existing whole-scene PNG tile when a non-empty viewport has no nearby editable operation on the active visible/unlocked layer. Other visible layers are included in the tile but do not keep vector mode active. Empty views create no tile jobs. In distant_tile mode Selection, Eraser, and Area Erase are read-only; Brush and Fill remain available and return the view to vectors after commit."
+        },
+        {
+          "name": "Vector depth radius",
+          "description": "Camera-relative radius ±N for vector display. If the complete native-depth span of an editable operation on the active visible/unlocked layer fits the radius, the whole viewport is vectors_near and cached PNG is not mixed in. CompactBlock stays atomic. Range 0–32; default ±2. Performance/Balanced/Quality set 1/2/4."
+        },
+        {
           "name": "Tile resolution",
           "description": "Physical PNG size of each tile. 64–256 px is faster and smaller but looks more pixelated. 512 px is the normal balance. 1024–2048 px adds detail at higher CPU, memory, disk, and upload cost."
         },
         {
           "name": "Pause tile generation",
-          "description": "Stops all new PNG tile work. Drawing, vector saves, Undo/Redo, and backups continue. The canvas uses vector display and any tiles already available."
+          "description": "Stops all new PNG tile work. Drawing, vector saves, Undo/Redo, and backups continue. Distant views use vector fallback while paused; nearby views are always vector-rendered."
         },
         {
           "name": "Pause tile generation while drawing",
@@ -270,7 +282,7 @@
         },
         {
           "name": "Smoothing",
-          "description": "Display smoothing for Brush, Eraser, and Fill geometry. Off shows raw points. Light, Balanced, and Strong progressively remove more jitter and round corners. Stored document points do not change."
+          "description": "Display smoothing for Brush, Eraser, and newly drawn freehand Fill geometry. Off shows raw points. Light, Balanced, and Strong progressively remove more jitter and round corners. Redundant straight interpolation from a stalled input frame is ignored before saved and raster smoothing. Fill polygons produced by Area clipping or vector erasing keep their exact boundaries. Stored raw points do not change."
         },
         {
           "name": "Cache size MiB",

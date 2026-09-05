@@ -23,7 +23,8 @@ pub const MAX_TILE_LOD: u8 = TILE_RESOLUTIONS.len() as u8 - 1;
 const TILE_RENDERER_CACHE_VERSION: u32 = 9;
 const DEFAULT_MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PngCompression {
     #[default]
     Fast,
@@ -32,6 +33,16 @@ pub enum PngCompression {
 }
 
 impl PngCompression {
+    pub const ALL: [Self; 3] = [Self::Fast, Self::Balanced, Self::Small];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast",
+            Self::Balanced => "Balanced",
+            Self::Small => "Small",
+        }
+    }
+
     fn encoder_type(self) -> CompressionType {
         match self {
             Self::Fast => CompressionType::Fast,

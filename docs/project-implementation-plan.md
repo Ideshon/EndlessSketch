@@ -1,6 +1,6 @@
 # План EndlessSketch
 
-Обновлено: 2026-07-07
+Обновлено: 2026-07-27
 
 ## Обозначения
 
@@ -11,6 +11,496 @@
 - **Очень высокая** — изменение модели документа или рендера с миграцией, производительностью и большим набором регрессий.
 
 Оценка сложности не является оценкой времени. Каждый крупный этап разбивается на короткие проверяемые checkpoints.
+
+## Дальние тайлы, захват глубины и векторное стирание
+
+Цель: вернуть тайлам роль дешёвого обзорного представления. Близкое содержимое
+рисуется и редактируется как авторитетные векторы; когда всё видимое содержимое
+находится дальше настроенного радиуса, вся сцена заменяется существующим
+полноэкранным тайлом. Одновременное смешивание дальнего PNG и ближних векторов
+не используется, потому что оно нарушает общий paint order, Fill/Eraser и
+слои.
+
+Основные инварианты:
+
+- Depth остаётся масштабом иерархических координат, а не осью слоёв.
+- SQLite/WAL и append-only vector operations остаются источником истины.
+- Обзорный тайл является read-only: Selection, Eraser и Area Erase не изменяют
+  содержимое, представленное только тайлом.
+- Brush/Fill могут создать новый объект на текущей глубине и перевести область
+  обратно в векторный режим.
+- Захват глубины задаётся симметричным радиусом `±N` относительно camera depth.
+- `Auto` связывает радиус редактирования с векторным радиусом; в ручном режиме
+  edit radius не может выходить за vector radius.
+- Обычная резинка и стирающее ласо используют один target-snapshot и одну
+  append-only vector-subtraction transaction; новые белые `Erase`/`EraseArea`
+  после перехода не создаются.
+- Старые белые erase-операции продолжают открываться и рендериться без
+  автоматической неоднозначной миграции.
+
+### DT-01. Общий editable-vector set
+
+- [x] Переиспользовать текущий spatial tile query для отбора операций текущего
+  viewport.
+- [x] Ограничить набор active visible unlocked layer и полным native-depth
+  диапазоном `±N`.
+- [x] Считать `CompactBlock` атомарным: весь recursive source depth span должен
+  попадать в захват.
+- [x] Перевести Object Selection click/rectangle/Alt cycle на единый набор.
+- [x] Добавить независимый `Depth capture ±N` в Layers и сохранить его в
+  settings; настройка editability не входит в Performance presets.
+- [x] Покрыть границы, отрицательные depth, locked/hidden/wrong layer и
+  mixed-depth CompactBlock focused tests.
+- [x] Не менять в этом checkpoint текущий tile/fallback и erase persistence.
+
+**DT-01 реализован и автоматически проверен:** settings v17 добавляет
+`Depth capture ±N` (`0..32`, default `±2`) в Layers. Общий document query
+переиспользует spatial viewport index, active visible unlocked layer и полный
+recursive depth span; Object Selection click/rectangle/Alt cycle используют
+этот набор. При переходе camera depth boundary или изменении радиуса текущий
+Object Selection консервативно очищается. Текущие tile/fallback,
+Erase/EraseArea, `.esketch`, SQLite и raster cache identity не менялись.
+Пользователь вручную подтвердил DT-01 2026-07-27.
+
+### DT-02. Дальние read-only тайлы
+
+- [x] Добавить `Distant tiles` и `Vector depth radius ±N`.
+- [x] Если хотя бы одна spatially-visible editable operation активного visible
+  unlocked слоя попадает в vector radius, рисовать всю сцену существующим
+  vector fallback и не ставить tile jobs.
+- [x] Если всё видимое содержимое дальше радиуса, использовать существующий
+  whole-scene tile pipeline без нового формата тайлов.
+- [x] Не создавать тайлы для пустого viewport.
+- [x] В tile-only режиме блокировать Selection/Eraser/Area Erase с понятным
+  status; Brush/Fill остаются доступными.
+- [x] Сохранять старые tile textures как rebuildable cache, но не перестраивать
+  их во время близкого редактирования.
+- [x] Добавить диагностику `vectors_near` / `distant_tile` / `empty`.
+
+**DT-02 реализован и автоматически проверен:** settings v18 добавляет
+`Distant tiles` и `Vector depth radius ±N` (`0..32`, default `±2`). Один
+spatial query классифицирует viewport как `vectors_near`, `distant_tile` или
+`empty`; nearby-критерий использует editable operations активного visible
+unlocked слоя, а только `distant_tile` входит в прежний whole-scene tile pipeline.
+Переход режима отменяет устаревшие jobs, но сохраняет готовые PNG как
+rebuildable cache. В дальнем режиме Object Selection, Eraser и Area Erase
+read-only; Brush/Fill остаются доступны и после commit возвращают векторы.
+SQLite, `.esketch`, paint order, tile identity и legacy erase persistence не
+изменялись.
+
+После ручного отчёта «видно только `vectors_near`» критерий исправлен:
+операции других видимых слоёв больше не удерживают векторный режим. На реальном
+dense-документе прежнее условие находило близкие источники почти на каждой
+глубине; active-layer scope сохраняет редактируемость без такой блокировки.
+Пользователь вручную подтвердил переход в `distant_tile` на исправленной
+portable-сборке 2026-07-27.
+
+### DT-03. Auto, presets и UX
+
+- [x] Добавить `Auto`: Depth capture следует за Vector depth radius.
+- [x] При выключенном Auto ограничить ручной edit radius векторным радиусом.
+- [x] Включить tile radius в Performance/Balanced/Quality; edit-only control
+  оставить независимым, когда Auto выключен.
+- [x] Показывать `±N (2N+1 уровней)` и причину read-only режима.
+- [x] При смене глубины/радиуса не позволять уже выбранным объектам обойти
+  editable-vector scope.
+
+**DT-03 реализован:** settings v19 сохраняет `Depth capture Auto` (по умолчанию
+включён). Общая нормализация при Auto синхронизирует edit radius с
+`Vector depth radius`, а в ручном режиме ограничивает его векторной границей.
+Смена профиля или Vector depth radius очищает текущее Object Selection, если
+эффективный edit scope изменился; смена camera depth сохраняет прежний
+консервативный reset. Tile pipeline, `.esketch`, SQLite и erase persistence не
+менялись. Фокусные 15 settings/profile тестов и полный набор из 273 тестов,
+fmt, clippy и release build прошли; portable exe и двуязычная Help обновлены.
+
+### VE-01. Общая векторная резинка для Paint
+
+- [x] На pointer down фиксировать targets: viewport, layer scope, depth capture,
+  vector mode и существующий paint order.
+- [x] Представить обычную резинку толстой траекторией, Area Erase — замкнутым
+  полигоном; обе формы передавать одной erase-команде.
+- [x] Вычитать область из Paint stroke с учётом ширины и сохранять surviving
+  runs как replacement operations.
+- [x] Tombstone исходных операций и replacements записывать одной transaction;
+  пустой результат не меняет history/revision.
+- [x] Не ставить tile jobs во время жеста; после commit менять revision один
+  раз, а дальний тайл строить только при последующем уходе вдаль.
+
+**VE-01a реализован:** `CanvasDocument::commit_paint_subtraction` принимает
+зафиксированные UUID Paint и готовые surviving runs. Неизменённая геометрия не
+создаёт history; split и полное удаление различаются; tombstone и replacements
+сохраняются одной существующей operation-group transaction с исходными style,
+layer и paint order. Reopen/Undo/Redo проверены. Нового SQLite schema или
+operation kind нет; интерактивные Eraser/Eraser Lasso пока не переключены.
+
+**VE-01b реализован:** чистая геометрия обычной толстой резинки проецирует
+Paint и capsule-chain mask через текущую camera, вырезает интервалы по сумме
+радиусов Paint/Eraser и возвращает surviving runs в canvas coordinates на
+глубине исходного сегмента. Outside остаётся точным no-op; crossing split,
+tangent, endpoint и full removal проверены. Инструменты пока не подключены.
+
+**VE-01c реализован:** обычный Eraser на pointer down фиксирует существующие
+Paint UUID активного visible/unlocked слоя из общего viewport/depth query.
+Live draft остаётся прежним preview, но не сохраняется как legacy-белая
+Erase-операция. На pointer up Area selection обрезает маску, VE-01b вычисляет
+surviving runs, а VE-01a записывает все tombstone/replacements одной
+transaction. No-hit не меняет revision; реальное стирание очищает устаревший
+Object Selection и входит в Undo/Redo одним шагом. Fill, CompactBlock и Eraser
+Lasso этим checkpoint не изменены. Фокусные проверки и полный набор из 277
+тестов, fmt, clippy и release build прошли; portable exe и двуязычная Help
+обновлены.
+
+Несрочный visual follow-up: при разрыве Paint добавить скруглённые endpoint
+caps у новых surviving runs. Это не должно менять авторитетную геометрию,
+границы вычитания или формат документа; выполнять вместе с унификацией
+fallback/raster stroke caps.
+
+**VE-01d реализован:** чистая геометрия Eraser Lasso вычитает из Paint
+внутренность произвольного замкнутого polygon и расширяет её границу на радиус
+Paint, чтобы учитывать видимую толщину линии. Общая с обычной резинкой сборка
+surviving runs переиспользована без второго преобразования координат. Outside,
+crossing, endpoint containment, boundary-width overlap и full removal
+проверены; полный набор из 278 тестов, fmt, clippy и release build прошёл.
+Интерактивный Eraser Lasso пока сохраняет прежнюю legacy EraseArea-операцию.
+
+**VE-01e реализован:** Eraser Lasso переиспользует общий pointer-down snapshot
+Paint UUID из active visible/unlocked layer и effective Depth capture.
+Замкнутый контур сначала обрезается текущей Area selection, затем все polygon
+fragments последовательно применяются к surviving runs и записываются одним
+`commit_paint_subtraction`. No-hit не меняет revision; реальное стирание
+очищает устаревший Object Selection и отменяется одним Undo. Новые EraseArea
+операции больше не создаются; legacy EraseArea по-прежнему открываются и
+рендерятся. Фокусные проверки и полный набор из 279 тестов, fmt, clippy и
+release build прошли; portable exe и двуязычная Help обновлены.
+Пользователь вручную подтвердил VE-01e 2026-07-27.
+
+### VE-02. Fill, holes, CompactBlock и legacy
+
+Цель следующей серии checkpoints: распространить уже проверенную
+target-snapshot/vector-subtraction механику с Paint на Fill и затем на
+CompactBlock, не вводя новый формат документа раньше измеренной необходимости.
+
+#### VE-02a. Polygon difference без persistence
+
+- [x] Добавить чистую операцию `source Fill polygon - erase polygon(s)`.
+- [x] На первом шаге возвращать набор неперекрывающихся простых Fill-полигонов,
+  используя текущие `points`; отдельное поле `holes` и новый operation kind не
+  добавлять.
+- [x] Переиспользовать существующие normalization, winding, triangulation и
+  convex clipping helpers; не возвращать удалённые зависимости.
+- [x] Отбрасывать вырожденные/нечисловые фрагменты и сохранять исходную
+  canvas-coordinate глубину точек.
+- [x] Ввести безопасный лимит числа фрагментов на один source. При превышении
+  возвращать ошибку и не менять документ; значение выбрать по focused stress,
+  а не как пользовательскую настройку.
+- [x] Покрыть disjoint, source-inside-mask, mask-inside-source (hole),
+  crossing, shared edge, tangent, reversed winding, concave source/mask,
+  несколько масок и no-op.
+
+VE-02a завершён 2026-08-12. Чистая операция работает в локальной системе
+координат относительно source anchor, возвращает замкнутые простые convex
+fragments на исходной глубине и не меняет document/history. Измеренный stress
+с 48 раздельными crossing masks дал 98 неперекрывающихся fragments; фиксированный
+лимит 4096 проверен отдельным overflow-тестом. Формат `.esketch`, UI и
+persistence не менялись. С 2026-08-15 существующий degenerate source является
+точным no-op; invalid mask/non-finite geometry по-прежнему возвращает ошибку.
+Предварительное решение — сохранить текущий `points`
+payload; окончательный decision gate остаётся за VE-02b raster/fallback
+equivalence.
+
+Decision gate после VE-02a:
+
+- Если неперекрывающиеся Fill-фрагменты совпадают в fallback/raster и их число
+  остаётся ограниченным, сохранить текущий payload без миграции.
+- Только если измерены швы, неприемлемый fragment explosion или потеря
+  объектной семантики, добавить минимальное
+  `#[serde(default, skip_serializing_if = "Vec::is_empty")] area_holes` либо
+  grouping field. До этого не менять `.esketch` payload и manifest.
+
+#### VE-02b. Одинаковая визуальная семантика
+
+- [x] Сравнить исходный Fill минус mask с набором surviving Fill fragments в
+  vector fallback и raster tile при одинаковом paint order.
+- [x] Измерить общие границы фрагментов во всех трёх edge-quality modes:
+  points-only представление не прошло gate из-за воспроизводимых внутренних
+  швов.
+- [x] Проверить hit testing, rectangle/lasso Selection, bounds/spatial index,
+  move/scale/rotate/flip/recolor и clipboard для полученных простых Fill.
+- [x] Проверить extreme depth и BigInt lateral coordinates без преобразования
+  авторитетных points в глобальные `f64`.
+- [x] Не подключать UI, пока raster/fallback equivalence не подтверждена.
+
+VE-02b diagnostic завершён 2026-08-12. На фиксированном tile `128x128`
+исходный Fill + legacy mask и surviving fragments сохранили paint order, но
+разошлись на 208 pixels в vector fallback и на 15/203/205 pixels при
+`edge_quality=0/1/2` в raster. Простой Fill hit testing корректно исключает
+вырезанную область, а bounds, spatial query и screen transforms остаются
+представимыми на depth `1200` и tile `10^200`. Однако отдельные UUID превращают
+один исходный Fill в независимо выбираемые, перекрашиваемые, перемещаемые и
+копируемые fragments. Поэтому текущий points-only payload одновременно теряет
+визуальную и объектную семантику; persistence/UI wiring отклонены.
+
+Decision gate пройден с решением добавить минимальную группировку, а не
+`area_holes`: difference может возвращать несколько раздельных components, для
+которых один внешний контур с holes недостаточен.
+
+#### VE-02b1. Атомарная Fill-группа
+
+- [x] Добавить optional serde-default `fill_group_id`; legacy operations без
+  поля сохраняют прежнюю identity, schema migration не требуется.
+- [x] Объединять raster scanline coverage всех последовательных fragments одной
+  группы и paint order до единственного blend.
+- [x] Объединять fallback spans группы; fallback operation budget не должен
+  начинать отрисовку с середины группы.
+- [x] Расширять click/Ctrl/Shift/Alt cycle, Inside/Crossing rectangle Selection,
+  hover и выбранные IDs на всю группу.
+- [x] Применять move/scale/rotate/flip/recolor/reorder/delete/clipboard и перенос
+  между слоями ко всей группе даже при передаче одного member UUID.
+- [x] При paste и Duplicate Layer выдавать группе новый identity; сохранять один
+  paint order и совместимость после reopen.
+
+VE-02b1 завершён 2026-08-14. Grouped raster совпадает с reference
+source-plus-mask на `128x128` без отличающихся pixels во всех
+`edge_quality=0/1/2`. Fallback surviving fragments до и после группировки
+совпадают точно: прежние 208 отличий от legacy `EraseArea` находятся только в
+полосе `<=1.5 px` его внешней mask boundary и вызваны существующим вертикальным
+scanline overdraw, а не внутренними fragment seams. Group payload и object
+commands проверены на depth `1200`, tile `10^200`, persistence/reopen и partial
+member selection. Eraser UI и Fill replacement commit не подключались.
+
+Portable executable refreshed from the validated release target on
+2026-08-14; SHA-256 matches exactly. Help and existing archives were unchanged.
+The user reported normal behavior in a general portable smoke check; this does
+not count as a manual Fill-replacement check because that UI path is not wired.
+
+#### VE-02c. Append-only Fill replacement
+
+- [x] Обобщить существующий `commit_paint_subtraction` до минимального общего
+  replacement helper для Paint/Fill либо добавить тонкий Fill-вход к тому же
+  transaction builder; не дублировать tombstone/history код.
+- [x] Для каждого source сохранять layer, color, native depth/zoom и
+  `effective_paint_order`; каждому surviving fragment выдавать новый UUID.
+- [x] Записывать tombstone исходных Fill и все replacements одной transaction.
+- [x] Точный no-op не должен менять revision/history; полное удаление создаёт
+  только tombstone; Undo/Redo/Reopen возвращают исходный единый Fill.
+- [x] Проверить branch-after-undo, locked/hidden/wrong layer, duplicate/stale
+  targets и отсутствие частичного commit при ошибке одного source.
+
+VE-02c завершён 2026-08-14. Тонкий `commit_fill_subtraction` использует тот же
+общий transaction builder, что и Paint: batch полностью проверяется до записи,
+после чего tombstone и surviving fragments сохраняются одной append-only
+transaction. Три focused-теста покрывают exact no-op, partial/full replacement,
+новые UUID/group identity, source metadata, multi-source atomicity,
+Undo/Redo/Reopen, branch-after-undo, stale/duplicate/wrong-kind/wrong-layer,
+invalid geometry и locked/hidden layers. Eraser UI и CompactBlock не менялись.
+Portable executable затем обновлён по запросу пользователя; его SHA-256
+`6249FE33CBF4BDD81E0F12B9FD5B92A03D1C7035F14C7C4729801FBA952C8210` точно
+совпадает с проверенным release target. Help и существующие архивы не менялись.
+
+#### Regression fix: Merge Down + CompactBlock
+
+- [x] Рекурсивно переносить `layer_id` всех `compact_sources` на destination
+  layer; не оставлять render sources привязанными к удалённому source layer.
+- [x] Проверить сохранение видимых source UUID до/после Merge Down, reopen,
+  Undo и Redo.
+- [x] Собрать и обновить portable для проверки у пользовательской log marker.
+
+Исправлено 2026-08-14 после пользовательского отчёта. Detailed session log
+показал проблемное слияние после `Compacted 174 old object groups`. Перестановка
+слоёв обходила дефект, потому что CompactBlock оказывался destination, а не
+переносимым source. Пользователь повторно проверил исправленный portable и
+подтвердил нормальное слияние слоёв. Пользовательский `.esketch` и его backups
+не изменялись.
+
+#### VE-02d. Подключение обычной резинки и Eraser Lasso к Fill
+
+- [x] Расширить существующий pointer-down snapshot на `Paint | Fill`, не
+  создавать второй target collector.
+- [x] Обычной резинке передавать capsule mask, Eraser Lasso — polygon fragments
+  после Area selection clipping.
+- [x] В одном жесте сначала вычислять все Paint/Fill replacements, затем делать
+  одну transaction; ошибка любой геометрии отменяет весь жест.
+- [x] Сохранять текущие no-hit/no-revision, один Undo, active layer,
+  Depth capture, distant-tile read-only и отсутствие nearby tile jobs.
+- [ ] Help обновлён после подключённого поведения; ручной check на Paint+Fill
+  одним жестом ожидается у двух пользовательских меток.
+- [ ] Представить частичное стирание внутри толстого `Paint` геометрией контура/
+  cutout: текущая centerline-модель может удалить только полный поперечный
+  интервал штриха и поэтому не подходит для маленького внутреннего отверстия.
+
+VE-02d реализован 2026-08-14. Оба инструмента используют один общий snapshot
+Paint/Fill/CompactBlock целей на pointer down. Обычная резинка строит ограниченную
+цепочку rounded capsule masks, а Eraser Lasso передаёт замкнутые polygon fragments
+после Area selection clipping. Mixed batch целиком вычисляется до одной
+append-only replacement/tombstone transaction. Fill fragments получают одну
+свежую group identity, поэтому остаются единым объектом.
+
+#### VE-02e. CompactBlock
+
+- [x] Оставить CompactBlock атомарным target для Selection и depth capture.
+- [x] Рекурсивно применить Paint/Fill subtraction к `compact_sources`, не
+  раскрывая block в UI.
+- [x] Удалить пустые recursive sources, обновить UUID изменённых источников,
+  пересчитать block bounds/native depth и сохранить глобальный paint order.
+- [x] Неизменённый block оставить точным no-op; полностью пустой block удалить
+  tombstone; частичный результат заменить одним CompactBlock.
+- [x] Проверить mixed Paint/Fill, nested/flattened blocks, move/scale/recolor
+  после erase, Undo/Redo/Reopen и raster/fallback equivalence.
+
+VE-02e реализован 2026-08-14. Резинка рекурсивно заменяет Paint/Fill внутри
+CompactBlock, сохраняет совместимые legacy Erase/EraseArea sources, удаляет
+пустые sources и пересчитывает bounds. Частичное изменение оставляет один
+CompactBlock, полное удаление создаёт только его tombstone, no-op не меняет
+revision. Новые mixed/full-delete/no-op/group tests дополняют существующие
+CompactBlock transform и raster/fallback equivalence regressions.
+
+**VE-02d/VE-02e cross-depth regression исправлен 2026-08-14.** Первый portable
+после подключения Fill атомарно отклонял оба инструмента с
+`fill subtraction mask polygon is degenerate`: валидная экранная маска
+сжималась ниже геометрического порога в source-depth coordinates. Первая
+scale-коррекция устранила вырождение, но реальный повторный лог выявил следующий
+`mask polygon could not be triangulated`: раздутые абсолютные `f32` coordinates
+теряли точность. Итоговый общий helper обеих резинок выполняет интерактивную Fill
+difference в ограниченных координатах текущей camera и переводит surviving
+fragments обратно на исходный depth. Регрессия проверяет физический вырез центра,
+сохранение соседней области и source depth.
+
+Повторная проверка на чистом холсте прошла, но документ после `Compact older`
+и Merge по-прежнему атомарно отклонял оба инструмента с
+`fill subtraction source polygon could not be triangulated`. Read-only scan
+показал 1279 таких исторических Fill внутри рекурсивных CompactBlock и ни одного
+в текущем viewport: видимый верхнеуровневый block заставлял новый erase path
+триангулировать также далёкие sources. Общий recursive path теперь до точной
+subtraction отбрасывает Paint/Fill, чьи current-camera screen bounds заведомо не
+пересекают bounds маски. Он не распаковывает CompactBlock и не меняет формат или
+хранимые данные. Новая регрессия сохраняет далёкий нетриангулируемый Fill без
+изменений и одновременно проверяет вырез видимого Paint. Полный набор содержит
+301 тест; portable заменён release-сборкой с SHA-256
+`875B94AFFCFC36EF134993CA2B1D3BDCC7898E0921FFEB4B843A2739E2850DB5`.
+
+**Manual continuation checkpoint, 2026-08-14:** исправление `culling` помогло, но
+не завершило VE-02d/VE-02e на пользовательском Compact older + Merge документе.
+Продолжать после перезапуска по
+`release/EndlessSketch-Rust/local/logs/session-20260814-155652.jsonl`: успешные
+ordinary Eraser commits дошли до revision 14614, Eraser Lasso — до revision
+14620, однако остались `eraser subtraction contains an invalid replacement`,
+source polygon `is degenerate` / `could not be triangulated` и ordinary mask
+`could not be triangulated`. Главная сохранённая точка — marker 1,
+`2026-08-14T15:59:05.517`, depth `-1`, tile `(1,-1)`, local
+`(0.4883031640369253, 0.6880274157134905)`, zoom `2.224298268395473`, revision
+`14617`: Eraser Lasso отклонён из-за degenerate source polygon. Следующий шаг —
+read-only найти exact source UUID/kind и отделить старую source-нормализацию от
+invalid generated replacement; затем добавить focused regressions и исправить
+общий путь обеих резинок. До этого VE-02f не начинать.
+
+**VE-02d/VE-02e marker-1 correction, 2026-08-15:** read-only reproducer на
+копии пользовательского документа нашёл точный источник: zero-area Fill
+`a842f702-673b-409b-a7ad-d81932abbd98` внутри CompactBlock
+`4a177b88-7909-44fb-8fda-71cd9d68b955`; все 50 stored points имеют один X.
+Скан также нашёл пять двухточечных legacy Fill, из-за которых любое другое
+изменение содержащего их CompactBlock отклонялось как `invalid replacement`.
+Общий subtraction path теперь сохраняет нетриангулируемый legacy source как
+точный no-op, а transaction validator разрешает только неизменённую ранее
+существовавшую invalid Fill geometry. Invalid masks и новые invalid fragments
+по-прежнему атомарно отклоняются.
+
+Ошибка ordinary mask отдельно воспроизведена на generated capsule минимальной
+ширины: порог итогового Fill fragment ошибочно применялся к каждому корректному
+служебному triangle. Triangulation теперь отбрасывает только нулевые triangles;
+субпиксельный capsule сворачивается в покрывающую окружность. Focused regression
+проверяет ordinary Eraser и Eraser Lasso с degenerate/двухточечными Fill внутри
+CompactBlock, один commit, Undo/Redo/Reopen и сохранение legacy payload. Полные
+303 tests, fmt, clippy и release build прошли. Portable SHA-256:
+`BA0170534FC601F92264009AE6507661D40B2A1D3A6F05A07C24353C49F1002A`.
+Пользовательский документ, backups, `local/` и архивы не изменялись; остаётся
+короткий ручной check у сохранённых меток.
+
+**Manual continuation checkpoint, 2026-08-17:** новый portable помог, но не
+завершил VE-02d/VE-02e. Сессия
+`release/EndlessSketch-Rust/local/logs/session-20260817-112928.jsonl` содержит
+успешный ordinary Eraser commit до revision 14621 и пять Eraser Lasso commits до
+revision 14626. Одновременно повторяется
+`Eraser Lasso failed: fill subtraction mask polygon could not be triangulated`.
+Marker 1 поставлен в `2026-08-17T11:31:08.782`: depth `-2`, tile `(0,0)`, local
+`(0.29964600370880334, 0.14590926126628004)`, zoom `3.3164102327921903`, revision
+14626, max sequence 203768. Он следует за двумя успешными `Area erased`, но
+пользователь визуально видит оставшийся объект. После перезапуска сначала
+read-only получить точный lasso polygon и recursive source UUID/path, затем
+отделить bad-mask failure от successful-but-incomplete subtraction. VE-02f пока
+не начинать. Это только status checkpoint; код, документ, backups, portable,
+`local/` и архивы не изменялись.
+
+**VE-02d/VE-02e subpixel-remnant correction, 2026-08-18:** read-only review of
+`session-20260818-163550.jsonl` and the marked transactions found that both
+erasers did collect and recursively replace the intersecting CompactBlock/Fill
+targets. The shared difference code nevertheless treated a valid subpixel Fill
+source/intersection like a disposable output sliver, so it returned an exact
+no-op which became a dotted remnant after zoom. Source/intersection validity is
+now separated from output-fragment cleanup. A focused regression erases a tiny
+zoomable Fill while the full-delete and 48-mask stress regressions retain their
+previous results. Manual confirmation at markers 1..3 is pending.
+
+**VE-02 legacy CompactBlock artifact correction, 2026-08-18:** the next
+read-only marker scan ruled out another-layer collection as the main cause at
+markers 1/2: 3689 viewport render sources belong to active layer `0`, versus one
+source from `gallery`. It found preserved non-triangulatable Fill lines inside
+active-layer CompactBlocks, including geometry about `0.00018 px` wide and
+hundreds of pixels long. The first policy tombstoned such a legacy Fill on any
+intersection and therefore deleted an entire object after a small touch.
+
+**VE-02 conservative invalid-Fill correction, 2026-08-19:** ordinary Eraser and
+Eraser Lasso now remove a non-triangulatable legacy Fill only when one mask fully
+covers its projected path. Partial intersections and disjoint invalid sources
+remain exact no-ops. The mixed CompactBlock regression covers both erasers, one
+transaction, Undo/Redo/Reopen, partial preservation, and full coverage. Exact
+partial subtraction of malformed legacy geometry remains intentionally deferred;
+content from other visible/locked layers is still outside active-layer erase.
+
+**Stylus/saved-geometry correction, 2026-08-19:** marker 1 operation `209743`
+contained a false jump across the canvas and marker 2 operation `209744` retained
+only a few true direction changes per circle. Display-point mouse history is now
+accepted only when its newest point matches the current pointer, and marker
+diagnostics accumulate recovered samples instead of being overwritten by a
+later unavailable query. Manual tile pause alone no longer forces raw angular
+saved Brush fallback. Newly captured freehand Fill persists optional
+serde-default `smooth_area` metadata and uses stable closed smoothing in fallback
+and raster output; legacy, clipped, and eraser-produced Fill remains exact.
+Small interior holes in thick Paint are not part of this checkpoint because the
+current centerline representation can only split out a full-width interval.
+
+#### VE-02f. Legacy и optional scope
+
+- [ ] Legacy `Erase`/`EraseArea` оставить совместимыми для reopen/render,
+  Selection и явного удаления; новые операции этих видов не создавать.
+- [ ] Не выполнять автоматическую миграцию legacy erase: её визуальный
+  результат зависит от исторического paint order.
+- [ ] Только после active-layer цепочки добавить опциональный
+  `All unlocked layers` через тот же target collector и одну transaction.
+- [ ] При multi-layer commit сохранять layer каждого source и инвалидировать
+  только затронутые layers; настройку оставить независимой от performance
+  presets.
+
+#### Порядок возобновления
+
+1. Отдать исправленный VE-02d/VE-02e portable пользователю на короткий GUI check
+   у двух сохранённых меток: ordinary Eraser, затем Eraser Lasso, с Undo/Redo.
+2. После подтверждения закрыть ручной пункт VE-02d и завершённую цепочку
+   Paint/Fill/CompactBlock.
+3. Затем перейти к VE-02f: оставить legacy reopen/render совместимым и отдельно
+   решить, нужен ли optional `All unlocked layers`.
+
+### Проверка завершённой цепочки
+
+- [ ] Близкий pan/zoom не ставит tile jobs и сохраняет векторное редактирование.
+- [ ] За порогом сцена целиком переходит в read-only tile и возвращается к
+  векторам без визуального изменения.
+- [ ] Selection и обе резинки соблюдают depth boundary на `N-1`, `N`, `N+1`.
+- [ ] Hidden/locked layers и глубины вне захвата не меняются.
+- [ ] Undo/Redo/Reopen восстанавливают stroke/fill/holes/CompactBlock.
+- [ ] Пустой erase gesture не меняет revision; реальный gesture создаёт один
+  history step и не вызывает близкий tile churn.
+- [ ] Fallback и raster tile совпадают на extreme depth/BigInt coordinates.
 
 ## Выполненная база
 
@@ -442,8 +932,12 @@ Depth остаётся пространственным масштабом и н
 - [x] Incremental commit indexing follow-up: after the bounded-queue log showed repeated `input` stalls around stroke save/commit events, ordinary append-only `CanvasDocument::commit` operations now update spatial/render indexes incrementally. Grouped edits, metadata, compact blocks, replacements, and out-of-order paint order still use the full rebuild path.
 - [x] Selection transform indexing follow-up: after the next log showed `selection_transform` input stalls, one-to-one non-CompactBlock move/scale/rotate replacements now update existing spatial/render index slots in place. Unsafe cases still fall back to the full rebuild path, so document storage and render output stay unchanged.
 - [x] Auto fallback interaction FPS follow-up: `Stroke fallback joins = Auto` now uses segmented joins only for calm no-interaction/no-pending-tile viewing. During drawing, navigation, selection interaction, or while tile jobs are pending, Auto temporarily uses the fast polyline fallback path; `Quality` and `Performance` keep their explicit behavior.
-- [x] Auto no-tile fallback FPS correction: the next log showed manual `Pause tile generation` still counted as calm viewing, so Auto kept segmented joins and full fallback still generated very large shape counts. Auto now also uses the fast polyline path whenever tile generation is paused; `Quality` remains the explicit no-tile quality override.
+- [x] Auto manual-pause quality correction: an earlier optimization forced the fast raw saved-stroke path whenever `Pause tile generation` was enabled and made calm Brush circles visibly angular. Manual pause alone now keeps normal saved smoothing; active interaction and pending tile work still use the bounded fast path, while explicit `Performance` remains unchanged.
 - [x] Eraser Lasso input-density correction: fast Area Erase gestures now recover Windows mouse-history samples like Brush/Fill, and lasso preview point appending interpolates large remaining gaps while still filtering tiny jitter. This keeps the EraseArea contour less speed-dependent without changing `.esketch`, raster cache identity, tiles, or selection transforms.
+- [x] Windows tablet-history correction: the existing `GetMouseMovePointsEx` adapter now prefers high-resolution absolute-device points, maps them through the virtual desktop, validates the newest point against the current cursor, and falls back to display-point history when needed. Session markers record the chosen mode and recovered count. The ten marked stylus circles had only 5..15 real direction changes despite 77..278 stored interpolated points; manual confirmation with the new portable is pending.
+- [x] Native pen-frame follow-up: the next marker showed `pointer_history_mode=unavailable` specifically for the stylus circles even though mouse gestures used `high_resolution`. Winit already converts Windows `GetPointerFrameInfoHistory` samples to ordered egui Touch events; drawing now consumes those exact positions before promoted PointerMoved or mouse-history fallback. A focused event-order regression preserves the pen endpoint, and markers now include `pointer_screen` plus the `touch_events` sample count. Manual hardware confirmation is pending.
+- [x] FPS-dependent stylus smoothing correction: markers 1/3 showed that low-FPS stylus input either recovered fewer history samples than the mouse or none at all, while gap interpolation persisted long runs of collinear points. Stable saved/raster smoothing now collapses only those geometry-redundant straight points before rounding the remaining real corners. Sparse and linearly interpolated versions produce identical open Brush and closed freehand-Fill curves; raw `.esketch` points, endpoints, input settings, eraser geometry, and scale stability are unchanged. Manual hardware confirmation is pending.
+- [x] Independent Windows cursor-sampling correction: the next marked raw circle had 489 points but only 51 non-collinear positions arriving out of circle order, while the shift marker accepted 1006 `GetMouseMovePointsEx` samples containing repeated false 660-712 px left/right jumps. Drawing no longer consumes that mixed-device history. A stroke-lifetime 2 ms worker samples changed `GetCursorPos` positions independently of UI FPS and stops on physical primary release; ordered native Touch events remain preferred and ordinary egui events remain fallback. The bounded order/dedup regression passes; `.esketch`, smoothing settings, eraser geometry, raster identity, and presets are unchanged. The user manually confirmed the corrected stylus input on 2026-08-19.
 - [x] Performance profile expansion: Settings `Performance/Balanced/Quality` now manage the full meaningful speed/quality matrix: Brush/Fill input density, Fill fallback limits, Stroke fallback joins, zoom settle, tile workers/resolution, automatic pause while drawing, deferred preview, rebuild policy, prefetch radius, edge quality, smoothing, PNG compression, and preview FPS. Manual tile pause, cache budget, Display, diagnostics logging, and object-compaction/editability controls remain independent.
 - [x] Saved fallback operation budget checkpoint: temporary no-tile saved-vector fallback can skip oldest visible operations before projection when `Saved fallback ops` is set above `0`. The first hidden version was too visually destructive in Performance/Balanced, so settings v15 exposes it explicitly: `0` means Unlimited/full saved fallback, `Performance` preset sets `1500`, and `Balanced`/`Quality` set Unlimited. Session logs include both `saved_fallback_operation_limit` and `fallback_skipped_operations`.
 - [x] Fast saved-stroke fallback shape-count checkpoint: `Performance` and `Auto` pressure paths now draw saved strokes as one polyline shape without endpoint caps instead of polyline plus two cap circles. This reduces egui shape count for full no-tile fallback without hiding operations; calm Auto, segmented sparse joins, Quality behavior, stored geometry, and PNG tiles are unchanged.
@@ -650,6 +1144,14 @@ Depth остаётся пространственным масштабом и н
 - [ ] PNG/JPEG/WebP как assets документа.
 - [ ] Placement, scale, rotate, selection и layers.
 - [ ] LOD/cache для больших bitmap.
+- [ ] Неприоритетный перенос части рисунка между холстами: экспорт активного
+  Object/Area selection в один flattened PNG с прозрачным фоном и bounds по
+  выделению, затем импорт/вставка этого PNG через общий image-asset path.
+- [ ] При вставке дать изменить размер с сохранением пропорций до commit;
+  первая версия переносит только RGBA-пиксели, без векторов, layers, UUID и
+  history исходного документа.
+- [ ] Для этой минимальной версии достаточно `alpha=0` вне отрисованного
+  выделения; точную layer opacity/transparency оставить общему compositing path.
 
 ### Приоритет 6. Общие настраиваемые горячие клавиши
 
@@ -659,7 +1161,7 @@ Depth остаётся пространственным масштабом и н
 - [ ] Проверка конфликтов, reset и сохранение в settings.
 - [ ] Default `Shift+N` создаёт и активирует новый верхний слой; команда проходит через registry и может быть переназначена.
 - [ ] Общий контракт tool shortcut: первое выполнение активирует tool, повторное выполнение при уже активном tool вызывает `Cycle mode`.
-- [ ] `S` циклически меняет Selection `Inside/Crossing`, `Q` циклически меняет Selection `Object/Area`, `X` циклически меняет Area `Fill/Erase`. Локальные `X` и `S/Q` checkpoints реализуются без полного command registry.
+- [ ] `S` циклически меняет Selection `Inside/Crossing`, `Q` циклически меняет Selection `Object/Area`, `F` циклически меняет Area `Fill/Erase`, а `X` меняет местами foreground/background colors. Локальные shortcut checkpoints реализуются без полного command registry.
 - [ ] Тот же механизм использовать для будущих инструментов с конечным набором режимов, без отдельных hardcoded обработчиков клавиш.
 - [x] Не обрабатывать tool shortcuts и cycle mode, когда фокус находится в text/numeric input.
 - [ ] Command registry предоставляет названия текущего и следующего mode для toolbar, status, context menu и Help.
@@ -690,6 +1192,12 @@ Depth остаётся пространственным масштабом и н
 - [x] Вынести палитру цвета в отдельное перемещаемое и растягиваемое окно с тем же поведением позиционирования, что у `Settings` и `Layers`; picker внутри окна автоматически следует за шириной окна.
 - [x] Сохранить текущий быстрый доступ к активному цвету и не менять color/persistence модель в рамках этой UI-задачи.
 - [x] После Palette выполнить tool shortcut cycles: `X` переключает общий Area tool `Fill/Erase`, `S` циклически меняет Selection `Inside/Crossing`, а `Q` — `Object/Area`.
+- [ ] Сразу после текущего основного Area-selection checkpoint перенести цикл
+  Area Fill/Area Erase с `X` на `F`; до реализации текущий `X` остаётся рабочим
+  и документированным поведением.
+- [ ] Добавить два выбираемых color slots — foreground/background — и назначить
+  `X` на их мгновенный обмен. Brush/Fill/Recolor используют foreground; оба
+  цвета и их порядок сохраняются в settings, не в `.esketch`.
 - [ ] После shortcut cycles перейти к уплотнению старых объектов, затем к profiling/optimization.
 - [x] Selection-версия контекстного окна по ПКМ выполнена в checkpoint 5.0e и переиспользует команды общего popover.
 - [x] В checkpoint 5.0f добавлены для Brush и Fill по ПКМ inline RGB-палитра и общий `Size`, связанные с теми же значениями toolbar; открытие/редактирование menu не создаёт operation или history step.
@@ -697,9 +1205,19 @@ Depth остаётся пространственным масштабом и н
 - [ ] Не показывать больше 4-6 основных действий одновременно; расширенные параметры остаются в Settings/Layers/File/Navigation.
 - [x] `F1` открывает вкладку Help общего окна `File/Help`.
 - [ ] Help строить из тех же command/setting descriptions, чтобы горячие клавиши и диапазоны не расходились с UI.
-- [ ] В Controls явно описать правило повторного нажатия shortcut и показать текущие циклы `S: Inside/Crossing`, `Q: Object/Area`, `X: Fill/Erase`.
+- [ ] После shortcut migration обновить Controls: `S: Inside/Crossing`,
+  `Q: Object/Area`, `F: Fill/Erase`, `X: Swap foreground/background`.
 
 ## Ближайший checkpoint
+
+**Текущий checkpoint:** исправление ввода стилуса вручную подтверждено. Следующий
+ограниченный шаг — учитывать полную ширину Brush/Eraser при commit clipping по
+постоянной Area selection вместо текущего разрезания по центральной линии. Copy/
+Cut Area и Gradient остаются следующими отдельными checkpoint.
+
+**Сразу после текущего основного checkpoint:** перенести Area Fill/Area Erase
+cycle с `X` на `F`, добавить foreground/background color slots и назначить `X`
+на их обмен. Текущие shortcuts и Help не менять до реализации этого checkpoint.
 
 **Palette — вручную подтверждено:** текущая RGB-палитра вынесена в отдельное перемещаемое и растягиваемое окно с компактным доступом из toolbar; picker внутри окна автоматически следует за шириной окна. Color persistence, документ и Brush/Fill/Recolor поведение не менялись.
 
@@ -768,3 +1286,25 @@ Depth остаётся пространственным масштабом и н
 - [x] Large Selection transform-outline correction: fast overlay is now disabled while a Selection move, scale, or rotate gesture is active, so the exact per-object transform outline remains visible during direct object transforms. Cached-bounds fast overlay remains available for large selected sets during navigation/tile-deferred interaction. Document format, storage, raster tiles, settings, presets, and tile cache identity are unchanged.
 
 - [x] Saved fallback screen-cull checkpoint manually confirmed: ordinary saved no-tile fallback operations are now rejected by rough screen bounds before expensive point projection when they are definitely outside the current viewport. CompactBlock source culling remains unchanged, and early rejections are included in `fallback_skipped_operations` diagnostics. This targets paused/manual tile-generation scenes where `fallback_project_ms` was dominated by thousands of projected operations after navigation; `.esketch`, saved operations, raster tiles, tile cache identity, settings, presets, selection, and input behavior are unchanged.
+
+- [x] F-02 frame timing diagnostics implemented, validated, and manually baseline-confirmed: `FrameRateTracker::update` is now the single source of valid active-interaction `frame_ms` in the `0..=250 ms` window, and its returned measurement feeds frame phase fields and `fps_drop` so idle/window-resume gaps cannot create false drops. Baseline and post-F-01 logs contain no `frame_ms > 250`.
+
+- [x] F-01 persistent fallback bounds cache implemented, validated, and manually reprofiled: cache `OperationBounds` by operation UUID for ordinary and `CompactBlock` fallback sources, preserve it across navigation/projection-anchor reset, clear it on explicit invalidation/document replacement, and log `fallback_bounds_cache_hits`/`fallback_bounds_cache_misses` without changing fallback visuals or persisted data. Warmed hit rate reached 99.44%; conservative slow/FPS median `fallback_project_ms` fell from 57.192 ms to 31.971 ms (44.1%).
+
+- [x] F-03a `FallbackRenderer` state/lifecycle extraction implemented, automatically validated, and manually smoke-confirmed: segmented-shape budget, projection cache, visible-operation cache, derived fallback cache, and bounds cache now live behind one internal component with centralized begin-frame and clear behavior; the clean session log retained full fallback rendering and diagnostics. F-04 clone work remains out of scope.
+
+- [x] F-03b bounded renderer boundary implemented, automatically validated, and manually smoke-confirmed: visible-operation cache lookup and saved-operation projection/cull orchestration now live behind `FallbackRenderer` methods while the app retains document/tile discovery and all painter algorithms; the paused-tile fallback log remained visually and diagnostically clean.
+
+- [x] F-04a measurement checkpoint implemented, validated, and manually profiled: visible-operation cache misses cost 12.27 ms median, 28.23 ms p95, and 37.79 ms max versus 0.0036 ms median on hits, so deep clone/query/sort removal is justified but deferred behind the new visual correctness investigation.
+
+- [x] Priority deep-zoom wheel-direction diagnostic manually captured: `session-20260722-181706` contains seven raw sign reversals within 250 ms at stationary pointer positions, including one `-14/+1` mixed batch, localizing the reversal before camera handling. Marker #2 also identifies a separate drawing issue: saved Paint operation 201705 projects consistently but its final 14 points reverse about 43 px.
+
+- [x] Deep-zoom wheel direction-latch correction implemented and automatically validated pending manual confirmation: a burst chooses its dominant sign, opposite impulses inside a continuous 250 ms window are suppressed, and quiet/`End`/`Cancel` resets direction. `wheel_zoom_input` retains raw/produced values and adds applied scrolls, suppression count, and latch state; drawing input, persistence, projection, rendering, settings, and tile identity are unchanged.
+
+- [x] Deep-layer drawing report reclassified from speculative mouse-history ordering to projection-anchor precision: `session-20260722-191347` reaches the first affected save/marker at depth 17, lines recover after direct navigation invalidation, and the old depth-0 projected-point anchor loses f64 detail around the 17–18-level scale.
+
+- [x] Priority projection-anchor depth-boundary correction implemented, automatically validated, and manually confirmed: projected point anchors reset at every depth change, same-depth reuse and persistent bounds cache remain, and continuous positive/negative zoom now retains responsive pan, immediate line visibility, and correct curved drawing. Stored operations, drawing input, wheel behavior, `.esketch`, raster tiles, settings, and tile identity are unchanged.
+
+- [x] F-04b visible-operation miss clone reduction implemented and automatically validated: the cache stores shared render indices, `CanvasDocument` owns immutable `Arc<EditOperation>` render sources, and fallback frames clone only cheap `Arc` handles. CompactBlock expansion, paint/layer order, fallback diagnostics, raster output, persistence, and input behavior are unchanged. Focused tests verify shared allocation reuse; the portable executable was refreshed with the validated release build. One paused-tile GUI/session-log comparison against the 12.27 ms median / 28.23 ms p95 F-04a miss baseline remains.
+
+- [x] Ponytail audit cleanup implemented and automatically validated: removed the stale root settings reference, dead affected-tile and selection APIs, redundant spatial UUID/layer mirrors, duplicate visible-cache and PNG-compression types, and unused direct `egui`/`lyon`/`rayon`/`thiserror` dependencies. `docs/settings-reference.md` remains authoritative.

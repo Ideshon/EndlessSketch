@@ -1,8 +1,6 @@
 use crate::raster::RasterOptions;
-use crate::tile_cache::{
-    DEFAULT_TILE_RESOLUTION, PngCompression as CachePngCompression, TileCacheOptions,
-    nearest_tile_resolution,
-};
+pub use crate::tile_cache::PngCompression;
+use crate::tile_cache::{DEFAULT_TILE_RESOLUTION, TileCacheOptions, nearest_tile_resolution};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -20,8 +18,10 @@ const DEFAULT_TILE_WORKER_COUNT: usize = 1;
 const DEFAULT_TILE_PREFETCH_RADIUS: u8 = 1;
 const DEFAULT_CACHE_SIZE_MIB: u32 = 2048;
 const DEFAULT_PREVIEW_FPS: u32 = 60;
+const DEFAULT_DEPTH_CAPTURE_RADIUS: i64 = 2;
+const DEFAULT_VECTOR_DEPTH_RADIUS: i64 = 2;
 const TILE_REBUILD_IDLE_MS: u64 = 180;
-const CURRENT_SETTINGS_VERSION: u32 = 16;
+const CURRENT_SETTINGS_VERSION: u32 = 19;
 
 pub const MIN_BRUSH_INPUT_SPACING_PX: f32 = 0.75;
 pub const MAX_BRUSH_INPUT_SPACING_PX: f32 = 8.0;
@@ -41,35 +41,8 @@ pub const MIN_CACHE_SIZE_MIB: u32 = 128;
 pub const MAX_CACHE_SIZE_MIB: u32 = 8192;
 pub const MIN_PREVIEW_FPS: u32 = 15;
 pub const MAX_PREVIEW_FPS: u32 = 120;
-
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PngCompression {
-    #[default]
-    Fast,
-    Balanced,
-    Small,
-}
-
-impl PngCompression {
-    pub const ALL: [Self; 3] = [Self::Fast, Self::Balanced, Self::Small];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Fast => "Fast",
-            Self::Balanced => "Balanced",
-            Self::Small => "Small",
-        }
-    }
-
-    const fn cache_value(self) -> CachePngCompression {
-        match self {
-            Self::Fast => CachePngCompression::Fast,
-            Self::Balanced => CachePngCompression::Balanced,
-            Self::Small => CachePngCompression::Small,
-        }
-    }
-}
+pub const MAX_DEPTH_CAPTURE_RADIUS: i64 = 32;
+pub const MAX_VECTOR_DEPTH_RADIUS: i64 = 32;
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -291,6 +264,7 @@ struct PerformanceValues {
     storage_commit_mode: StorageCommitMode,
     png_compression: PngCompression,
     preview_fps: u32,
+    vector_depth_radius: i64,
 }
 
 impl PerformanceProfile {
@@ -326,6 +300,7 @@ impl PerformanceProfile {
                 storage_commit_mode: StorageCommitMode::Fast,
                 png_compression: PngCompression::Fast,
                 preview_fps: 30,
+                vector_depth_radius: 1,
             }),
             Self::Balanced => Some(PerformanceValues {
                 brush_input_spacing_px: DEFAULT_BRUSH_INPUT_SPACING_PX,
@@ -346,6 +321,7 @@ impl PerformanceProfile {
                 storage_commit_mode: StorageCommitMode::Full,
                 png_compression: PngCompression::Fast,
                 preview_fps: DEFAULT_PREVIEW_FPS,
+                vector_depth_radius: DEFAULT_VECTOR_DEPTH_RADIUS,
             }),
             Self::Quality => Some(PerformanceValues {
                 brush_input_spacing_px: 1.5,
@@ -366,6 +342,7 @@ impl PerformanceProfile {
                 storage_commit_mode: StorageCommitMode::Full,
                 png_compression: PngCompression::Small,
                 preview_fps: MAX_PREVIEW_FPS,
+                vector_depth_radius: 4,
             }),
             Self::Custom => None,
         }
@@ -472,6 +449,10 @@ pub struct AppSettings {
     pub png_compression: PngCompression,
     pub preview_fps: u32,
     pub object_compaction_limit: ObjectCompactionLimit,
+    pub distant_tiles_enabled: bool,
+    pub vector_depth_radius: i64,
+    pub depth_capture_auto: bool,
+    pub depth_capture_radius: i64,
     pub overlay_enabled: bool,
     pub overlay_show_depth: bool,
     pub overlay_show_zoom: bool,
@@ -509,6 +490,10 @@ impl Default for AppSettings {
             png_compression: PngCompression::Fast,
             preview_fps: DEFAULT_PREVIEW_FPS,
             object_compaction_limit: ObjectCompactionLimit::Unlimited,
+            distant_tiles_enabled: true,
+            vector_depth_radius: DEFAULT_VECTOR_DEPTH_RADIUS,
+            depth_capture_auto: true,
+            depth_capture_radius: DEFAULT_DEPTH_CAPTURE_RADIUS,
             overlay_enabled: true,
             overlay_show_depth: false,
             overlay_show_zoom: true,
@@ -600,6 +585,9 @@ impl AppSettings {
             .cache_size_mib
             .clamp(MIN_CACHE_SIZE_MIB, MAX_CACHE_SIZE_MIB);
         self.preview_fps = self.preview_fps.clamp(MIN_PREVIEW_FPS, MAX_PREVIEW_FPS);
+        self.vector_depth_radius = self.vector_depth_radius.clamp(0, MAX_VECTOR_DEPTH_RADIUS);
+        self.depth_capture_radius = self.depth_capture_radius.clamp(0, MAX_DEPTH_CAPTURE_RADIUS);
+        self.sync_depth_capture_radius();
         self
     }
 
@@ -619,7 +607,7 @@ impl AppSettings {
         TileCacheOptions {
             render_options: self.raster_options(),
             max_cache_bytes: u64::from(self.cache_size_mib) * 1024 * 1024,
-            png_compression: self.png_compression.cache_value(),
+            png_compression: self.png_compression,
         }
     }
 
@@ -657,6 +645,16 @@ impl AppSettings {
         self.storage_commit_mode = values.storage_commit_mode;
         self.png_compression = values.png_compression;
         self.preview_fps = values.preview_fps;
+        self.vector_depth_radius = values.vector_depth_radius;
+        self.sync_depth_capture_radius();
+    }
+
+    fn sync_depth_capture_radius(&mut self) {
+        self.depth_capture_radius = if self.depth_capture_auto {
+            self.vector_depth_radius
+        } else {
+            self.depth_capture_radius.min(self.vector_depth_radius)
+        };
     }
 
     pub fn overlay_profile(&self) -> OverlayProfile {
@@ -716,6 +714,7 @@ impl AppSettings {
             storage_commit_mode: self.storage_commit_mode,
             png_compression: self.png_compression,
             preview_fps: self.preview_fps,
+            vector_depth_radius: self.vector_depth_radius,
         }
     }
 }
@@ -731,12 +730,12 @@ fn finite_clamp(value: f32, default: f32, min: f32, max: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppSettings, EdgeQuality, MAX_CACHE_SIZE_MIB, MAX_PREVIEW_FPS,
-        MAX_SAVED_FALLBACK_OPERATION_LIMIT, MAX_TILE_PREFETCH_RADIUS, ObjectCompactionLimit,
-        OverlayProfile, PerformanceProfile, PngCompression, SessionLoggingLevel, SmoothingLevel,
-        StorageCommitMode, StrokeFallbackJoinMode, TileRebuildPolicy,
+        AppSettings, EdgeQuality, MAX_CACHE_SIZE_MIB, MAX_DEPTH_CAPTURE_RADIUS, MAX_PREVIEW_FPS,
+        MAX_SAVED_FALLBACK_OPERATION_LIMIT, MAX_TILE_PREFETCH_RADIUS, MAX_VECTOR_DEPTH_RADIUS,
+        ObjectCompactionLimit, OverlayProfile, PerformanceProfile, PngCompression,
+        SessionLoggingLevel, SmoothingLevel, StorageCommitMode, StrokeFallbackJoinMode,
+        TileRebuildPolicy,
     };
-    use crate::tile_cache::PngCompression as CachePngCompression;
     use std::time::Duration;
 
     #[test]
@@ -764,6 +763,8 @@ mod tests {
             png_compression: PngCompression::Small,
             preview_fps: u32::MAX,
             object_compaction_limit: ObjectCompactionLimit::Keep1000,
+            vector_depth_radius: i64::MAX,
+            depth_capture_radius: i64::MAX,
             session_logging: SessionLoggingLevel::Detailed,
             ..AppSettings::default()
         }
@@ -809,6 +810,8 @@ mod tests {
             settings.object_compaction_limit,
             ObjectCompactionLimit::Keep1000
         );
+        assert_eq!(settings.vector_depth_radius, MAX_VECTOR_DEPTH_RADIUS);
+        assert_eq!(settings.depth_capture_radius, MAX_DEPTH_CAPTURE_RADIUS);
         assert_eq!(settings.session_logging, SessionLoggingLevel::Detailed);
     }
 
@@ -838,6 +841,36 @@ mod tests {
     }
 
     #[test]
+    fn depth_capture_follows_vector_radius_or_is_capped_by_it() {
+        let automatic = AppSettings {
+            vector_depth_radius: 7,
+            depth_capture_auto: true,
+            depth_capture_radius: 1,
+            ..AppSettings::default()
+        }
+        .normalized();
+        assert_eq!(automatic.depth_capture_radius, 7);
+
+        let manual = AppSettings {
+            vector_depth_radius: 3,
+            depth_capture_auto: false,
+            depth_capture_radius: 7,
+            ..AppSettings::default()
+        }
+        .normalized();
+        assert_eq!(manual.depth_capture_radius, 3);
+
+        let manual_inside_scope = AppSettings {
+            vector_depth_radius: 7,
+            depth_capture_auto: false,
+            depth_capture_radius: 3,
+            ..AppSettings::default()
+        }
+        .normalized();
+        assert_eq!(manual_inside_scope.depth_capture_radius, 3);
+    }
+
+    #[test]
     fn settings_load_or_create_round_trips_json() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let path = temp_dir.path().join("settings.json");
@@ -863,6 +896,10 @@ mod tests {
         changed.cache_size_mib = 512;
         changed.png_compression = PngCompression::Balanced;
         changed.preview_fps = 30;
+        changed.distant_tiles_enabled = false;
+        changed.vector_depth_radius = 7;
+        changed.depth_capture_auto = false;
+        changed.depth_capture_radius = 5;
         changed.overlay_show_depth = true;
         changed.overlay_show_tile_coordinates = true;
         changed.overlay_show_performance = false;
@@ -895,7 +932,7 @@ mod tests {
 
         let settings = AppSettings::load(&path).expect("load legacy settings");
 
-        assert_eq!(settings.settings_version, 16);
+        assert_eq!(settings.settings_version, 19);
         assert_eq!(settings.tile_resolution_px, 512);
         assert!(!settings.pause_tile_generation);
         assert!(!settings.pause_tile_generation_while_drawing);
@@ -912,6 +949,10 @@ mod tests {
         assert_eq!(settings.cache_size_mib, 2048);
         assert_eq!(settings.png_compression, PngCompression::Fast);
         assert_eq!(settings.preview_fps, 60);
+        assert!(settings.distant_tiles_enabled);
+        assert_eq!(settings.vector_depth_radius, 2);
+        assert!(settings.depth_capture_auto);
+        assert_eq!(settings.depth_capture_radius, 2);
         assert_eq!(settings.overlay_profile(), OverlayProfile::Standard);
         assert_eq!(
             settings.object_compaction_limit,
@@ -950,6 +991,8 @@ mod tests {
         assert_eq!(settings.storage_commit_mode, StorageCommitMode::Fast);
         assert_eq!(settings.png_compression, PngCompression::Fast);
         assert_eq!(settings.preview_fps, 30);
+        assert_eq!(settings.vector_depth_radius, 1);
+        assert_eq!(settings.depth_capture_radius, 1);
         assert_eq!(
             settings.performance_profile(),
             PerformanceProfile::Performance
@@ -977,6 +1020,8 @@ mod tests {
         assert_eq!(settings.storage_commit_mode, StorageCommitMode::Full);
         assert_eq!(settings.png_compression, PngCompression::Small);
         assert_eq!(settings.preview_fps, MAX_PREVIEW_FPS);
+        assert_eq!(settings.vector_depth_radius, 4);
+        assert_eq!(settings.depth_capture_radius, 4);
         assert_eq!(settings.performance_profile(), PerformanceProfile::Quality);
 
         settings.fast_zoom_tile_settle_ms = 81;
@@ -991,6 +1036,9 @@ mod tests {
             pause_tile_generation: true,
             cache_size_mib: 512,
             object_compaction_limit: ObjectCompactionLimit::Keep100,
+            distant_tiles_enabled: false,
+            depth_capture_auto: false,
+            depth_capture_radius: 3,
             overlay_enabled: false,
             overlay_show_depth: true,
             session_logging: SessionLoggingLevel::Detailed,
@@ -1005,6 +1053,9 @@ mod tests {
             settings.object_compaction_limit,
             ObjectCompactionLimit::Keep100
         );
+        assert!(!settings.depth_capture_auto);
+        assert_eq!(settings.depth_capture_radius, 3);
+        assert!(!settings.distant_tiles_enabled);
         assert!(!settings.overlay_enabled);
         assert!(settings.overlay_show_depth);
         assert_eq!(settings.session_logging, SessionLoggingLevel::Detailed);
@@ -1046,7 +1097,7 @@ mod tests {
             .expect("deserialize version ten settings");
         let settings = settings.normalized();
 
-        assert_eq!(settings.settings_version, 16);
+        assert_eq!(settings.settings_version, 19);
         assert_eq!(settings.overlay_profile(), OverlayProfile::Standard);
         assert_eq!(
             settings.object_compaction_limit,
@@ -1144,7 +1195,7 @@ mod tests {
         let cache = settings.tile_cache_options();
 
         assert_eq!(cache.max_cache_bytes, 512 * 1024 * 1024);
-        assert_eq!(cache.png_compression, CachePngCompression::Small);
+        assert_eq!(cache.png_compression, PngCompression::Small);
         assert_eq!(
             settings.preview_repaint_interval(),
             Duration::from_secs_f64(1.0 / 30.0)

@@ -64,10 +64,6 @@ impl SelectionShape {
         }
     }
 
-    pub fn contains_all_points(&self, points: &[Point2]) -> bool {
-        !points.is_empty() && points.iter().all(|point| self.contains_point(*point))
-    }
-
     pub fn intersects_polyline(&self, points: &[Point2], radius: f64) -> bool {
         if points.is_empty() || !self.is_valid() {
             return false;

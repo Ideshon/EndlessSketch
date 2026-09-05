@@ -1,6 +1,6 @@
 # Настройки EndlessSketch
 
-Обновлено: 2026-07-01
+Обновлено: 2026-07-27
 
 Настройки Rust-версии хранятся в `local/settings.json` рядом с исполняемым файлом. Изменения применяются сразу и сохраняются автоматически. Кнопка `Reset` возвращает все параметры к значениям по умолчанию.
 
@@ -20,6 +20,7 @@
 | Saved fallback ops | `1500` | `0` / Unlimited | `0` / Unlimited |
 | Zoom settle ms | `250` | `140` | `80` |
 | Tile workers | `1` | `1` | `2` |
+| Vector depth radius | `1` | `2` | `4` |
 | Tile resolution | `128 px` | `512 px` | `1024 px` |
 | Pause tile generation while drawing | `on` | `off` | `off` |
 | Deferred drawing preview | `on` | `off` | `off` |
@@ -36,8 +37,13 @@
 Профиль намеренно не меняет:
 
 - `Pause tile generation`: это оперативный ручной выключатель фоновой работы.
+- `Distant tiles`: это явный master switch обзорных тайлов; профиль меняет
+  радиус, но не включает отключённую пользователем функцию.
 - `Cache size MiB`: это аппаратный/дисковый бюджет пользователя.
 - `Keep latest objects`: это контроль редактируемости/уплотнения старых объектов.
+- `Layers > Depth capture > Auto`: сам переключатель не меняется профилем.
+  При включённом Auto эффективный радиус следует за профильным Vector depth
+  radius; при выключенном ручное значение остаётся независимым в его пределах.
 - `Settings > Display`, overlay и session logging: это UI/diagnostics-настройки, а не качество рендера.
 
 Новые параметры должны попадать в профильную матрицу, если они осмысленно влияют на скорость, качество, плотность ввода, fallback cost, tile work или preview cadence. Исключения нужно фиксировать явно.
@@ -53,7 +59,7 @@
 - Большое значение уменьшает число входных точек, но не меняет максимальную длину интерполированного сегмента.
 - Разрывы всегда делятся на участки не длиннее `8 px`, а release endpoint сохраняется независимо от выбранной плотности.
 - Визуальная разница между значениями может быть небольшой: линейная интерполяция сохраняет траекторию, а видимая округлость управляется `Smoothing`.
-- На Windows перед spacing и интерполяцией восстанавливается до `64` промежуточных mouse-history samples между UI-кадрами. При недоступности системной истории используются обычные egui events.
+- На Windows при рисовании отдельный cursor sampler каждые `2 ms` читает фактическую экранную позицию независимо от UI FPS, хранит только изменившиеся точки в порядке получения и останавливается при физическом отпускании primary button. Нативные ordered Touch events остаются приоритетными. Повреждённая mixed-device история `GetMouseMovePointsEx` больше не используется; обычные egui events остаются fallback.
 - Комбинация минимального `0.75 px` и `Smoothing: Off` намеренно сохраняет каждый целочисленный sample; на толстой диагональной линии это может давать острые vector joins. Для обычного рисования используйте больший Input либо включённый Smoothing.
 
 Этот параметр не является силой сглаживания: внешний вид готового тайла настраивается отдельным `Smoothing`.
@@ -90,7 +96,7 @@
 - Значения: `Auto`, `Quality`, `Performance`.
 - По умолчанию: `Auto`.
 - Управляет joins только во временном no-tile vector fallback для сохранённых Brush/Eraser strokes. Cached PNG tiles, live input, сохранённые точки и формат `.esketch` не меняются.
-- `Auto` рисует короткие сохранённые sparse strokes до `128` экранных точек segmented capsule-joins, когда нет активного draft. Во время рисования, ожидания тайлов или tile pause уже сохранённые фоновые strokes временно используют быстрый one-shape raw polyline path без saved smoothing и endpoint caps, чтобы снизить input latency.
+- `Auto` рисует короткие сохранённые sparse strokes до `128` экранных точек segmented capsule-joins, когда нет активного draft. Во время рисования или ожидания тайлов уже сохранённые фоновые strokes временно используют быстрый one-shape raw polyline path без saved smoothing и endpoint caps, чтобы снизить input latency. Ручная пауза tile generation сама по себе не отключает качественный idle fallback.
 - `Quality` сохраняет segmented capsule-joins для сохранённых strokes до `512` экранных точек даже во время рисования.
 - `Performance` всегда использует быстрый one-shape raw polyline path без saved smoothing и endpoint caps.
 - Dense strokes выше выбранного лимита всегда остаются на быстром polyline path.
@@ -106,6 +112,27 @@
 - `Performance` preset выставляет `1500`. `Balanced` и `Quality` выставляют `0`, чтобы обычный просмотр оставался полным.
 
 ## Генерация тайлов
+
+### Distant tiles / Vector depth radius
+
+- `Distant tiles` по умолчанию включён. При выключении вся видимая сцена
+  рисуется векторами и новые tile jobs не создаются.
+- `Vector depth radius`: диапазон `0..32`, по умолчанию `±2` (`5` уровней).
+- Если полный native-depth span хотя бы одной editable operation активного
+  visible/unlocked слоя помещается в `camera depth ±N`, весь viewport работает
+  как `vectors_near`: сохранённые PNG не смешиваются с близкими векторами и не
+  перестраиваются. `CompactBlock` остаётся атомарным.
+- Если видимое содержимое существует, но активный слой не имеет nearby
+  editable operations, весь viewport работает как `distant_tile` через
+  прежний whole-scene tile pipeline. Операции других слоёв входят в тайл, но
+  сами по себе не удерживают векторный режим.
+- Пустой viewport работает как `empty` и не создаёт тайлы.
+- В `distant_tile` Object Selection, Eraser и Area Erase read-only. Brush и
+  Fill могут создать объект на текущей глубине; после commit viewport
+  возвращается к векторному режиму.
+- Старые tile textures сохраняются как удаляемый rebuildable cache.
+- Performance/Balanced/Quality задают радиус `1/2/4`; `Distant tiles`
+  намеренно остаётся независимым master switch.
 
 ### Zoom settle ms
 
@@ -133,7 +160,8 @@
 - По умолчанию: выключено.
 - Полностью запрещает новые tile jobs и отменяет устаревшую очередь.
 - Не останавливает векторное сохранение, drafts, undo/redo или checkpoints.
-- После выключения паузы запрашивается текущая область.
+- После выключения паузы текущая область запрашивается только в
+  `distant_tile`; близкий и пустой viewport остаются без tile jobs.
 
 ### Pause tile generation while drawing
 
@@ -146,7 +174,7 @@
 
 - По умолчанию: выключено.
 - Предназначено для слабых CPU, которые теряют часть быстрого жеста из-за обработки растущего live draft.
-- Brush/Eraser/Fill продолжает собирать системную mouse history, применять Input spacing/interpolation, сохранять release endpoint и выполнять draft autosave.
+- Brush/Eraser/Fill продолжает собирать системную mouse history, применять Input spacing/interpolation и сохранять release endpoint. Draft autosave выполняется для Brush/Fill; векторный Eraser фиксирует targets только в памяти и при прерывании жеста не создаёт устаревшую белую erase-операцию.
 - До отпускания кнопки растущий draft не проецируется, не проходит Smoothing и не тесселируется egui. После release сохранённая операция появляется целиком через обычный fallback/тайлы.
 - Итоговые точки, Smoothing после release, undo/redo и формат `.esketch` не меняются.
 - Режим не устраняет нагрузку от уже существующей сцены или SQLite autosave; он убирает только стоимость live preview текущего жеста.
@@ -217,7 +245,7 @@
 - `Balanced` (по умолчанию): jitter tolerance `0.9 px`, средний радиус и шаг адаптивной quadratic-кривой.
 - `Strong`: jitter tolerance `1.5 px`, широкий радиус, более чувствительное обнаружение поворотов и наиболее частая тесселяция.
 
-При включённом уровне сначала удаляются малые отклонения в пределах указанного screen-space допуска, затем строятся адаптивные кривые. Error-bounded RDP работает окнами не больше `64` точек или `32 px` пути и никогда не увеличивает число входных точек. Smoothing применяется при растеризации Brush, Eraser и замкнутого Fill, к единственному активному live draft и к сохранённому full/retained fallback до готовности тайла. Сохранённые точки не изменяются. Для ограничения нагрузки fallback остаётся исходным при более чем `4096` входных или `8192` сглаженных точках; Brush сглаживается до clipping, чтобы clipping не менял форму кривой при zoom/depth navigation.
+При включённом уровне сначала удаляются малые отклонения в пределах указанного screen-space допуска, затем строятся адаптивные кривые. Error-bounded RDP работает окнами не больше `64` точек или `32 px` пути и никогда не увеличивает число входных точек. Перед стабильным saved/raster smoothing также сворачиваются только геометрически избыточные точки на одном прямом отрезке: линейная интерполяция при пропущенном кадре больше не превращает редкий ввод стилуса в мелкие угловатые joins. Smoothing применяется при растеризации Brush, Eraser и новых свободных замкнутых Fill, к единственному активному live draft и к сохранённому full/retained fallback до готовности тайла. Fill-фрагменты после Area clipping или vector erasing сохраняют точные polygon boundaries и повторно не сглаживаются. Старые операции без нового совместимого признака также остаются неизменными. Сохранённые raw points не изменяются. Для ограничения нагрузки fallback остаётся исходным при более чем `4096` входных или `8192` сглаженных точках; Brush сглаживается до clipping, чтобы clipping не менял форму кривой при zoom/depth navigation.
 
 ## Фиксированная оптимизация геометрии
 
@@ -252,7 +280,7 @@
 
 ### Area Fill/Erase mode
 
-Планируется объединить Lasso Fill и Eraser Lasso в один Area tool с общей геометрией контура. `X` активирует инструмент и при повторном нажатии переключает `Fill/Erase`; toolbar и preview явно показывают destructive режим. Текущий `EraseArea` по-прежнему записывается с active `layer_id`, поддерживает undo/redo и reopen. Переключатель scope `Active layer` / `All unlocked layers` остаётся задачей M4.
+`X` активирует общий Area tool и при повторном нажатии переключает `Fill/Erase`; toolbar и preview явно показывают destructive режим. Area Erase фиксирует Paint, Fill groups и CompactBlock активного visible/unlocked слоя в пределах Depth capture при pointer down и на release записывает все replacements одной append-only transaction. Пустой результат не меняет history/revision; CompactBlock редактируется рекурсивно без раскрытия в UI. Переключатель scope `Active layer` / `All unlocked layers` остаётся будущим этапом. Старые сохранённые `EraseArea` продолжают открываться и рендериться, но новые Area Erase их не создают.
 
 ### Canvas overlay / Display
 
@@ -275,7 +303,7 @@
 - `Basic` (default): writes launch/open/settings, markers, coalesced navigation, tile pause/resume/fallback/queue changes, save/undo/redo/compact/selection edits, FPS drops, and slow frame/phase snapshots.
 - `Detailed`: also records navigation-caused tile generation invalidations.
 
-Session files are written next to settings under `local/logs/session-YYYYMMDD-HHMMSS.jsonl`; only the newest 20 session logs are kept at startup. Each line is one JSON event with monotonic `t_ms`, local `wall_time`, camera depth/zoom/tile/local coordinates, document revision/counts, tile pause/fallback/pending state, performance metrics, active tool, selection count, smoothing, stroke fallback join mode, saved fallback operation limit, tile resolution, compaction limit, and status text. Slow-frame and phase events also include lightweight saved fallback counters: approximate fallback stroke shape count, segmented/fast stroke path counts, `fallback_projected_operations`, `fallback_painted_operations`, saved fallback projection/derived `fallback_cache_hits`/`fallback_cache_misses`, and `fallback_skipped_operations` when the temporary saved fallback budget omits old visible operations. Tile diagnostics split frame time into `tile_total`, `tile_collect_upload`, `tile_request_queue`, and `tile_draw`; fallback diagnostics split frame time into `fallback_project`, `fallback_derive`, `fallback_clip`, and `fallback_shape_paint`, with matching `perf` fields in milliseconds. The tile payload records per-frame `uploaded_textures` and `queued_jobs`. When an automatic FPS/phase event adds timing fields, they are merged into the existing `perf` object so fallback counters remain visible in the same JSON line.
+Session files are written next to settings under `local/logs/session-YYYYMMDD-HHMMSS.jsonl`; only the newest 20 session logs are kept at startup. Each line is one JSON event with monotonic `t_ms`, local `wall_time`, camera depth/zoom/tile/local coordinates, document revision/counts, tile pause/fallback/pending state, `depth_render_mode` (`vectors_near` / `distant_tile` / `empty`), vector radius, performance metrics, active tool, selection count, depth capture radius, smoothing, stroke fallback join mode, saved fallback operation limit, tile resolution, compaction limit, and status text. Slow-frame and phase events also include lightweight saved fallback counters: approximate fallback stroke shape count, segmented/fast stroke path counts, `fallback_projected_operations`, `fallback_painted_operations`, saved fallback projection/derived `fallback_cache_hits`/`fallback_cache_misses`, and `fallback_skipped_operations` when the temporary saved fallback budget omits old visible operations. Tile diagnostics split frame time into `tile_total`, `tile_collect_upload`, `tile_request_queue`, and `tile_draw`; fallback diagnostics split frame time into `fallback_project`, `fallback_derive`, `fallback_clip`, and `fallback_shape_paint`, with matching `perf` fields in milliseconds. The tile payload records per-frame `uploaded_textures` and `queued_jobs`. When an automatic FPS/phase event adds timing fields, they are merged into the existing `perf` object so fallback counters remain visible in the same JSON line.
 
 Press `F12` or the `Mark log` button to write a manual marker. The status/overlay shows `Log marker #N`. For FPS/zoom analysis, send the marker number, the approximate action around it, and the `.jsonl` file.
 
@@ -291,5 +319,21 @@ Press `F12` or the `Mark log` button to write a manual marker. The status/overla
 
 Управление именованными пользовательскими слоями дополнительно к автоматическим уровням глубины.
 Окно `Layers` показывает stack сверху вниз, active layer и количество операций. Первый checkbox управляет visibility, второй — lock. `+` создаёт новый верхний слой, `Duplicate` создаёт копию active layer непосредственно над исходным с новыми UUID операций, `Delete` удаляет active layer, `Rename` меняет имя, `Up`/`Down` меняют порядок. `Move selection to` переносит Object selection в другой visible/unlocked layer. `Merge Down` объединяет active layer с непосредственным нижним. Последний слой удалить нельзя; для непустого слоя требуется подтверждение. Hidden layer исключается из рендера, hidden/locked active layer не принимает инструменты редактирования. Все команды входят в общую с рисованием undo/redo timeline.
+
+`Depth capture ±N` задаёт camera-relative native-depth радиус Object Selection:
+
+- диапазон `0..32`, по умолчанию `±2` (`5` уровней вместе с текущим);
+- `Auto` по умолчанию включён и делает эффективный Depth capture равным
+  `Vector depth radius`;
+- при выключенном `Auto` ручной радиус сохраняется независимо, но UI и
+  нормализация не позволяют ему превысить `Vector depth radius`;
+- click, rectangle и Alt cycle получают кандидатов только из active visible
+  unlocked layer и только когда полный диапазон глубин объекта входит в
+  `camera depth ±N`;
+- mixed-depth `CompactBlock` остаётся атомарным и не выбирается частично;
+- изменение радиуса и переход через camera depth boundary очищают текущее
+  Object Selection, чтобы ранее выбранный объект не обошёл новый scope;
+- настройка сохраняется в `local/settings.json`, не меняет `.esketch`,
+  SQLite, paint order, тайлы или Area selection.
 
 Планируется multi-layer selection: обычный клик задаёт единственный active/selected layer, `Ctrl+клик` переключает отдельные слои, `Shift+клик` выбирает диапазон. Рисование всегда остаётся только в active layer. Bulk visibility/lock/reorder/delete/duplicate выполняются для selected layers атомарно; reorder сохраняет внутренний порядок блока. Позднее тот же selected set используется folders и `Merge Selected`.

@@ -2,7 +2,7 @@ use crate::coords::{CameraAddress, CanvasPoint, DEPTH_RATIO};
 use crate::model::{Color, EditOperation};
 use crate::smoothing::{
     GeometryClipRect, STROKE_SMOOTHING_PASSES, clip_polygon_to_rect, clip_polyline_to_rect,
-    simplify_render_points, smooth_stroke_points_stable,
+    simplify_render_points, smooth_closed_points_stable, smooth_stroke_points_stable,
 };
 use crate::spatial::operation_bounds;
 use crate::tile_cache::{TILE_BLEED, TILE_SIZE, TileKey, tile_resolution};
@@ -117,18 +117,39 @@ pub fn render_operations_onto_tile_with_options(
     };
     let mut fill_coverage = None;
 
-    for operation in operations {
-        render_operation_onto_tile(
-            image,
-            operation,
-            key,
-            background,
-            options,
-            &camera,
-            content_size,
-            resolution_scale,
-            &mut fill_coverage,
-        );
+    let mut index = 0;
+    while index < operations.len() {
+        let operation = &operations[index];
+        let group_end = operation.fill_group_id.map_or(index + 1, |_| {
+            operations[index + 1..]
+                .iter()
+                .position(|candidate| !operation.shares_fill_group_with(candidate))
+                .map_or(operations.len(), |offset| index + 1 + offset)
+        });
+        if group_end > index + 1 {
+            render_fill_group_onto_tile(
+                image,
+                &operations[index..group_end],
+                background,
+                options,
+                &camera,
+                content_size,
+                &mut fill_coverage,
+            );
+        } else {
+            render_operation_onto_tile(
+                image,
+                operation,
+                key,
+                background,
+                options,
+                &camera,
+                content_size,
+                resolution_scale,
+                &mut fill_coverage,
+            );
+        }
+        index = group_end;
     }
 }
 
@@ -178,7 +199,7 @@ fn render_operation_onto_tile(
         if points.len() < 3 {
             return;
         }
-        let points = simplify_render_points(&points, true);
+        let points = raster_area_render_points(operation, &points, options.smoothing_passes);
         let image_width = image.width();
         let image_height = image.height();
         let coverage =
@@ -190,13 +211,12 @@ fn render_operation_onto_tile(
         if clipped_points.len() < 3 {
             return;
         }
-        fill_polygon(
-            image,
-            &clipped_points,
-            color,
+        accumulate_fill_polygons(
+            &[clipped_points.as_slice()],
             coverage,
             options.fill_sample_grid(),
         );
+        blend_fill_coverage(image, color, coverage, options.fill_sample_grid());
     } else {
         if points.len() < 2 {
             return;
@@ -221,6 +241,19 @@ fn raster_stroke_render_points(points: &[(f32, f32)], smoothing_passes: u8) -> V
         return smooth_stroke_points_stable(&simplified, usize::from(smoothing_passes));
     }
     smooth_stroke_points_stable(points, usize::from(smoothing_passes))
+}
+
+fn raster_area_render_points(
+    operation: &EditOperation,
+    points: &[(f32, f32)],
+    smoothing_passes: u8,
+) -> Vec<(f32, f32)> {
+    let points = simplify_render_points(points, true);
+    if operation.smooth_area {
+        smooth_closed_points_stable(&points, usize::from(smoothing_passes))
+    } else {
+        points
+    }
 }
 
 fn operation_may_affect_tile(
@@ -414,59 +447,134 @@ impl FillCoverage {
     }
 }
 
-fn fill_polygon(
-    image: &mut RgbaImage,
-    points: &[(f32, f32)],
-    color: Color,
+fn accumulate_fill_polygons(
+    polygons: &[&[(f32, f32)]],
     coverage: &mut FillCoverage,
     sample_grid: i64,
 ) {
-    let min_y = points
+    let min_y = polygons
         .iter()
-        .map(|point| point.1)
+        .flat_map(|points| points.iter().map(|point| point.1))
         .fold(f32::INFINITY, f32::min);
-    let max_y = points
+    let max_y = polygons
         .iter()
-        .map(|point| point.1)
+        .flat_map(|points| points.iter().map(|point| point.1))
         .fold(f32::NEG_INFINITY, f32::max);
     if !min_y.is_finite() || !max_y.is_finite() {
         return;
     }
 
-    let total_sample_rows = i64::from(image.height()) * sample_grid;
+    let image_height = coverage.values.len() / coverage.image_width;
+    let total_sample_rows = i64::try_from(image_height).unwrap_or(i64::MAX) * sample_grid;
     let first_sample_row = sample_index_at_or_after(min_y, sample_grid).clamp(0, total_sample_rows);
     let end_sample_row = sample_index_at_or_after(max_y, sample_grid).clamp(0, total_sample_rows);
-    let mut intersections = Vec::with_capacity(points.len());
+    let mut intersections = Vec::new();
+    let mut spans = Vec::new();
     for sample_row in first_sample_row..end_sample_row {
         let sample_y = (sample_row as f32 + 0.5) / sample_grid as f32;
-        intersections.clear();
-        let mut previous = points.len() - 1;
-        for current in 0..points.len() {
-            let a = points[current];
-            let b = points[previous];
-            if ((a.1 > sample_y) != (b.1 > sample_y)) && (b.1 - a.1).abs() > f32::EPSILON {
-                let x = a.0 + (sample_y - a.1) * (b.0 - a.0) / (b.1 - a.1);
-                if x.is_finite() {
-                    intersections.push(x);
+        spans.clear();
+        for points in polygons.iter().copied().filter(|points| points.len() >= 3) {
+            intersections.clear();
+            let mut previous = points.len() - 1;
+            for current in 0..points.len() {
+                let a = points[current];
+                let b = points[previous];
+                if ((a.1 > sample_y) != (b.1 > sample_y)) && (b.1 - a.1).abs() > f32::EPSILON {
+                    let x = a.0 + (sample_y - a.1) * (b.0 - a.0) / (b.1 - a.1);
+                    if x.is_finite() {
+                        intersections.push(x);
+                    }
                 }
+                previous = current;
             }
-            previous = current;
+            intersections.sort_by(|a, b| a.total_cmp(b));
+            spans.extend(intersections.chunks_exact(2).map(|span| (span[0], span[1])));
         }
-        intersections.sort_by(|a, b| a.total_cmp(b));
+        spans.sort_by(|left, right| left.0.total_cmp(&right.0));
 
         let pixel_y = (sample_row / sample_grid) as usize;
-        for span in intersections.chunks_exact(2) {
+        let mut merged_span = None::<(f32, f32)>;
+        for (left, right) in spans.iter().copied() {
+            if let Some((merged_left, merged_right)) = merged_span.as_mut() {
+                if left <= *merged_right + 1.0e-3 {
+                    *merged_right = merged_right.max(right);
+                    continue;
+                }
+                accumulate_fill_span(
+                    coverage,
+                    pixel_y,
+                    *merged_left,
+                    *merged_right,
+                    u32::try_from(coverage.image_width).unwrap_or(u32::MAX),
+                    sample_grid,
+                );
+            }
+            merged_span = Some((left, right));
+        }
+        if let Some((left, right)) = merged_span {
             accumulate_fill_span(
                 coverage,
                 pixel_y,
-                span[0],
-                span[1],
-                image.width(),
+                left,
+                right,
+                u32::try_from(coverage.image_width).unwrap_or(u32::MAX),
                 sample_grid,
             );
         }
     }
+}
 
+fn render_fill_group_onto_tile(
+    image: &mut RgbaImage,
+    operations: &[EditOperation],
+    background: Color,
+    options: RasterOptions,
+    camera: &CameraAddress,
+    content_size: u32,
+    fill_coverage: &mut Option<FillCoverage>,
+) {
+    let image_width = image.width();
+    let image_height = image.height();
+    let polygons = operations
+        .iter()
+        .filter_map(|operation| {
+            let points = operation
+                .points
+                .iter()
+                .filter_map(|point| {
+                    camera.canvas_to_screen(point, f64::from(content_size), f64::from(content_size))
+                })
+                .map(|(x, y)| (x as f32 + TILE_BLEED as f32, y as f32 + TILE_BLEED as f32))
+                .collect::<Vec<_>>();
+            let points = raster_area_render_points(operation, &points, options.smoothing_passes);
+            let clipped = clip_polygon_to_rect(
+                &points,
+                GeometryClipRect::new(0.0, 0.0, image_width as f32, image_height as f32),
+            );
+            (clipped.len() >= 3).then_some(clipped)
+        })
+        .collect::<Vec<_>>();
+    if polygons.is_empty() {
+        return;
+    }
+    let coverage =
+        fill_coverage.get_or_insert_with(|| FillCoverage::new(image_width, image_height));
+    let polygon_slices = polygons.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    accumulate_fill_polygons(&polygon_slices, coverage, options.fill_sample_grid());
+    blend_fill_coverage(
+        image,
+        operations[0].opaque_visible_color(background),
+        coverage,
+        options.fill_sample_grid(),
+    );
+}
+
+fn blend_fill_coverage(
+    image: &mut RgbaImage,
+    color: Color,
+    coverage: &mut FillCoverage,
+    sample_grid: i64,
+) {
     let max_coverage = (sample_grid * sample_grid) as f32;
     for index in coverage.touched.drain(..) {
         let pixel_coverage = coverage.values[index] as f32 / max_coverage;
@@ -511,7 +619,7 @@ fn accumulate_fill_span(
         if coverage.values[index] == 0 {
             coverage.touched.push(index);
         }
-        coverage.values[index] += covered_samples;
+        coverage.values[index] = coverage.values[index].saturating_add(covered_samples);
     }
 }
 
@@ -581,6 +689,26 @@ mod tests {
             assert!((x * scale - scaled_x).abs() < 0.001);
             assert!((y * scale - scaled_y).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn raster_smooths_only_explicit_freehand_fill_geometry() {
+        let points = [
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (0.0, 10.0),
+            (0.0, 0.0),
+        ];
+        let mut fill = EditOperation::draft(EditKind::Fill, 0, 1.0, Vec::new(), Color::BLACK, 10.0);
+
+        let sharp = raster_area_render_points(&fill, &points, 2);
+        fill.smooth_area = true;
+        let smooth = raster_area_render_points(&fill, &points, 2);
+
+        assert_eq!(sharp, points);
+        assert!(smooth.len() > sharp.len());
+        assert!(!smooth.contains(&(10.0, 0.0)));
     }
 
     #[test]

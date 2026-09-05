@@ -1,36 +1,37 @@
 use crate::coords::{CameraAddress, CanvasPoint, ScreenAffine};
-use crate::document::CanvasDocument;
+use crate::document::{CanvasDocument, VisibleDepthMode, recompute_compact_block_bounds};
 use crate::help::HelpLibrary;
 use crate::local_paths::{default_canvas_path, session_logs_path, settings_path};
-use crate::model::{Bookmark, Color, DEFAULT_LAYER_ID, EditKind, EditOperation, Layer, ToolKind};
+use crate::model::{Bookmark, Color, DEFAULT_LAYER_ID, EditKind, EditOperation, ToolKind};
 use crate::mouse_history::{MouseHistory, NativeWindow, native_window};
-use crate::projection_cache::{ProjectedGeometryCache, VisibleRenderOperationCache};
+use crate::projection_cache::{ProjectedGeometryCache, VisibleOperationCache};
 use crate::raster::operation_width;
 use crate::selection_geometry::{Point2 as SelectionPoint, Rect2 as SelectionRect, SelectionShape};
 use crate::session_log::{LOW_FPS_EMA, SLOW_FRAME_MS, SessionLogger};
 use crate::settings::{
     AppSettings, EdgeQuality, MAX_BRUSH_INPUT_SPACING_PX, MAX_CACHE_SIZE_MIB,
     MAX_FILL_INPUT_SPACING_PX, MAX_PREVIEW_FPS, MAX_SAVED_FALLBACK_OPERATION_LIMIT,
-    MAX_TILE_PREFETCH_RADIUS, MIN_BRUSH_INPUT_SPACING_PX, MIN_CACHE_SIZE_MIB,
-    MIN_FILL_INPUT_SPACING_PX, MIN_PREVIEW_FPS, ObjectCompactionLimit, OverlayProfile,
-    PerformanceProfile, PngCompression, SessionLoggingLevel, SmoothingLevel, StorageCommitMode,
-    StrokeFallbackJoinMode, TileRebuildPolicy,
+    MAX_TILE_PREFETCH_RADIUS, MAX_VECTOR_DEPTH_RADIUS, MIN_BRUSH_INPUT_SPACING_PX,
+    MIN_CACHE_SIZE_MIB, MIN_FILL_INPUT_SPACING_PX, MIN_PREVIEW_FPS, ObjectCompactionLimit,
+    OverlayProfile, PerformanceProfile, PngCompression, SessionLoggingLevel, SmoothingLevel,
+    StorageCommitMode, StrokeFallbackJoinMode, TileRebuildPolicy,
 };
 use crate::smoothing::{
-    GeometryClipRect, clip_polygon_to_rect, clip_polyline_to_rect, smooth_closed_points_stable,
-    smooth_stroke_points, smooth_stroke_points_stable,
+    GeometryClipRect, clip_polygon_to_rect, clip_polyline_to_rect,
+    simplify_render_points_with_tolerance, smooth_closed_points_stable, smooth_stroke_points,
+    smooth_stroke_points_stable,
 };
-use crate::spatial::operation_bounds;
+use crate::spatial::{OperationBounds, operation_bounds};
 use crate::tile_cache::{
     TILE_BLEED, TILE_RESOLUTIONS, TILE_SIZE, TileCache, TileKey, tile_lod_for_resolution,
     tile_resolution,
 };
 use crate::tile_scheduler::{IncrementalTileUpdate, TileJob, TileScheduler};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use eframe::egui::{self, Color32, Painter, PointerButton, Pos2, Rect, Sense, Stroke};
 use num_bigint::BigInt;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,6 +61,7 @@ const MAX_SEGMENTED_FALLBACK_SHAPES_PER_FRAME: usize = 200_000;
 const MAX_TILE_JOBS_QUEUED_PER_FRAME: usize = 4;
 const WHEEL_LINE_SCROLL_POINTS: f32 = 40.0;
 const WHEEL_ZOOM_SCALE: f32 = 0.002;
+const WHEEL_ZOOM_DIRECTION_LATCH_TIMEOUT: Duration = Duration::from_millis(250);
 const MIN_QUICK_DEPTH: i64 = -10_000;
 const MAX_QUICK_DEPTH: i64 = 10_000;
 const MAX_LATERAL_COORDINATE_DIGITS: usize = 10_000;
@@ -68,6 +70,9 @@ const OVERLAY_COORDINATE_EDGE_DIGITS: usize = 8;
 const MIN_LASSO_PREVIEW_SPACING_PX: f32 = 2.0;
 const MAX_LASSO_PREVIEW_GAP_PX: f32 = 4.0;
 const MAX_LASSO_PREVIEW_INTERPOLATION_STEPS: usize = 128;
+const MAX_FILL_DIFFERENCE_FRAGMENTS: usize = 4096;
+const MIN_FILL_GEOMETRY_AREA_TWICE: f32 = 0.0001;
+const MIN_FILL_FRAGMENT_AREA_TWICE: f32 = 1.0;
 const CLICK_SELECTION_DRAG_THRESHOLD_PX: f32 = 4.0;
 const ALT_SELECTION_DRAG_STEP_PX: f32 = 28.0;
 const CLICK_SELECTION_TOLERANCE_PX: f64 = 6.0;
@@ -95,6 +100,13 @@ enum TileFallbackMode {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepthRenderMode {
+    Empty,
+    VectorsNear,
+    DistantTile,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct FallbackFrameStats {
     stroke_shape_count: usize,
@@ -107,7 +119,13 @@ struct FallbackFrameStats {
     painted_operations: usize,
     fallback_cache_hits: usize,
     fallback_cache_misses: usize,
+    fallback_bounds_cache_hits: usize,
+    fallback_bounds_cache_misses: usize,
+    fallback_visible_cache_hits: usize,
+    fallback_visible_cache_misses: usize,
     project_ms: f64,
+    visible_operations_ms: f64,
+    projection_loop_ms: f64,
     derive_ms: f64,
     clip_ms: f64,
     paint_ms: f64,
@@ -141,10 +159,65 @@ impl FallbackFrameStats {
         self.fallback_cache_misses = self
             .fallback_cache_misses
             .saturating_add(other.fallback_cache_misses);
+        self.fallback_bounds_cache_hits = self
+            .fallback_bounds_cache_hits
+            .saturating_add(other.fallback_bounds_cache_hits);
+        self.fallback_bounds_cache_misses = self
+            .fallback_bounds_cache_misses
+            .saturating_add(other.fallback_bounds_cache_misses);
+        self.fallback_visible_cache_hits = self
+            .fallback_visible_cache_hits
+            .saturating_add(other.fallback_visible_cache_hits);
+        self.fallback_visible_cache_misses = self
+            .fallback_visible_cache_misses
+            .saturating_add(other.fallback_visible_cache_misses);
         self.project_ms += other.project_ms;
+        self.visible_operations_ms += other.visible_operations_ms;
+        self.projection_loop_ms += other.projection_loop_ms;
         self.derive_ms += other.derive_ms;
         self.clip_ms += other.clip_ms;
         self.paint_ms += other.paint_ms;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OperationBoundsLookup {
+    cache_hit: bool,
+    may_intersect: bool,
+}
+
+#[derive(Default)]
+struct OperationBoundsCache {
+    entries: HashMap<Uuid, Option<OperationBounds>>,
+}
+
+impl OperationBoundsCache {
+    fn operation_may_intersect_screen_rect(
+        &mut self,
+        operation: &EditOperation,
+        camera: &CameraAddress,
+        rect: Rect,
+        width: f32,
+    ) -> OperationBoundsLookup {
+        let (bounds, cache_hit) = match self.entries.entry(operation.id) {
+            Entry::Occupied(entry) => (entry.into_mut().as_ref(), true),
+            Entry::Vacant(entry) => (entry.insert(operation_bounds(operation)).as_ref(), false),
+        };
+        OperationBoundsLookup {
+            cache_hit,
+            may_intersect: bounds.is_some_and(|bounds| {
+                operation_bounds_may_intersect_screen_rect(bounds, camera, rect, width)
+            }),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -196,7 +269,11 @@ fn saved_fallback_render_variant(
     smoothing: SmoothingLevel,
 ) -> u8 {
     if operation.kind.is_area() {
-        return 0;
+        return if operation.smooth_area {
+            1u8.saturating_add(smoothing.passes())
+        } else {
+            0
+        };
     }
     let passes = stroke_fallback_smoothing_passes(
         fallback_join_mode,
@@ -325,6 +402,175 @@ impl SavedFallbackRenderCache {
     }
 }
 
+struct FallbackRenderer {
+    segmented_shape_budget_remaining: usize,
+    projected_geometry: ProjectedGeometryCache,
+    visible_operations: VisibleOperationCache,
+    saved_render_cache: SavedFallbackRenderCache,
+    operation_bounds_cache: OperationBoundsCache,
+}
+
+impl Default for FallbackRenderer {
+    fn default() -> Self {
+        Self {
+            segmented_shape_budget_remaining: MAX_SEGMENTED_FALLBACK_SHAPES_PER_FRAME,
+            projected_geometry: ProjectedGeometryCache::default(),
+            visible_operations: VisibleOperationCache::default(),
+            saved_render_cache: SavedFallbackRenderCache::default(),
+            operation_bounds_cache: OperationBoundsCache::default(),
+        }
+    }
+}
+
+impl FallbackRenderer {
+    fn begin_frame(&mut self, frame_key: SavedFallbackRenderFrameKey) {
+        self.saved_render_cache.begin_frame(frame_key);
+        self.segmented_shape_budget_remaining = MAX_SEGMENTED_FALLBACK_SHAPES_PER_FRAME;
+    }
+
+    fn visible_operations(
+        &mut self,
+        revision: u64,
+        visible_tiles: &[TileKey],
+        query: impl FnOnce() -> Vec<usize>,
+    ) -> (Arc<[usize]>, bool) {
+        let mut cache_miss = false;
+        let operations = self
+            .visible_operations
+            .get_or_update(revision, visible_tiles, || {
+                cache_miss = true;
+                query()
+            });
+        (operations, !cache_miss)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_operations(
+        &mut self,
+        operations: &[Arc<EditOperation>],
+        camera: &CameraAddress,
+        rect: Rect,
+        after_sequence: Option<i64>,
+        operation_limit: Option<usize>,
+        fallback_join_mode: StrokeFallbackJoinMode,
+        auto_fast_stroke_fallback: bool,
+        smoothing: SmoothingLevel,
+        project_start: Instant,
+    ) -> (Vec<FallbackPaintOperation>, usize, FallbackFrameStats) {
+        let projection_loop_start = Instant::now();
+        let eligible_operation_indices = operations
+            .iter()
+            .enumerate()
+            .filter(|(_, operation)| {
+                after_sequence.is_none_or(|sequence| operation.sequence > sequence)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let eligible_operation_count = eligible_operation_indices.len();
+        let mut skipped_operations =
+            fallback_operation_skip_count(eligible_operation_count, operation_limit);
+        while skipped_operations > 0 && skipped_operations < eligible_operation_count {
+            let current = &operations[eligible_operation_indices[skipped_operations]];
+            let previous = &operations[eligible_operation_indices[skipped_operations - 1]];
+            if !current.shares_fill_group_with(previous) {
+                break;
+            }
+            skipped_operations -= 1;
+        }
+        let Some(frame) = self.projected_geometry.begin_frame(camera, rect) else {
+            return (
+                Vec::new(),
+                skipped_operations,
+                FallbackFrameStats {
+                    project_ms: project_start.elapsed().as_secs_f64() * 1_000.0,
+                    projection_loop_ms: projection_loop_start.elapsed().as_secs_f64() * 1_000.0,
+                    ..FallbackFrameStats::default()
+                },
+            );
+        };
+        let mut projected =
+            Vec::with_capacity(eligible_operation_count.saturating_sub(skipped_operations));
+        let mut projected_operation_count = 0usize;
+        let mut screen_culled_operations = 0usize;
+        let mut fallback_cache_hits = 0usize;
+        let mut fallback_bounds_cache_hits = 0usize;
+        let mut fallback_bounds_cache_misses = 0usize;
+        for operation_index in eligible_operation_indices
+            .into_iter()
+            .skip(skipped_operations)
+        {
+            let operation = &operations[operation_index];
+            if operation.is_compact_block() {
+                projected.push(FallbackPaintOperation::Projected {
+                    operation_index,
+                    points: Vec::new(),
+                });
+                continue;
+            }
+            let operation_key = saved_fallback_operation_key(
+                operation.id,
+                operation,
+                fallback_join_mode,
+                auto_fast_stroke_fallback,
+                smoothing,
+            );
+            if let Some(points) = self.saved_render_cache.get(&operation_key) {
+                fallback_cache_hits = fallback_cache_hits.saturating_add(1);
+                projected.push(FallbackPaintOperation::CachedDerived {
+                    operation_index,
+                    points,
+                });
+                continue;
+            }
+            let bounds_lookup = self
+                .operation_bounds_cache
+                .operation_may_intersect_screen_rect(
+                    operation,
+                    camera,
+                    rect,
+                    operation_width(operation, camera.depth, camera.zoom),
+                );
+            if bounds_lookup.cache_hit {
+                fallback_bounds_cache_hits = fallback_bounds_cache_hits.saturating_add(1);
+            } else {
+                fallback_bounds_cache_misses = fallback_bounds_cache_misses.saturating_add(1);
+            }
+            if !bounds_lookup.may_intersect {
+                screen_culled_operations = screen_culled_operations.saturating_add(1);
+                continue;
+            }
+            let points = self.projected_geometry.project_operation(operation, frame);
+            projected_operation_count = projected_operation_count.saturating_add(1);
+            projected.push(FallbackPaintOperation::Projected {
+                operation_index,
+                points,
+            });
+        }
+        (
+            projected,
+            skipped_operations,
+            FallbackFrameStats {
+                skipped_operations: screen_culled_operations,
+                projected_operations: projected_operation_count,
+                fallback_cache_hits,
+                fallback_bounds_cache_hits,
+                fallback_bounds_cache_misses,
+                project_ms: project_start.elapsed().as_secs_f64() * 1_000.0,
+                projection_loop_ms: projection_loop_start.elapsed().as_secs_f64() * 1_000.0,
+                ..FallbackFrameStats::default()
+            },
+        )
+    }
+
+    fn clear(&mut self) {
+        self.projected_geometry.clear();
+        self.visible_operations.clear();
+        self.saved_render_cache.clear();
+        self.operation_bounds_cache.clear();
+        self.segmented_shape_budget_remaining = MAX_SEGMENTED_FALLBACK_SHAPES_PER_FRAME;
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct OperationPaintContext {
     is_draft: bool,
@@ -341,6 +587,19 @@ enum FallbackPaintOperation {
         operation_index: usize,
         points: Arc<[Pos2]>,
     },
+}
+
+impl FallbackPaintOperation {
+    fn operation_index(&self) -> usize {
+        match self {
+            Self::Projected {
+                operation_index, ..
+            }
+            | Self::CachedDerived {
+                operation_index, ..
+            } => *operation_index,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -621,16 +880,16 @@ struct FrameRateTracker {
 }
 
 impl FrameRateTracker {
-    fn update(&mut self, frame_time: f32, interaction_active: bool) {
+    fn update(&mut self, frame_time: f32, interaction_active: bool) -> Option<f32> {
         if !interaction_active {
             self.interaction_active_last_frame = false;
-            return;
+            return None;
         }
         if !frame_time.is_finite()
             || frame_time <= f32::EPSILON
             || frame_time > MAX_MEASURED_FRAME_TIME
         {
-            return;
+            return None;
         }
 
         if !self.interaction_active_last_frame || self.average_frame_time.is_none() {
@@ -639,6 +898,7 @@ impl FrameRateTracker {
             *average += (frame_time - *average) * FRAME_TIME_EMA_ALPHA;
         }
         self.interaction_active_last_frame = true;
+        Some(frame_time * 1_000.0)
     }
 
     fn metrics(&self) -> Option<(f32, f32)> {
@@ -849,6 +1109,74 @@ impl SelectionOverlayBoundsCache {
     }
 }
 
+#[derive(Default)]
+struct WheelZoomDirectionLatch {
+    direction: Option<f32>,
+    last_input_at: Option<Instant>,
+}
+
+struct WheelZoomLatchResult {
+    applied_scrolls: Vec<f32>,
+    suppressed_scroll_count: usize,
+    direction_before: Option<f32>,
+    direction_used: Option<f32>,
+    direction_after: Option<f32>,
+}
+
+impl WheelZoomDirectionLatch {
+    fn apply(
+        &mut self,
+        scrolls: &[f32],
+        gesture_ended: bool,
+        now: Instant,
+    ) -> WheelZoomLatchResult {
+        if self.last_input_at.is_some_and(|last_input_at| {
+            now.saturating_duration_since(last_input_at) >= WHEEL_ZOOM_DIRECTION_LATCH_TIMEOUT
+        }) {
+            self.reset();
+        }
+        let direction_before = self.direction;
+        if self.direction.is_none() {
+            let batch_total = scrolls.iter().copied().sum::<f32>();
+            if batch_total.abs() > f32::EPSILON {
+                self.direction = Some(batch_total.signum());
+            }
+        }
+        let direction_used = self.direction;
+        let mut suppressed_scroll_count = 0usize;
+        let applied_scrolls = scrolls
+            .iter()
+            .copied()
+            .filter(|scroll| {
+                let matches_direction =
+                    direction_used.is_some_and(|direction| scroll.signum() == direction.signum());
+                if !matches_direction {
+                    suppressed_scroll_count = suppressed_scroll_count.saturating_add(1);
+                }
+                matches_direction
+            })
+            .collect();
+        if !scrolls.is_empty() {
+            self.last_input_at = Some(now);
+        }
+        if gesture_ended {
+            self.reset();
+        }
+        WheelZoomLatchResult {
+            applied_scrolls,
+            suppressed_scroll_count,
+            direction_before,
+            direction_used,
+            direction_after: self.direction,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.direction = None;
+        self.last_input_at = None;
+    }
+}
+
 pub struct EndlessSketchApp {
     document: CanvasDocument,
     camera: CameraAddress,
@@ -856,6 +1184,7 @@ pub struct EndlessSketchApp {
     color: Color,
     brush_size: f32,
     draft: Option<EditOperation>,
+    eraser_target_ids: HashSet<Uuid>,
     last_draft_save: Instant,
     last_pointer_position: Option<Pos2>,
     status_message: String,
@@ -866,6 +1195,7 @@ pub struct EndlessSketchApp {
     visible_tile_set: HashSet<TileKey>,
     last_zoom_change: Option<Instant>,
     wheel_zoom_point_remainder: f32,
+    wheel_zoom_direction_latch: WheelZoomDirectionLatch,
     last_tile_rebuild_interaction: Option<Instant>,
     settings: AppSettings,
     settings_path: PathBuf,
@@ -886,16 +1216,14 @@ pub struct EndlessSketchApp {
     brush_sizing_drag_active: bool,
     frame_rate: FrameRateTracker,
     last_visible_render_operation_count: Option<usize>,
+    last_depth_render_mode: Option<DepthRenderMode>,
     last_fallback_mode: Option<TileFallbackMode>,
     last_fallback_frame_stats: FallbackFrameStats,
     last_tile_frame_stats: TileFrameStats,
     last_frame_phase_stats: FramePhaseStats,
     last_auto_fast_stroke_fallback: bool,
     last_large_selection_fast_overlay: bool,
-    fallback_segmented_shape_budget_remaining: usize,
-    projected_geometry: ProjectedGeometryCache,
-    visible_operations: VisibleRenderOperationCache,
-    saved_fallback_render_cache: SavedFallbackRenderCache,
+    fallback_renderer: FallbackRenderer,
     automatic_tile_generation_pause: bool,
     mouse_history: MouseHistory,
     depth_jump_target: i64,
@@ -927,6 +1255,7 @@ pub struct EndlessSketchApp {
     selection_cycle_position: Option<Pos2>,
     selection_cycle_candidates: Vec<Uuid>,
     selection_cycle_index: usize,
+    selection_capture_camera_depth: i64,
     alt_pointer_gesture: Option<AltPointerGesture>,
     eraser_lasso_points: Vec<Pos2>,
     eraser_lasso_active: bool,
@@ -977,6 +1306,7 @@ impl EndlessSketchApp {
             color: Color::BLACK,
             brush_size: 5.0,
             draft: None,
+            eraser_target_ids: HashSet::new(),
             last_draft_save: Instant::now(),
             last_pointer_position: None,
             status_message,
@@ -987,6 +1317,7 @@ impl EndlessSketchApp {
             visible_tile_set: HashSet::new(),
             last_zoom_change: None,
             wheel_zoom_point_remainder: 0.0,
+            wheel_zoom_direction_latch: WheelZoomDirectionLatch::default(),
             last_tile_rebuild_interaction: None,
             settings,
             settings_path,
@@ -1007,16 +1338,14 @@ impl EndlessSketchApp {
             brush_sizing_drag_active: false,
             frame_rate: FrameRateTracker::default(),
             last_visible_render_operation_count: None,
+            last_depth_render_mode: None,
             last_fallback_mode: None,
             last_fallback_frame_stats: FallbackFrameStats::default(),
             last_tile_frame_stats: TileFrameStats::default(),
             last_frame_phase_stats: FramePhaseStats::default(),
             last_auto_fast_stroke_fallback: false,
             last_large_selection_fast_overlay: false,
-            fallback_segmented_shape_budget_remaining: MAX_SEGMENTED_FALLBACK_SHAPES_PER_FRAME,
-            projected_geometry: ProjectedGeometryCache::default(),
-            visible_operations: VisibleRenderOperationCache::default(),
-            saved_fallback_render_cache: SavedFallbackRenderCache::default(),
+            fallback_renderer: FallbackRenderer::default(),
             automatic_tile_generation_pause: false,
             mouse_history: MouseHistory::default(),
             depth_jump_target: 0,
@@ -1048,6 +1377,7 @@ impl EndlessSketchApp {
             selection_cycle_position: None,
             selection_cycle_candidates: Vec::new(),
             selection_cycle_index: 0,
+            selection_capture_camera_depth: 0,
             alt_pointer_gesture: None,
             eraser_lasso_points: Vec::new(),
             eraser_lasso_active: false,
@@ -1530,6 +1860,9 @@ impl EndlessSketchApp {
         let previous_pause_while_drawing = self.settings.pause_tile_generation_while_drawing;
         let previous_rebuild_policy = self.settings.tile_rebuild_policy;
         let previous_prefetch_radius = self.settings.tile_prefetch_radius;
+        let previous_distant_tiles_enabled = self.settings.distant_tiles_enabled;
+        let previous_vector_depth_radius = self.settings.vector_depth_radius;
+        let previous_depth_capture_radius = self.settings.depth_capture_radius;
         let previous_edge_quality = self.settings.edge_quality;
         let previous_smoothing = self.settings.smoothing;
         let previous_cache_size_mib = self.settings.cache_size_mib;
@@ -1635,6 +1968,28 @@ impl EndlessSketchApp {
                             .text("Tile workers"),
                     )
                     .changed();
+                changed |= ui
+                    .checkbox(&mut self.settings.distant_tiles_enabled, "Distant tiles")
+                    .changed();
+                ui.add_enabled_ui(self.settings.distant_tiles_enabled, |ui| {
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(
+                                &mut self.settings.vector_depth_radius,
+                                0..=MAX_VECTOR_DEPTH_RADIUS,
+                            )
+                            .text("Vector depth radius"),
+                        )
+                        .changed();
+                    ui.small(format!(
+                        "±{} ({} levels)",
+                        self.settings.vector_depth_radius,
+                        self.settings
+                            .vector_depth_radius
+                            .saturating_mul(2)
+                            .saturating_add(1)
+                    ));
+                });
                 ui.horizontal(|ui| {
                     ui.label("Tile resolution");
                     egui::ComboBox::from_id_salt("tile_resolution")
@@ -1929,6 +2284,9 @@ impl EndlessSketchApp {
         }
         if changed {
             self.settings.normalize();
+            if self.settings.depth_capture_radius != previous_depth_capture_radius {
+                self.clear_object_selection_state();
+            }
             let tile_worker_count_changed =
                 self.settings.tile_worker_count != previous_tile_worker_count;
             let tile_resolution_changed =
@@ -1941,6 +2299,9 @@ impl EndlessSketchApp {
                 self.settings.tile_rebuild_policy != previous_rebuild_policy;
             let prefetch_radius_changed =
                 self.settings.tile_prefetch_radius != previous_prefetch_radius;
+            let distant_tile_gate_changed = self.settings.distant_tiles_enabled
+                != previous_distant_tiles_enabled
+                || self.settings.vector_depth_radius != previous_vector_depth_radius;
             let render_quality_changed = self.settings.edge_quality != previous_edge_quality
                 || self.settings.smoothing != previous_smoothing;
             let cache_settings_changed = self.settings.cache_size_mib != previous_cache_size_mib
@@ -1959,7 +2320,7 @@ impl EndlessSketchApp {
             if pause_while_drawing_changed {
                 self.apply_pause_while_drawing_setting();
             }
-            if rebuild_policy_changed || prefetch_radius_changed {
+            if rebuild_policy_changed || prefetch_radius_changed || distant_tile_gate_changed {
                 self.apply_tile_request_settings();
             }
             if storage_commit_mode_changed {
@@ -2008,6 +2369,7 @@ impl EndlessSketchApp {
         let mut move_selection_target = None;
         let mut visibility_request = None;
         let mut lock_request = None;
+        let mut depth_capture_changed = false;
         egui::Window::new("Layers")
             .open(&mut open)
             .default_width(280.0)
@@ -2066,6 +2428,33 @@ impl EndlessSketchApp {
                         .add_enabled(can_merge_down, egui::Button::new("Merge Down"))
                         .clicked();
                 });
+                ui.horizontal(|ui| {
+                    depth_capture_changed |= ui
+                        .checkbox(&mut self.settings.depth_capture_auto, "Auto")
+                        .on_hover_text("Follow Vector depth radius")
+                        .changed();
+                    ui.add_enabled_ui(!self.settings.depth_capture_auto, |ui| {
+                        depth_capture_changed |= ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut self.settings.depth_capture_radius,
+                                    0..=self.settings.vector_depth_radius,
+                                )
+                                .text("Depth capture ±"),
+                            )
+                            .on_hover_text(
+                                "Object Selection can target complete vector objects in this \
+                                 camera-relative native-depth radius",
+                            )
+                            .changed();
+                    });
+                    let levels = self
+                        .settings
+                        .depth_capture_radius
+                        .saturating_mul(2)
+                        .saturating_add(1);
+                    ui.small(format!("{levels} levels"));
+                });
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .max_height(420.0)
@@ -2101,6 +2490,11 @@ impl EndlessSketchApp {
                     });
             });
         self.show_layers = open;
+        if depth_capture_changed {
+            self.settings.normalize();
+            self.clear_object_selection_state();
+            self.save_settings();
+        }
         if create_requested {
             self.create_layer();
         } else if duplicate_requested {
@@ -2294,7 +2688,7 @@ impl EndlessSketchApp {
                 self.invalidate_tile_rendering();
                 self.status_message = format!(
                     "Moved {} objects to {target_name}",
-                    self.selected_operation_ids.len()
+                    self.selected_object_count()
                 );
             }
             Ok(_) => self.status_message = "Nothing moved".to_owned(),
@@ -2456,6 +2850,10 @@ impl EndlessSketchApp {
             .or(self.last_fallback_mode)
             .map(tile_fallback_mode_label)
             .unwrap_or("unknown");
+        let depth_render_mode = self
+            .last_depth_render_mode
+            .map(depth_render_mode_label)
+            .unwrap_or("unknown");
         let (fps_ema, frame_ms_ema) = self
             .frame_rate
             .metrics()
@@ -2472,6 +2870,10 @@ impl EndlessSketchApp {
                 "max_y_bits": rect.max.y.to_bits(),
             })
         });
+        let pointer_screen = self
+            .last_pointer_position
+            .map(|position| json!({ "x": position.x, "y": position.y }));
+        let (pointer_history_mode, pointer_history_samples) = self.mouse_history.diagnostics();
         json!({
             "camera": {
                 "depth": self.camera.depth,
@@ -2495,6 +2897,9 @@ impl EndlessSketchApp {
                 "manual": self.settings.pause_tile_generation,
                 "drawing": self.automatic_tile_generation_pause,
                 "fallback_mode": fallback_mode,
+                "depth_render_mode": depth_render_mode,
+                "distant_tiles_enabled": self.settings.distant_tiles_enabled,
+                "vector_depth_radius": self.settings.vector_depth_radius,
                 "pending_count": self.pending_tiles.len(),
                 "visible_tile_count": self.visible_tile_set.len(),
                 "uploaded_textures": self.last_tile_frame_stats.uploaded_textures,
@@ -2522,7 +2927,13 @@ impl EndlessSketchApp {
                 "fallback_painted_operations": self.last_fallback_frame_stats.painted_operations,
                 "fallback_cache_hits": self.last_fallback_frame_stats.fallback_cache_hits,
                 "fallback_cache_misses": self.last_fallback_frame_stats.fallback_cache_misses,
+                "fallback_bounds_cache_hits": self.last_fallback_frame_stats.fallback_bounds_cache_hits,
+                "fallback_bounds_cache_misses": self.last_fallback_frame_stats.fallback_bounds_cache_misses,
+                "fallback_visible_cache_hits": self.last_fallback_frame_stats.fallback_visible_cache_hits,
+                "fallback_visible_cache_misses": self.last_fallback_frame_stats.fallback_visible_cache_misses,
                 "fallback_project_ms": self.last_frame_phase_stats.fallback_project_ms,
+                "fallback_visible_operations_ms": self.last_fallback_frame_stats.visible_operations_ms,
+                "fallback_projection_loop_ms": self.last_fallback_frame_stats.projection_loop_ms,
                 "fallback_derive_ms": self.last_frame_phase_stats.fallback_derive_ms,
                 "fallback_clip_ms": self.last_frame_phase_stats.fallback_clip_ms,
                 "fallback_shape_paint_ms": self.last_frame_phase_stats.fallback_shape_paint_ms,
@@ -2541,6 +2952,11 @@ impl EndlessSketchApp {
                 "tile_resolution": self.settings.tile_resolution_px,
                 "canvas_rect": canvas_rect,
                 "compact_limit": self.settings.object_compaction_limit.label(),
+                "depth_capture_auto": self.settings.depth_capture_auto,
+                "depth_capture_radius": self.settings.depth_capture_radius,
+                "pointer_history_mode": pointer_history_mode,
+                "pointer_history_samples": pointer_history_samples,
+                "pointer_screen": pointer_screen,
                 "selected_count": self.selected_operation_ids.len(),
                 "status_message": self.status_message,
             },
@@ -2581,7 +2997,14 @@ impl EndlessSketchApp {
         let input_phase_start = Instant::now();
         self.handle_shortcuts(context);
         self.handle_navigation(ui, &response);
+        let revision_before_input = self.document.revision();
+        let mut depth_render_mode = self.depth_render_mode(response.rect);
+        self.apply_depth_render_mode(depth_render_mode);
         self.handle_drawing(ui, &response, window);
+        if self.document.revision() != revision_before_input {
+            depth_render_mode = self.depth_render_mode(response.rect);
+            self.apply_depth_render_mode(depth_render_mode);
+        }
         let input_phase_ms = input_phase_start.elapsed().as_secs_f64() * 1_000.0;
         let pointer_down = ui.input(|input| input.pointer.any_down());
         let transient_preview_active = self.selection_drag_active
@@ -2593,10 +3016,18 @@ impl EndlessSketchApp {
         let interaction_active =
             input_active || self.zoom_tile_requests_deferred() || self.tile_rebuild_is_deferred();
         let overlay_interaction_active = interaction_active || transient_preview_active;
-        self.frame_rate.update(frame_time, interaction_active);
+        let frame_ms = self.frame_rate.update(frame_time, interaction_active);
         let tile_phase_start = Instant::now();
-        let (fallback_mode, tile_frame_stats) =
-            self.paint_cached_tiles(context, &painter, response.rect);
+        let (fallback_mode, tile_frame_stats) = if depth_render_mode == DepthRenderMode::DistantTile
+        {
+            self.paint_cached_tiles(context, &painter, response.rect)
+        } else {
+            let stats = TileFrameStats {
+                uploaded_textures: self.collect_tile_results(context),
+                ..TileFrameStats::default()
+            };
+            (TileFallbackMode::Full, stats)
+        };
         self.last_tile_frame_stats = tile_frame_stats;
         let tile_phase_ms = tile_phase_start.elapsed().as_secs_f64() * 1_000.0;
         if self.last_fallback_mode != Some(fallback_mode) {
@@ -2618,7 +3049,7 @@ impl EndlessSketchApp {
             tile_generation_paused,
         );
         self.last_auto_fast_stroke_fallback = auto_fast_stroke_fallback;
-        self.saved_fallback_render_cache
+        self.fallback_renderer
             .begin_frame(SavedFallbackRenderFrameKey::new(
                 self.document.revision(),
                 &self.camera,
@@ -2626,7 +3057,6 @@ impl EndlessSketchApp {
                 &self.settings,
                 auto_fast_stroke_fallback,
             ));
-        self.fallback_segmented_shape_budget_remaining = MAX_SEGMENTED_FALLBACK_SHAPES_PER_FRAME;
         let fallback_operation_limit = fallback_operation_limit(&self.settings, fallback_mode);
         self.last_fallback_frame_stats = match fallback_mode {
             TileFallbackMode::Current => FallbackFrameStats::default(),
@@ -2696,7 +3126,6 @@ impl EndlessSketchApp {
         );
         phases.insert("overlay".to_owned(), overlay_phase_ms);
         phases.insert("total_frame".to_owned(), total_phase_ms);
-        let frame_ms = (frame_time.is_finite() && frame_time > 0.0).then_some(frame_time * 1_000.0);
         let fps_ema = self.frame_rate.metrics().map(|(fps, _)| fps);
         self.last_frame_phase_stats = FramePhaseStats {
             frame_ms,
@@ -2879,16 +3308,37 @@ impl EndlessSketchApp {
                 {
                     return;
                 }
-                let wheel_scrolls = ui.input(|input| {
-                    wheel_zoom_scrolls(
+                let (
+                    raw_wheel_events,
+                    wheel_scrolls,
+                    wheel_gesture_ended,
+                    remainder_before,
+                    remainder_after,
+                ) = ui.input(|input| {
+                    let diagnostics = wheel_zoom_input_diagnostics(input.events.as_slice());
+                    let remainder_before = self.wheel_zoom_point_remainder;
+                    let scrolls = wheel_zoom_scrolls(
                         input.events.as_slice(),
                         &mut self.wheel_zoom_point_remainder,
                         response.rect.height(),
+                    );
+                    (
+                        diagnostics,
+                        scrolls,
+                        wheel_zoom_gesture_ended(input.events.as_slice()),
+                        remainder_before,
+                        self.wheel_zoom_point_remainder,
                     )
                 });
-                if !wheel_scrolls.is_empty() {
-                    for scroll in wheel_scrolls {
-                        let factor = (scroll as f64 * f64::from(WHEEL_ZOOM_SCALE)).exp();
+                let latch_result = self.wheel_zoom_direction_latch.apply(
+                    &wheel_scrolls,
+                    wheel_gesture_ended,
+                    Instant::now(),
+                );
+                let camera_before = self.camera.clone();
+                if !latch_result.applied_scrolls.is_empty() {
+                    for scroll in &latch_result.applied_scrolls {
+                        let factor = (f64::from(*scroll) * f64::from(WHEEL_ZOOM_SCALE)).exp();
                         self.camera.zoom_at(
                             factor,
                             (position.x - response.rect.left()) as f64,
@@ -2897,6 +3347,37 @@ impl EndlessSketchApp {
                             response.rect.height() as f64,
                         );
                     }
+                }
+                if !raw_wheel_events.is_empty() {
+                    self.log_session_event_with(
+                        "wheel_zoom_input",
+                        json!({
+                            "wheel_zoom": {
+                                "raw_events": raw_wheel_events,
+                                "produced_scrolls": wheel_scrolls,
+                                "applied_scrolls": latch_result.applied_scrolls,
+                                "suppressed_scroll_count": latch_result.suppressed_scroll_count,
+                                "direction_latch_before": latch_result.direction_before,
+                                "direction_latch_used": latch_result.direction_used,
+                                "direction_latch_after": latch_result.direction_after,
+                                "gesture_ended": wheel_gesture_ended,
+                                "point_remainder_before": remainder_before,
+                                "point_remainder_after": remainder_after,
+                                "pointer_screen": {
+                                    "x": position.x,
+                                    "y": position.y,
+                                },
+                                "pointer_canvas": {
+                                    "x": position.x - response.rect.left(),
+                                    "y": position.y - response.rect.top(),
+                                },
+                                "camera_before": wheel_zoom_camera_diagnostics(&camera_before),
+                                "camera_after": wheel_zoom_camera_diagnostics(&self.camera),
+                            }
+                        }),
+                    );
+                }
+                if !latch_result.applied_scrolls.is_empty() {
                     self.mark_zoom_changed();
                     self.log_navigation_event("wheel_zoom");
                 }
@@ -2963,7 +3444,7 @@ impl EndlessSketchApp {
         let primary_down = pointer.button_down(PointerButton::Primary);
         let primary_released = pointer.button_released(PointerButton::Primary);
         let events = ui.input(|input| input.events.clone());
-        let (event_press_position, mut drag_positions) =
+        let (event_press_position, mut drag_positions, touch_event_history) =
             primary_pointer_positions(&events, primary_down);
         let modifiers = ui.input(|input| SelectionModifiers {
             shift: input.modifiers.shift,
@@ -3019,6 +3500,16 @@ impl EndlessSketchApp {
         }
         if self.tool == ToolKind::Selection {
             self.mouse_history.reset();
+            if !self.existing_object_tools_are_editable() {
+                self.hovered_operation_id = None;
+                self.selection_hover_position = None;
+                if primary_pressed && response.hovered() {
+                    self.status_message =
+                        "Distant tile is read-only; move closer to edit objects".to_owned();
+                }
+                self.last_pointer_position = position;
+                return;
+            }
             self.handle_transient_tool(
                 response,
                 event_press_position,
@@ -3033,13 +3524,24 @@ impl EndlessSketchApp {
             return;
         }
         if self.tool == ToolKind::EraserLasso {
-            if primary_pressed
+            if !self.existing_object_tools_are_editable() {
+                self.mouse_history.reset();
+                if primary_pressed && response.hovered() {
+                    self.status_message =
+                        "Distant tile is read-only; move closer to erase".to_owned();
+                }
+                self.last_pointer_position = position;
+                return;
+            }
+            if !touch_event_history
+                && primary_pressed
                 && response.hovered()
                 && let Some(position) = event_press_position.or(position)
             {
                 self.mouse_history.begin(window, position, pixels_per_point);
             }
-            if (primary_down || primary_released)
+            if !touch_event_history
+                && (primary_down || primary_released)
                 && let Some(position) = position
                 && let Some(history_positions) =
                     self.mouse_history
@@ -3047,6 +3549,9 @@ impl EndlessSketchApp {
                 && history_positions.len() > drag_positions.len()
             {
                 drag_positions = history_positions;
+            }
+            if touch_event_history && (primary_pressed || primary_down || primary_released) {
+                self.mouse_history.record_touch_events(drag_positions.len());
             }
             self.handle_transient_tool(
                 response,
@@ -3066,9 +3571,14 @@ impl EndlessSketchApp {
         }
 
         if primary_pressed && response.hovered() {
+            self.eraser_target_ids.clear();
             let press_position = event_press_position.or(position);
             if self.tool == ToolKind::Eyedropper {
                 self.pick_color_at(press_position, response.rect);
+                return;
+            }
+            if self.tool == ToolKind::Eraser && !self.existing_object_tools_are_editable() {
+                self.status_message = "Distant tile is read-only; move closer to erase".to_owned();
                 return;
             }
             if !self.document.layer_is_editable(self.active_layer_id) {
@@ -3088,6 +3598,9 @@ impl EndlessSketchApp {
                 } else {
                     self.color
                 };
+                if kind == EditKind::Erase {
+                    self.eraser_target_ids = self.visible_eraser_target_ids(response.rect);
+                }
                 let mut draft = EditOperation::draft(
                     kind,
                     self.camera.depth,
@@ -3096,9 +3609,12 @@ impl EndlessSketchApp {
                     color,
                     self.brush_size,
                 );
+                draft.smooth_area = kind == EditKind::Fill;
                 draft.layer_id = self.active_layer_id;
                 self.draft = Some(draft);
-                self.mouse_history.begin(window, position, pixels_per_point);
+                if !touch_event_history {
+                    self.mouse_history.begin(window, position, pixels_per_point);
+                }
                 self.last_draft_save = Instant::now();
                 self.begin_drawing_tile_pause();
             }
@@ -3111,6 +3627,7 @@ impl EndlessSketchApp {
             drag_positions.push(position);
         }
         if self.draft.is_some()
+            && !touch_event_history
             && (primary_down || primary_released)
             && let Some(position) = position
             && let Some(history_positions) =
@@ -3119,6 +3636,11 @@ impl EndlessSketchApp {
             && history_positions.len() > drag_positions.len()
         {
             drag_positions = history_positions;
+        }
+        if touch_event_history
+            && (self.draft.is_some() || primary_pressed || primary_down || primary_released)
+        {
+            self.mouse_history.record_touch_events(drag_positions.len());
         }
         for drag_position in drag_positions {
             if response.rect.contains(drag_position) && self.draft.is_some() {
@@ -3397,9 +3919,11 @@ impl EndlessSketchApp {
                     && let Some(position) = event_press_position.or(position)
                 {
                     if !self.document.layer_is_editable(self.active_layer_id) {
+                        self.eraser_target_ids.clear();
                         self.status_message = "Active layer is hidden or locked".to_owned();
                         return;
                     }
+                    self.eraser_target_ids = self.visible_eraser_target_ids(response.rect);
                     self.eraser_lasso_points.clear();
                     self.eraser_lasso_points.push(position);
                     self.eraser_lasso_active = true;
@@ -3544,7 +4068,7 @@ impl EndlessSketchApp {
         let selection_rect =
             SelectionRect::from_points(selection_point(start), selection_point(end));
         let selection = SelectionShape::Rectangle(selection_rect);
-        let candidates = self.visible_selectable_operation_ids(canvas_rect);
+        let candidates = self.visible_editable_operation_ids(canvas_rect);
         let matches: HashSet<_> = self
             .document
             .operations()
@@ -3572,9 +4096,18 @@ impl EndlessSketchApp {
                 selected.then_some(operation.id)
             })
             .collect();
+        let matches = if self.rectangle_selection_mode == RectangleSelectionMode::Inside {
+            fully_contained_object_operation_ids(
+                self.document.operations(),
+                &matches,
+                self.active_layer_id,
+            )
+        } else {
+            matches
+        };
         self.apply_selection_ids(matches, modifiers);
         self.reset_selection_cycle();
-        self.status_message = format!("Selected {} objects", self.selected_operation_ids.len());
+        self.status_message = format!("Selected {} objects", self.selected_object_count());
         self.selection_drag_start = None;
         self.selection_drag_current = None;
     }
@@ -3595,20 +4128,11 @@ impl EndlessSketchApp {
         };
 
         if let Some(selected) = selected {
-            if modifiers.ctrl {
-                if !self.selected_operation_ids.remove(&selected) {
-                    self.selected_operation_ids.insert(selected);
-                }
-            } else if modifiers.shift {
-                self.selected_operation_ids.insert(selected);
-            } else {
-                self.selected_operation_ids.clear();
-                self.selected_operation_ids.insert(selected);
-            }
+            self.apply_selection_ids(HashSet::from([selected]), modifiers);
         } else if !modifiers.shift && !modifiers.ctrl {
             self.selected_operation_ids.clear();
         }
-        self.status_message = format!("Selected {} objects", self.selected_operation_ids.len());
+        self.status_message = format!("Selected {} objects", self.selected_object_count());
     }
 
     fn cycle_selection_with_wheel(&mut self, position: Pos2, canvas_rect: Rect, step: isize) {
@@ -3621,8 +4145,9 @@ impl EndlessSketchApp {
             self.status_message = "No object under cursor".to_owned();
             return;
         };
-        self.selected_operation_ids.clear();
-        self.selected_operation_ids.insert(selected);
+        self.selected_operation_ids = self
+            .document
+            .expanded_object_group_ids(&HashSet::from([selected]), self.active_layer_id);
         self.hovered_operation_id = Some(selected);
         self.selection_hover_position = Some(position);
         self.selection_drag_start = None;
@@ -3690,14 +4215,43 @@ impl EndlessSketchApp {
             .copied()
     }
 
-    fn visible_selectable_operation_ids(&self, canvas_rect: Rect) -> HashSet<Uuid> {
-        let eligible_layers = selectable_layer_ids(self.document.layers(), self.active_layer_id);
+    fn visible_editable_operation_ids(&self, canvas_rect: Rect) -> HashSet<Uuid> {
+        if !self.existing_object_tools_are_editable() {
+            return HashSet::new();
+        }
         let lod = tile_lod_for_resolution(self.settings.tile_resolution_px);
         let visible_tiles = self.visible_tiles(canvas_rect, lod);
         self.document
-            .operation_ids_for_tiles_in_layers(&visible_tiles, &eligible_layers)
+            .editable_operation_ids_for_tiles(
+                &visible_tiles,
+                self.active_layer_id,
+                self.camera.depth,
+                self.settings.depth_capture_radius,
+            )
             .into_iter()
             .collect()
+    }
+
+    fn visible_eraser_target_ids(&self, canvas_rect: Rect) -> HashSet<Uuid> {
+        let editable_ids = self.visible_editable_operation_ids(canvas_rect);
+        let target_ids = self
+            .document
+            .operations()
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    operation.kind,
+                    EditKind::Paint | EditKind::Fill | EditKind::CompactBlock
+                ) && editable_ids.contains(&operation.id)
+            })
+            .map(|operation| operation.id)
+            .collect();
+        self.document
+            .expanded_object_group_ids(&target_ids, self.active_layer_id)
+    }
+
+    fn existing_object_tools_are_editable(&self) -> bool {
+        self.last_depth_render_mode != Some(DepthRenderMode::DistantTile)
     }
 
     fn selection_candidates_at(
@@ -3705,8 +4259,9 @@ impl EndlessSketchApp {
         position: Pos2,
         canvas_rect: Rect,
     ) -> Vec<SelectionCandidate> {
-        let candidate_ids = self.visible_selectable_operation_ids(canvas_rect);
+        let candidate_ids = self.visible_editable_operation_ids(canvas_rect);
         let click = selection_point(position);
+        let mut seen_object_ids = HashSet::new();
         let mut candidates: Vec<_> = self
             .document
             .operations()
@@ -3722,6 +4277,9 @@ impl EndlessSketchApp {
                 let width = operation_width(operation, self.camera.depth, self.camera.zoom) as f64;
                 let (effective_distance, bounds_area) =
                     operation_click_score(operation.kind, &points, width, click)?;
+                if !seen_object_ids.insert(operation.object_group_id()) {
+                    return None;
+                }
                 Some(SelectionCandidate {
                     id: operation.id,
                     effective_distance,
@@ -3744,17 +4302,34 @@ impl EndlessSketchApp {
     }
 
     fn apply_selection_ids(&mut self, matches: HashSet<Uuid>, modifiers: SelectionModifiers) {
+        let matches = self
+            .document
+            .expanded_object_group_ids(&matches, self.active_layer_id);
         if modifiers.ctrl {
-            for id in matches {
-                if !self.selected_operation_ids.remove(&id) {
-                    self.selected_operation_ids.insert(id);
-                }
+            let remove = matches
+                .iter()
+                .all(|id| self.selected_operation_ids.contains(id));
+            if remove {
+                self.selected_operation_ids
+                    .retain(|id| !matches.contains(id));
+            } else {
+                self.selected_operation_ids.extend(matches);
             }
         } else if modifiers.shift {
             self.selected_operation_ids.extend(matches);
         } else {
             self.selected_operation_ids = matches;
         }
+    }
+
+    fn selected_object_count(&self) -> usize {
+        self.document
+            .operations()
+            .iter()
+            .filter(|operation| self.selected_operation_ids.contains(&operation.id))
+            .map(EditOperation::object_group_id)
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     fn reset_selection_cycle(&mut self) {
@@ -3949,6 +4524,9 @@ impl EndlessSketchApp {
         &self,
         selected: &HashSet<Uuid>,
     ) -> Vec<EditOperation> {
+        let selected = self
+            .document
+            .expanded_object_group_ids(selected, self.active_layer_id);
         self.document
             .operations()
             .iter()
@@ -3962,6 +4540,7 @@ impl EndlessSketchApp {
         selected: &HashSet<Uuid>,
         layer_id: Uuid,
     ) -> Vec<EditOperation> {
+        let selected = self.document.expanded_object_group_ids(selected, layer_id);
         let mut operations = self
             .document
             .operations()
@@ -4009,11 +4588,11 @@ impl EndlessSketchApp {
                 self.last_auto_fast_stroke_fallback,
                 self.settings.smoothing,
             );
-            if self.saved_fallback_render_cache.insert_transformed_from(
-                &source_key,
-                replacement_key,
-                transform,
-            ) {
+            if self
+                .fallback_renderer
+                .saved_render_cache
+                .insert_transformed_from(&source_key, replacement_key, transform)
+            {
                 warmed = warmed.saturating_add(1);
             }
         }
@@ -4046,7 +4625,7 @@ impl EndlessSketchApp {
                     .map(|id| replacement_map.get(&id).copied().unwrap_or(id))
                     .collect();
                 self.begin_new_document_revision_for_layer(self.active_layer_id);
-                self.status_message = format!("Recolored {} objects", replacement_map.len());
+                self.status_message = format!("Recolored {} objects", self.selected_object_count());
                 self.log_session_event_with(
                     "selection_transform",
                     json!({ "context": { "action": "recolor", "count": replacement_map.len() } }),
@@ -4123,7 +4702,7 @@ impl EndlessSketchApp {
                 );
                 let warm_fallback_cache_ms = warm_cache_start.elapsed().as_secs_f64() * 1_000.0;
                 self.selected_operation_ids = replacement_ids.into_iter().collect();
-                let count = self.selected_operation_ids.len();
+                let count = self.selected_object_count();
                 let revision_start = Instant::now();
                 self.begin_new_document_revision_for_layer(self.active_layer_id);
                 let revision_invalidation_ms = revision_start.elapsed().as_secs_f64() * 1_000.0;
@@ -4184,12 +4763,11 @@ impl EndlessSketchApp {
                 let revision_start = Instant::now();
                 self.begin_new_document_revision_for_layer(self.active_layer_id);
                 let revision_invalidation_ms = revision_start.elapsed().as_secs_f64() * 1_000.0;
-                self.status_message =
-                    format!("Moved {} objects", self.selected_operation_ids.len());
+                self.status_message = format!("Moved {} objects", self.selected_object_count());
                 self.log_session_event_with(
                     "selection_transform",
                     json!({
-                        "context": { "action": "move", "count": self.selected_operation_ids.len() },
+                        "context": { "action": "move", "count": self.selected_object_count() },
                         "selection_commit": {
                             "document": commit_stats,
                             "warm_fallback_cache_ms": warm_fallback_cache_ms,
@@ -4206,6 +4784,7 @@ impl EndlessSketchApp {
 
     fn commit_eraser_lasso(&mut self, canvas_rect: Rect) {
         if !self.document.layer_is_editable(self.active_layer_id) {
+            self.eraser_target_ids.clear();
             self.status_message = "Active layer is hidden or locked".to_owned();
             return;
         }
@@ -4215,29 +4794,80 @@ impl EndlessSketchApp {
             canvas_rect,
             self.active_layer_id,
         ) else {
+            self.eraser_target_ids.clear();
             self.status_message = "Eraser Lasso needs a non-degenerate area".to_owned();
             return;
         };
         let layer_id = operation.layer_id;
-        let operations = self.clip_draft_to_area_selection(operation, canvas_rect);
-        if operations.is_empty() {
+        let masks = self.clip_draft_to_area_selection(operation, canvas_rect);
+        if masks.is_empty() {
+            self.eraser_target_ids.clear();
             self.status_message = "Clipped outside area".to_owned();
             return;
         }
-        let commit_result = if operations.len() == 1 {
-            self.document
-                .commit(operations.into_iter().next().expect("one operation"))
-        } else {
-            self.document.commit_group(operations)
-        };
-        match commit_result {
-            Ok(()) => {
+        match self.commit_vector_eraser_lasso(masks, canvas_rect) {
+            Ok(true) => {
+                self.clear_object_selection_state();
                 self.begin_new_document_revision_for_layer(layer_id);
                 self.status_message = "Area erased".to_owned();
                 self.log_session_event("save");
             }
+            Ok(false) => self.status_message = "Nothing erased".to_owned(),
             Err(error) => self.status_message = format!("Eraser Lasso failed: {error:#}"),
         }
+    }
+
+    fn commit_vector_eraser_lasso(
+        &mut self,
+        masks: Vec<EditOperation>,
+        rect: Rect,
+    ) -> Result<bool> {
+        let target_ids = std::mem::take(&mut self.eraser_target_ids);
+        if target_ids.is_empty() {
+            return Ok(false);
+        }
+        let polygons = masks
+            .iter()
+            .map(|mask| {
+                let points = mask
+                    .points
+                    .iter()
+                    .map(|point| canvas_point_to_position(&self.camera, point, rect))
+                    .collect::<Option<Vec<_>>>()
+                    .context("eraser lasso is not representable at the current camera")?;
+                let polygon = normalized_pos_polygon(&points);
+                (polygon.len() >= 3).then_some(polygon).context(
+                    "eraser lasso produced a degenerate polygon after Area selection clipping",
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let fill_masks = masks
+            .iter()
+            .map(|mask| mask.points.clone())
+            .collect::<Vec<_>>();
+        let sources = self.snapshotted_eraser_sources(&target_ids)?;
+        let changes = subtract_eraser_sources(&sources, &fill_masks, &self.camera, |source| {
+            let mut runs = vec![source.points.clone()];
+            for polygon in &polygons {
+                let mut next = Vec::new();
+                for points in runs {
+                    let mut fragment = source.clone();
+                    fragment.points = points;
+                    next.extend(
+                        subtract_paint_stroke_by_polygon(&fragment, &self.camera, rect, polygon)
+                            .context(
+                                "paint subtraction is not representable at the current camera",
+                            )?,
+                    );
+                }
+                runs = next;
+            }
+            Ok(runs)
+        })?;
+        Ok(self
+            .document
+            .commit_eraser_subtraction(changes, self.active_layer_id)?
+            .is_some())
     }
 
     fn selection_move_delta(&self) -> egui::Vec2 {
@@ -4321,15 +4951,34 @@ impl EndlessSketchApp {
     fn finish_draft(&mut self, rect: Rect) {
         self.mouse_history.reset();
         let Some(mut draft) = self.draft.take() else {
+            self.eraser_target_ids.clear();
             self.end_drawing_tile_pause();
             return;
         };
         prepare_draft_for_commit(&mut draft);
         if !draft_is_committable(&draft) {
+            self.eraser_target_ids.clear();
             let _ = self.document.discard_draft(&draft);
             self.end_drawing_tile_pause();
             return;
         }
+        if draft.kind == EditKind::Erase {
+            let layer_id = draft.layer_id;
+            let result = self.commit_vector_eraser(draft, rect);
+            match result {
+                Ok(true) => {
+                    self.clear_object_selection_state();
+                    self.begin_new_document_revision_for_layer(layer_id);
+                    self.status_message = "Erased".to_owned();
+                    self.log_session_event("save");
+                }
+                Ok(false) => self.status_message = "Nothing erased".to_owned(),
+                Err(error) => self.status_message = format!("Erase failed: {error:#}"),
+            }
+            self.end_drawing_tile_pause();
+            return;
+        }
+        self.eraser_target_ids.clear();
         let layer_id = draft.layer_id;
         let draft_for_discard = draft.clone();
         let operations = self.clip_draft_to_area_selection(draft, rect);
@@ -4358,6 +5007,73 @@ impl EndlessSketchApp {
             Err(error) => self.status_message = format!("Save failed: {error:#}"),
         }
         self.end_drawing_tile_pause();
+    }
+
+    fn commit_vector_eraser(&mut self, draft: EditOperation, rect: Rect) -> Result<bool> {
+        let target_ids = std::mem::take(&mut self.eraser_target_ids);
+        if target_ids.is_empty() {
+            return Ok(false);
+        }
+        let layer_id = draft.layer_id;
+        let masks = self.clip_draft_to_area_selection(draft, rect);
+        if masks.is_empty() {
+            return Ok(false);
+        }
+        let masks = masks
+            .iter()
+            .map(|mask| {
+                let points = mask
+                    .points
+                    .iter()
+                    .map(|point| canvas_point_to_position(&self.camera, point, rect))
+                    .collect::<Option<Vec<_>>>()
+                    .context("eraser mask is not representable at the current camera")?;
+                let width = operation_width(mask, self.camera.depth, self.camera.zoom);
+                Ok((points, width))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let fill_masks = eraser_path_fill_masks(&masks, &self.camera, rect)?;
+        let sources = self.snapshotted_eraser_sources(&target_ids)?;
+        let changes = subtract_eraser_sources(&sources, &fill_masks, &self.camera, |source| {
+            let mut runs = vec![source.points.clone()];
+            for (points, width) in &masks {
+                let mut next = Vec::new();
+                for points_to_subtract in runs {
+                    let mut fragment = source.clone();
+                    fragment.points = points_to_subtract;
+                    next.extend(
+                        subtract_paint_stroke_by_path(
+                            &fragment,
+                            &self.camera,
+                            rect,
+                            points,
+                            *width,
+                        )
+                        .context("paint subtraction is not representable at the current camera")?,
+                    );
+                }
+                runs = next;
+            }
+            Ok(runs)
+        })?;
+        Ok(self
+            .document
+            .commit_eraser_subtraction(changes, layer_id)?
+            .is_some())
+    }
+
+    fn snapshotted_eraser_sources(&self, target_ids: &HashSet<Uuid>) -> Result<Vec<EditOperation>> {
+        let sources = self
+            .document
+            .operations()
+            .iter()
+            .filter(|operation| target_ids.contains(&operation.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if sources.len() != target_ids.len() {
+            anyhow::bail!("eraser target snapshot is stale");
+        }
+        Ok(sources)
     }
 
     fn clip_draft_to_area_selection(&self, draft: EditOperation, rect: Rect) -> Vec<EditOperation> {
@@ -4428,6 +5144,7 @@ impl EndlessSketchApp {
                     .map(|point| screen_to_canvas_for_camera(&self.camera, point, rect))
                     .collect();
                 if matches!(operation.kind, EditKind::Fill | EditKind::EraseArea) {
+                    operation.smooth_area = false;
                     prepare_draft_for_commit(&mut operation);
                 }
                 draft_is_committable(&operation).then_some(operation)
@@ -4448,15 +5165,13 @@ impl EndlessSketchApp {
             skipped_operations,
             ..FallbackFrameStats::default()
         });
-        for item in projected {
-            stats.add(self.paint_fallback_operation_item(
-                painter,
-                rect,
-                operations.as_ref(),
-                item,
-                auto_fast_stroke_fallback,
-            ));
-        }
+        stats.add(self.paint_fallback_operation_items(
+            painter,
+            rect,
+            operations.as_ref(),
+            projected,
+            auto_fast_stroke_fallback,
+        ));
         stats
     }
 
@@ -4478,15 +5193,142 @@ impl EndlessSketchApp {
             skipped_operations,
             ..FallbackFrameStats::default()
         });
-        for item in projected {
-            stats.add(self.paint_fallback_operation_item(
-                painter,
-                rect,
-                operations.as_ref(),
-                item,
-                auto_fast_stroke_fallback,
-            ));
+        stats.add(self.paint_fallback_operation_items(
+            painter,
+            rect,
+            operations.as_ref(),
+            projected,
+            auto_fast_stroke_fallback,
+        ));
+        stats
+    }
+
+    fn paint_fallback_operation_items(
+        &mut self,
+        painter: &Painter,
+        rect: Rect,
+        operations: &[Arc<EditOperation>],
+        projected: Vec<FallbackPaintOperation>,
+        auto_fast_stroke_fallback: bool,
+    ) -> FallbackFrameStats {
+        let mut stats = FallbackFrameStats::default();
+        let mut items = projected.into_iter().peekable();
+        while let Some(item) = items.next() {
+            let Some(operation) = operations.get(item.operation_index()) else {
+                continue;
+            };
+            let mut group = vec![item];
+            while operation.fill_group_id.is_some()
+                && items.peek().is_some_and(|candidate| {
+                    operations
+                        .get(candidate.operation_index())
+                        .is_some_and(|candidate| operation.shares_fill_group_with(candidate))
+                })
+            {
+                group.push(items.next().expect("peeked fallback operation"));
+            }
+            if group.len() > 1 {
+                stats.add(self.paint_fallback_fill_group_items(
+                    painter,
+                    rect,
+                    operations,
+                    group,
+                    auto_fast_stroke_fallback,
+                ));
+            } else {
+                stats.add(self.paint_fallback_operation_item(
+                    painter,
+                    rect,
+                    operations,
+                    group.pop().expect("one fallback operation"),
+                    auto_fast_stroke_fallback,
+                ));
+            }
         }
+        stats
+    }
+
+    fn paint_fallback_fill_group_items(
+        &mut self,
+        painter: &Painter,
+        rect: Rect,
+        operations: &[Arc<EditOperation>],
+        items: Vec<FallbackPaintOperation>,
+        auto_fast_stroke_fallback: bool,
+    ) -> FallbackFrameStats {
+        let Some(first) = items
+            .first()
+            .and_then(|item| operations.get(item.operation_index()))
+        else {
+            return FallbackFrameStats::default();
+        };
+        let color = to_color32(first.opaque_visible_color(BACKGROUND));
+        let operation_count = items.len();
+        let mut stats = FallbackFrameStats::default();
+        let mut polygons = Vec::with_capacity(operation_count);
+        for item in items {
+            let Some(operation) = operations.get(item.operation_index()) else {
+                continue;
+            };
+            let operation_key = saved_fallback_operation_key(
+                operation.id,
+                operation,
+                self.settings.stroke_fallback_joins,
+                auto_fast_stroke_fallback,
+                self.settings.smoothing,
+            );
+            let points = match item {
+                FallbackPaintOperation::Projected { points, .. } => {
+                    let derive_start = Instant::now();
+                    let points = area_saved_fallback_render_points(
+                        &points,
+                        self.settings.fill_fallback_max_points,
+                        if operation.smooth_area {
+                            usize::from(self.settings.smoothing.passes())
+                        } else {
+                            0
+                        },
+                    );
+                    stats.derive_ms += derive_start.elapsed().as_secs_f64() * 1_000.0;
+                    stats.fallback_cache_misses = stats.fallback_cache_misses.saturating_add(1);
+                    self.fallback_renderer
+                        .saved_render_cache
+                        .insert(operation_key, points)
+                }
+                FallbackPaintOperation::CachedDerived { points, .. } => points,
+            };
+            if !should_paint_fill_fallback(
+                operation,
+                self.camera.depth,
+                points.len(),
+                &self.settings,
+            ) {
+                continue;
+            }
+            let clipped = if let Some(clipped) = self
+                .fallback_renderer
+                .saved_render_cache
+                .get_clipped_area_polygon(&operation_key)
+            {
+                clipped
+            } else {
+                let clip_start = Instant::now();
+                let clipped = clip_pos2_polygon(points.as_ref(), rect);
+                stats.clip_ms += clip_start.elapsed().as_secs_f64() * 1_000.0;
+                self.fallback_renderer
+                    .saved_render_cache
+                    .insert_clipped_area_polygon(operation_key, clipped)
+            };
+            polygons.push(clipped);
+        }
+        let polygon_slices = polygons
+            .iter()
+            .map(|polygon| polygon.as_ref())
+            .collect::<Vec<_>>();
+        let paint_start = Instant::now();
+        stats.fill_shape_count = paint_fill_group_scanlines(painter, rect, &polygon_slices, color);
+        stats.paint_ms += paint_start.elapsed().as_secs_f64() * 1_000.0;
+        stats.painted_operations = operation_count;
         stats
     }
 
@@ -4494,7 +5336,7 @@ impl EndlessSketchApp {
         &mut self,
         painter: &Painter,
         rect: Rect,
-        operations: &[EditOperation],
+        operations: &[Arc<EditOperation>],
         item: FallbackPaintOperation,
         auto_fast_stroke_fallback: bool,
     ) -> FallbackFrameStats {
@@ -4550,107 +5392,48 @@ impl EndlessSketchApp {
         operation_limit: Option<usize>,
         auto_fast_stroke_fallback: bool,
     ) -> (
-        Arc<[EditOperation]>,
+        Vec<Arc<EditOperation>>,
         Vec<FallbackPaintOperation>,
         usize,
         FallbackFrameStats,
     ) {
         let project_start = Instant::now();
-        let operations = self.visible_render_operations(rect);
-        let eligible_operation_count = operations
-            .iter()
-            .filter(|operation| after_sequence.is_none_or(|sequence| operation.sequence > sequence))
-            .count();
-        let skipped_operations =
-            fallback_operation_skip_count(eligible_operation_count, operation_limit);
-        let Some(frame) = self.projected_geometry.begin_frame(&self.camera, rect) else {
-            return (
-                operations,
-                Vec::new(),
-                skipped_operations,
-                FallbackFrameStats {
-                    project_ms: project_start.elapsed().as_secs_f64() * 1_000.0,
-                    ..FallbackFrameStats::default()
-                },
-            );
-        };
-        let mut projected =
-            Vec::with_capacity(eligible_operation_count.saturating_sub(skipped_operations));
-        let mut projected_operation_count = 0usize;
-        let mut screen_culled_operations = 0usize;
-        let mut fallback_cache_hits = 0usize;
-        for (operation_index, operation) in operations
-            .iter()
-            .enumerate()
-            .filter(|(_, operation)| {
-                after_sequence.is_none_or(|sequence| operation.sequence > sequence)
-            })
-            .skip(skipped_operations)
-        {
-            if operation.is_compact_block() {
-                projected.push(FallbackPaintOperation::Projected {
-                    operation_index,
-                    points: Vec::new(),
-                });
-                continue;
-            }
-            if !operation_may_intersect_screen_rect(
-                operation,
-                &self.camera,
-                rect,
-                operation_width(operation, self.camera.depth, self.camera.zoom),
-            ) {
-                screen_culled_operations = screen_culled_operations.saturating_add(1);
-                continue;
-            }
-            let operation_key = saved_fallback_operation_key(
-                operation.id,
-                operation,
-                self.settings.stroke_fallback_joins,
-                auto_fast_stroke_fallback,
-                self.settings.smoothing,
-            );
-            if let Some(points) = self.saved_fallback_render_cache.get(&operation_key) {
-                fallback_cache_hits = fallback_cache_hits.saturating_add(1);
-                projected.push(FallbackPaintOperation::CachedDerived {
-                    operation_index,
-                    points,
-                });
-                continue;
-            }
-            let points = self.projected_geometry.project_operation(operation, frame);
-            projected_operation_count = projected_operation_count.saturating_add(1);
-            projected.push(FallbackPaintOperation::Projected {
-                operation_index,
-                points,
-            });
+        let visible_operations_start = Instant::now();
+        let (operations, visible_cache_hit) = self.visible_render_operations(rect);
+        let visible_operations_ms = visible_operations_start.elapsed().as_secs_f64() * 1_000.0;
+        let (projected, skipped_operations, mut stats) = self.fallback_renderer.project_operations(
+            operations.as_ref(),
+            &self.camera,
+            rect,
+            after_sequence,
+            operation_limit,
+            self.settings.stroke_fallback_joins,
+            auto_fast_stroke_fallback,
+            self.settings.smoothing,
+            project_start,
+        );
+        stats.visible_operations_ms = visible_operations_ms;
+        if visible_cache_hit {
+            stats.fallback_visible_cache_hits = 1;
+        } else {
+            stats.fallback_visible_cache_misses = 1;
         }
-        (
-            operations,
-            projected,
-            skipped_operations,
-            FallbackFrameStats {
-                skipped_operations: screen_culled_operations,
-                projected_operations: projected_operation_count,
-                fallback_cache_hits,
-                project_ms: project_start.elapsed().as_secs_f64() * 1_000.0,
-                ..FallbackFrameStats::default()
-            },
-        )
+        (operations, projected, skipped_operations, stats)
     }
 
-    fn visible_render_operations(&mut self, rect: Rect) -> Arc<[EditOperation]> {
+    fn visible_render_operations(&mut self, rect: Rect) -> (Vec<Arc<EditOperation>>, bool) {
         let lod = tile_lod_for_resolution(self.settings.tile_resolution_px);
         let visible_tiles = self.visible_tiles(rect, lod);
         let revision = self.document.revision();
         let document = &self.document;
-        let operations = self
-            .visible_operations
-            .get_or_update(revision, &visible_tiles, || {
-                document.render_operations_for_tiles(&visible_tiles)
-            });
+        let (indices, cache_hit) =
+            self.fallback_renderer
+                .visible_operations(revision, &visible_tiles, || {
+                    document.render_operation_indices_for_tiles(&visible_tiles)
+                });
+        let operations = self.document.render_operations_by_indices(&indices);
         self.last_visible_render_operation_count = Some(operations.len());
-        operations
+        (operations, cache_hit)
     }
 
     fn paint_draft(&mut self, painter: &Painter, rect: Rect) {
@@ -4698,43 +5481,59 @@ impl EndlessSketchApp {
         if operation.is_compact_block() {
             let mut stats = FallbackFrameStats::default();
             for source in &operation.compact_sources {
-                if operation_may_intersect_screen_rect(
+                let operation_key = saved_fallback_operation_key(
+                    context.cache_scope_id,
                     source,
-                    &self.camera,
-                    rect,
-                    operation_width(source, self.camera.depth, self.camera.zoom),
-                ) {
-                    let operation_key = saved_fallback_operation_key(
-                        context.cache_scope_id,
+                    self.settings.stroke_fallback_joins,
+                    context.auto_fast_stroke_fallback,
+                    self.settings.smoothing,
+                );
+                if !context.is_draft
+                    && let Some(points) = self
+                        .fallback_renderer
+                        .saved_render_cache
+                        .get(&operation_key)
+                {
+                    stats.fallback_cache_hits = stats.fallback_cache_hits.saturating_add(1);
+                    stats.add(self.paint_saved_operation_derived_points(
+                        painter,
+                        rect,
                         source,
-                        self.settings.stroke_fallback_joins,
+                        operation_key,
+                        points.as_ref(),
                         context.auto_fast_stroke_fallback,
-                        self.settings.smoothing,
-                    );
-                    if !context.is_draft
-                        && let Some(points) = self.saved_fallback_render_cache.get(&operation_key)
-                    {
-                        stats.fallback_cache_hits = stats.fallback_cache_hits.saturating_add(1);
-                        stats.add(self.paint_saved_operation_derived_points(
-                            painter,
-                            rect,
-                            source,
-                            operation_key,
-                            points.as_ref(),
-                            context.auto_fast_stroke_fallback,
-                        ));
-                        continue;
-                    }
-                    let project_start = Instant::now();
-                    let points: Vec<Pos2> = source
-                        .points
-                        .iter()
-                        .filter_map(|point| self.point_to_position(point, rect))
-                        .collect();
-                    stats.projected_operations = stats.projected_operations.saturating_add(1);
-                    stats.project_ms += project_start.elapsed().as_secs_f64() * 1_000.0;
-                    stats.add(self.paint_operation_points(painter, rect, source, points, context));
+                    ));
+                    continue;
                 }
+                let bounds_lookup = self
+                    .fallback_renderer
+                    .operation_bounds_cache
+                    .operation_may_intersect_screen_rect(
+                        source,
+                        &self.camera,
+                        rect,
+                        operation_width(source, self.camera.depth, self.camera.zoom),
+                    );
+                if bounds_lookup.cache_hit {
+                    stats.fallback_bounds_cache_hits =
+                        stats.fallback_bounds_cache_hits.saturating_add(1);
+                } else {
+                    stats.fallback_bounds_cache_misses =
+                        stats.fallback_bounds_cache_misses.saturating_add(1);
+                }
+                if !bounds_lookup.may_intersect {
+                    stats.skipped_operations = stats.skipped_operations.saturating_add(1);
+                    continue;
+                }
+                let project_start = Instant::now();
+                let points: Vec<Pos2> = source
+                    .points
+                    .iter()
+                    .filter_map(|point| self.point_to_position(point, rect))
+                    .collect();
+                stats.projected_operations = stats.projected_operations.saturating_add(1);
+                stats.project_ms += project_start.elapsed().as_secs_f64() * 1_000.0;
+                stats.add(self.paint_operation_points(painter, rect, source, points, context));
             }
             return stats;
         }
@@ -4758,23 +5557,32 @@ impl EndlessSketchApp {
                     context.auto_fast_stroke_fallback,
                     self.settings.smoothing,
                 );
-                let points =
-                    if let Some(cached) = self.saved_fallback_render_cache.get(&operation_key) {
-                        stats.fallback_cache_hits = stats.fallback_cache_hits.saturating_add(1);
-                        cached
-                    } else {
-                        let derive_start = Instant::now();
-                        let points = area_saved_fallback_render_points(
-                            &points,
-                            self.settings.fill_fallback_max_points,
-                        );
-                        stats.derive_ms += derive_start.elapsed().as_secs_f64() * 1_000.0;
-                        let points = self
-                            .saved_fallback_render_cache
-                            .insert(operation_key, points);
-                        stats.fallback_cache_misses = stats.fallback_cache_misses.saturating_add(1);
-                        points
-                    };
+                let points = if let Some(cached) = self
+                    .fallback_renderer
+                    .saved_render_cache
+                    .get(&operation_key)
+                {
+                    stats.fallback_cache_hits = stats.fallback_cache_hits.saturating_add(1);
+                    cached
+                } else {
+                    let derive_start = Instant::now();
+                    let points = area_saved_fallback_render_points(
+                        &points,
+                        self.settings.fill_fallback_max_points,
+                        if operation.smooth_area {
+                            usize::from(self.settings.smoothing.passes())
+                        } else {
+                            0
+                        },
+                    );
+                    stats.derive_ms += derive_start.elapsed().as_secs_f64() * 1_000.0;
+                    let points = self
+                        .fallback_renderer
+                        .saved_render_cache
+                        .insert(operation_key, points);
+                    stats.fallback_cache_misses = stats.fallback_cache_misses.saturating_add(1);
+                    points
+                };
                 if should_paint_fill_fallback(
                     operation,
                     self.camera.depth,
@@ -4810,7 +5618,10 @@ impl EndlessSketchApp {
                 context.auto_fast_stroke_fallback,
                 self.settings.smoothing,
             );
-            let points = if let Some(cached) = self.saved_fallback_render_cache.get(&operation_key)
+            let points = if let Some(cached) = self
+                .fallback_renderer
+                .saved_render_cache
+                .get(&operation_key)
             {
                 stats.fallback_cache_hits = stats.fallback_cache_hits.saturating_add(1);
                 cached
@@ -4819,7 +5630,8 @@ impl EndlessSketchApp {
                 let points = smooth_pos2_saved_fallback(&points, smoothing_passes, false);
                 stats.derive_ms += derive_start.elapsed().as_secs_f64() * 1_000.0;
                 let points = self
-                    .saved_fallback_render_cache
+                    .fallback_renderer
+                    .saved_render_cache
                     .insert(operation_key, points);
                 stats.fallback_cache_misses = stats.fallback_cache_misses.saturating_add(1);
                 points
@@ -4861,7 +5673,8 @@ impl EndlessSketchApp {
                 &self.settings,
             ) {
                 let clipped = if let Some(clipped) = self
-                    .saved_fallback_render_cache
+                    .fallback_renderer
+                    .saved_render_cache
                     .get_clipped_area_polygon(&operation_key)
                 {
                     clipped
@@ -4869,7 +5682,8 @@ impl EndlessSketchApp {
                     let clip_start = Instant::now();
                     let clipped = clip_pos2_polygon(points, rect);
                     stats.clip_ms += clip_start.elapsed().as_secs_f64() * 1_000.0;
-                    self.saved_fallback_render_cache
+                    self.fallback_renderer
+                        .saved_render_cache
                         .insert_clipped_area_polygon(operation_key, clipped)
                 };
                 let paint_start = Instant::now();
@@ -4889,7 +5703,8 @@ impl EndlessSketchApp {
         let clip_rect = rect.expand(width * 0.5 + 1.0);
         let mut stats = FallbackFrameStats::default();
         let runs = if let Some(runs) = self
-            .saved_fallback_render_cache
+            .fallback_renderer
+            .saved_render_cache
             .get_clipped_stroke_runs(&operation_key)
         {
             runs
@@ -4897,7 +5712,8 @@ impl EndlessSketchApp {
             let clip_start = Instant::now();
             let runs = clip_pos2_polyline(points, clip_rect);
             stats.clip_ms += clip_start.elapsed().as_secs_f64() * 1_000.0;
-            self.saved_fallback_render_cache
+            self.fallback_renderer
+                .saved_render_cache
                 .insert_clipped_stroke_runs(operation_key, runs)
         };
         for run in runs.iter() {
@@ -4905,7 +5721,7 @@ impl EndlessSketchApp {
             let (run_segmented_point_limit, budget_fallback) = consume_segmented_fallback_budget(
                 run.len(),
                 segmented_point_limit,
-                &mut self.fallback_segmented_shape_budget_remaining,
+                &mut self.fallback_renderer.segmented_shape_budget_remaining,
             );
             if budget_fallback {
                 stats.segmented_budget_fallbacks =
@@ -5099,32 +5915,37 @@ impl EndlessSketchApp {
             }
         }
 
-        if let Some(operation) = self.hovered_operation_id.and_then(|id| {
+        if let Some(hovered) = self.hovered_operation_id.and_then(|id| {
             self.document
                 .operations()
                 .iter()
                 .find(|operation| operation.id == id)
-        }) && !self.selected_operation_ids.contains(&operation.id)
+        }) && !self.selected_operation_ids.contains(&hovered.id)
         {
-            let projected_points: Vec<_> = operation
-                .points
-                .iter()
-                .filter_map(|point| self.point_to_position(point, rect))
-                .collect();
-            let points = selection_highlight_render_points(
-                operation,
-                projected_points,
-                usize::from(self.settings.smoothing.passes()),
-                self.settings.fill_fallback_max_points,
-            );
-            let width = operation_width(operation, self.camera.depth, self.camera.zoom);
-            paint_operation_highlight(
-                painter,
-                operation.kind,
-                &points,
-                width,
-                Color32::from_rgba_unmultiplied(40, 180, 80, 190),
-            );
+            let object_id = hovered.object_group_id();
+            for operation in self.document.operations().iter().filter(|operation| {
+                operation.layer_id == hovered.layer_id && operation.object_group_id() == object_id
+            }) {
+                let projected_points: Vec<_> = operation
+                    .points
+                    .iter()
+                    .filter_map(|point| self.point_to_position(point, rect))
+                    .collect();
+                let points = selection_highlight_render_points(
+                    operation,
+                    projected_points,
+                    usize::from(self.settings.smoothing.passes()),
+                    self.settings.fill_fallback_max_points,
+                );
+                let width = operation_width(operation, self.camera.depth, self.camera.zoom);
+                paint_operation_highlight(
+                    painter,
+                    operation.kind,
+                    &points,
+                    width,
+                    Color32::from_rgba_unmultiplied(40, 180, 80, 190),
+                );
+            }
         }
 
         if self.eraser_lasso_points.len() >= 2 {
@@ -5140,6 +5961,7 @@ impl EndlessSketchApp {
     fn clear_transient_tools(&mut self) {
         self.clear_object_selection_state();
         self.clear_area_selection_state();
+        self.eraser_target_ids.clear();
         self.eraser_lasso_points.clear();
         self.eraser_lasso_active = false;
     }
@@ -5174,7 +5996,12 @@ impl EndlessSketchApp {
         {
             self.coordinate_overlay.update(&self.camera);
         }
-        let tile_state = if self.settings.pause_tile_generation {
+        let mut tile_state = self
+            .last_depth_render_mode
+            .map(depth_render_mode_label)
+            .unwrap_or("unknown")
+            .to_owned();
+        let tile_activity = if self.settings.pause_tile_generation {
             "tiles paused"
         } else if self.automatic_tile_generation_pause {
             "tiles paused: drawing"
@@ -5183,6 +6010,10 @@ impl EndlessSketchApp {
         } else {
             ""
         };
+        if !tile_activity.is_empty() {
+            tile_state.push_str(" · ");
+            tile_state.push_str(tile_activity);
+        }
         let performance = self.frame_rate.metrics().map_or_else(
             || "fps --".to_owned(),
             |(fps, frame_time)| format!("fps {fps:.1} ({frame_time:.1} ms)"),
@@ -5193,7 +6024,7 @@ impl EndlessSketchApp {
             self.document.operations().len(),
             &performance,
             &self.status_message,
-            tile_state,
+            &tile_state,
             &self.coordinate_overlay.formatted_x,
             &self.coordinate_overlay.formatted_y,
         ) else {
@@ -5382,6 +6213,35 @@ impl EndlessSketchApp {
         tile_keys_for_view(&self.camera, rect, lod, 0)
     }
 
+    fn depth_render_mode(&self, rect: Rect) -> DepthRenderMode {
+        let lod = tile_lod_for_resolution(self.settings.tile_resolution_px);
+        let visible_tiles = self.visible_tiles(rect, lod);
+        let visible_mode = self.document.visible_depth_mode_for_tiles(
+            &visible_tiles,
+            self.active_layer_id,
+            self.camera.depth,
+            self.settings.vector_depth_radius,
+        );
+        depth_render_mode(visible_mode, self.settings.distant_tiles_enabled)
+    }
+
+    fn apply_depth_render_mode(&mut self, mode: DepthRenderMode) {
+        if self.last_depth_render_mode == Some(mode) {
+            return;
+        }
+        self.reset_tile_requests();
+        if mode == DepthRenderMode::DistantTile {
+            self.clear_object_selection_state();
+            self.eraser_lasso_points.clear();
+            self.eraser_lasso_active = false;
+        }
+        self.last_depth_render_mode = Some(mode);
+        self.log_session_event_with(
+            "depth_render_mode",
+            json!({ "tiles": { "depth_render_mode": depth_render_mode_label(mode) } }),
+        );
+    }
+
     fn update_tile_rebuild_interaction(&mut self, interaction_active: bool) {
         let Some(idle_interval) = self.settings.tile_rebuild_policy.idle_interval() else {
             self.last_tile_rebuild_interaction = None;
@@ -5418,15 +6278,19 @@ impl EndlessSketchApp {
 
     fn apply_tile_request_settings(&mut self) {
         self.last_tile_rebuild_interaction = None;
+        self.reset_tile_requests();
+        self.log_session_event_with(
+            "tile_generation",
+            json!({ "tiles": { "reason": "request_settings" } }),
+        );
+    }
+
+    fn reset_tile_requests(&mut self) {
         self.pending_tiles.clear();
         self.visible_tile_generation = self.visible_tile_generation.saturating_add(1);
         self.visible_tile_set.clear();
         self.tile_scheduler
             .set_generation(self.visible_tile_generation);
-        self.log_session_event_with(
-            "tile_generation",
-            json!({ "tiles": { "reason": "request_settings" } }),
-        );
     }
 
     fn position_to_canvas(&self, position: Pos2, rect: Rect) -> CanvasPoint {
@@ -5434,13 +6298,7 @@ impl EndlessSketchApp {
     }
 
     fn point_to_position(&self, point: &CanvasPoint, rect: Rect) -> Option<Pos2> {
-        let (x, y) =
-            self.camera
-                .canvas_to_screen(point, rect.width() as f64, rect.height() as f64)?;
-        if !x.is_finite() || !y.is_finite() {
-            return None;
-        }
-        Some(Pos2::new(rect.left() + x as f32, rect.top() + y as f32))
+        canvas_point_to_position(&self.camera, point, rect)
     }
 
     fn pick_color_at(&mut self, position: Option<Pos2>, rect: Rect) {
@@ -5458,7 +6316,7 @@ impl EndlessSketchApp {
     }
 
     fn sample_color_at(&mut self, position: Pos2, rect: Rect) -> Option<Color> {
-        let operations = self.visible_render_operations(rect);
+        let (operations, _) = self.visible_render_operations(rect);
         for operation in operations.iter().rev() {
             let points = operation
                 .points
@@ -5519,11 +6377,14 @@ impl EndlessSketchApp {
     }
 
     fn selected_operation_snapshots(&self) -> Vec<EditOperation> {
+        let selected = self
+            .document
+            .expanded_object_group_ids(&self.selected_operation_ids, self.active_layer_id);
         let mut operations = self
             .document
             .operations()
             .iter()
-            .filter(|operation| self.selected_operation_ids.contains(&operation.id))
+            .filter(|operation| selected.contains(&operation.id))
             .cloned()
             .collect::<Vec<_>>();
         operations.sort_by_key(|operation| {
@@ -5542,7 +6403,11 @@ impl EndlessSketchApp {
             self.status_message = "Nothing selected".to_owned();
             return;
         }
-        let count = operations.len();
+        let count = operations
+            .iter()
+            .map(EditOperation::object_group_id)
+            .collect::<HashSet<_>>()
+            .len();
         self.selection_clipboard = SelectionClipboard {
             operations,
             paste_count: 0,
@@ -5560,7 +6425,11 @@ impl EndlessSketchApp {
             self.status_message = "Nothing selected".to_owned();
             return;
         }
-        let count = operations.len();
+        let count = operations
+            .iter()
+            .map(EditOperation::object_group_id)
+            .collect::<HashSet<_>>()
+            .len();
         self.selection_clipboard = SelectionClipboard {
             operations,
             paste_count: 0,
@@ -5620,12 +6489,12 @@ impl EndlessSketchApp {
                 self.invalidate_tile_rendering();
                 self.status_message = format!(
                     "Pasted {} objects{}",
-                    self.selected_operation_ids.len(),
+                    self.selected_object_count(),
                     if in_place { " in place" } else { "" }
                 );
                 self.log_session_event_with(
                     "paste",
-                    json!({ "document": { "pasted": self.selected_operation_ids.len() } }),
+                    json!({ "document": { "pasted": self.selected_object_count() } }),
                 );
             }
             Ok(_) => self.status_message = "Clipboard is empty".to_owned(),
@@ -5745,6 +6614,7 @@ impl EndlessSketchApp {
                 self.bookmark_edits = bookmark_edit_names(&self.bookmarks);
                 self.new_bookmark_name = format!("Bookmark {}", self.bookmarks.len() + 1);
                 self.camera = CameraAddress::default();
+                self.selection_capture_camera_depth = self.camera.depth;
                 self.depth_jump_target = self.camera.depth;
                 self.status_message = "Canvas opened".to_owned();
                 self.log_session_event("document_opened");
@@ -5805,6 +6675,10 @@ impl EndlessSketchApp {
     }
 
     fn mark_zoom_changed(&mut self) {
+        if self.selection_capture_camera_depth != self.camera.depth {
+            self.selection_capture_camera_depth = self.camera.depth;
+            self.clear_object_selection_state();
+        }
         self.depth_jump_target = self.camera.depth;
         self.hovered_operation_id = None;
         self.selection_hover_position = None;
@@ -5915,9 +6789,7 @@ impl EndlessSketchApp {
     }
 
     fn invalidate_projection_caches(&mut self) {
-        self.projected_geometry.clear();
-        self.visible_operations.clear();
-        self.saved_fallback_render_cache.clear();
+        self.fallback_renderer.clear();
     }
 
     fn begin_new_document_revision(&mut self) {
@@ -6001,6 +6873,25 @@ fn tile_fallback_mode_label(mode: TileFallbackMode) -> &'static str {
     }
 }
 
+fn depth_render_mode(
+    visible_mode: VisibleDepthMode,
+    distant_tiles_enabled: bool,
+) -> DepthRenderMode {
+    match visible_mode {
+        VisibleDepthMode::Empty => DepthRenderMode::Empty,
+        VisibleDepthMode::Distant if distant_tiles_enabled => DepthRenderMode::DistantTile,
+        VisibleDepthMode::Near | VisibleDepthMode::Distant => DepthRenderMode::VectorsNear,
+    }
+}
+
+fn depth_render_mode_label(mode: DepthRenderMode) -> &'static str {
+    match mode {
+        DepthRenderMode::Empty => "empty",
+        DepthRenderMode::VectorsNear => "vectors_near",
+        DepthRenderMode::DistantTile => "distant_tile",
+    }
+}
+
 fn merge_json_objects(base: Value, extra: Value) -> Value {
     match (base, extra) {
         (Value::Object(mut base), Value::Object(extra)) => {
@@ -6034,8 +6925,13 @@ fn fill_fallback_render_points(points: &[Pos2], max_points: usize) -> Vec<Pos2> 
     sampled
 }
 
-fn area_saved_fallback_render_points(points: &[Pos2], max_points: usize) -> Vec<Pos2> {
-    fill_fallback_render_points(points, max_points)
+fn area_saved_fallback_render_points(
+    points: &[Pos2],
+    max_points: usize,
+    smoothing_passes: usize,
+) -> Vec<Pos2> {
+    let points = fill_fallback_render_points(points, max_points);
+    smooth_pos2_saved_fallback(&points, smoothing_passes, true)
 }
 
 fn smooth_pos2_draft(points: &[Pos2], level: usize) -> Vec<Pos2> {
@@ -6101,19 +6997,28 @@ fn paint_fill_scanlines(
     points: &[Pos2],
     color: Color32,
 ) -> usize {
-    if points.len() < 3 {
+    paint_fill_group_scanlines(painter, clip_rect, &[points], color)
+}
+
+fn paint_fill_group_scanlines(
+    painter: &Painter,
+    clip_rect: Rect,
+    polygons: &[&[Pos2]],
+    color: Color32,
+) -> usize {
+    if polygons.iter().all(|points| points.len() < 3) {
         return 0;
     }
-    let min_y = points
+    let min_y = polygons
         .iter()
-        .map(|point| point.y)
+        .flat_map(|points| points.iter().map(|point| point.y))
         .fold(f32::INFINITY, f32::min)
         .floor()
         .max(clip_rect.top())
         .max(i32::MIN as f32) as i32;
-    let max_y = points
+    let max_y = polygons
         .iter()
-        .map(|point| point.y)
+        .flat_map(|points| points.iter().map(|point| point.y))
         .fold(f32::NEG_INFINITY, f32::max)
         .ceil()
         .min(clip_rect.bottom())
@@ -6123,28 +7028,45 @@ fn paint_fill_scanlines(
     }
 
     let mut intersections = Vec::new();
+    let mut spans = Vec::new();
     let mut shape_count = 0usize;
     for y in min_y..=max_y {
         let scan_y = y as f32 + 0.5;
-        intersections.clear();
-        let mut previous = points.len() - 1;
-        for current in 0..points.len() {
-            let a = points[current];
-            let b = points[previous];
-            if ((a.y > scan_y) != (b.y > scan_y)) && (b.y - a.y).abs() > f32::EPSILON {
-                let t = (scan_y - a.y) / (b.y - a.y);
-                let x = a.x + t * (b.x - a.x);
-                if x.is_finite() {
-                    intersections.push(x);
+        spans.clear();
+        for points in polygons.iter().copied().filter(|points| points.len() >= 3) {
+            intersections.clear();
+            let mut previous = points.len() - 1;
+            for current in 0..points.len() {
+                let a = points[current];
+                let b = points[previous];
+                if ((a.y > scan_y) != (b.y > scan_y)) && (b.y - a.y).abs() > f32::EPSILON {
+                    let t = (scan_y - a.y) / (b.y - a.y);
+                    let x = a.x + t * (b.x - a.x);
+                    if x.is_finite() {
+                        intersections.push(x);
+                    }
                 }
+                previous = current;
             }
-            previous = current;
+            intersections.sort_by(|a, b| a.total_cmp(b));
+            spans.extend(intersections.chunks_exact(2).map(|span| (span[0], span[1])));
         }
-        intersections.sort_by(|a, b| a.total_cmp(b));
+        spans.sort_by(|left, right| left.0.total_cmp(&right.0));
 
-        for span in intersections.chunks_exact(2) {
-            let left = span[0].max(clip_rect.left());
-            let right = span[1].min(clip_rect.right());
+        let mut merged = Vec::<(f32, f32)>::new();
+        for (left, right) in spans.iter().copied() {
+            if let Some((_, merged_right)) = merged.last_mut()
+                && left <= *merged_right + 1.0e-3
+            {
+                *merged_right = merged_right.max(right);
+            } else {
+                merged.push((left, right));
+            }
+        }
+
+        for (left, right) in merged {
+            let left = left.max(clip_rect.left());
+            let right = right.min(clip_rect.right());
             if right > left {
                 painter.rect_filled(
                     Rect::from_min_max(
@@ -6323,9 +7245,9 @@ fn stroke_fallback_smoothing_passes(
 fn auto_fast_stroke_fallback_active(
     interaction_active: bool,
     tile_jobs_pending: bool,
-    tile_generation_paused: bool,
+    _tile_generation_paused: bool,
 ) -> bool {
-    interaction_active || tile_jobs_pending || tile_generation_paused
+    interaction_active || tile_jobs_pending
 }
 
 fn large_selection_fast_overlay_active(
@@ -6593,15 +7515,22 @@ fn screen_to_canvas_for_camera(camera: &CameraAddress, position: Pos2, rect: Rec
     )
 }
 
-fn operation_may_intersect_screen_rect(
-    operation: &EditOperation,
+fn canvas_point_to_position(
+    camera: &CameraAddress,
+    point: &CanvasPoint,
+    rect: Rect,
+) -> Option<Pos2> {
+    let (x, y) = camera.canvas_to_screen(point, rect.width() as f64, rect.height() as f64)?;
+    let position = Pos2::new(rect.left() + x as f32, rect.top() + y as f32);
+    (position.x.is_finite() && position.y.is_finite()).then_some(position)
+}
+
+fn operation_bounds_may_intersect_screen_rect(
+    bounds: &OperationBounds,
     camera: &CameraAddress,
     rect: Rect,
     width: f32,
 ) -> bool {
-    let Some(bounds) = operation_bounds(operation) else {
-        return false;
-    };
     let corners = [
         CanvasPoint::new(
             bounds.depth,
@@ -6624,7 +7553,13 @@ fn operation_may_intersect_screen_rect(
             1.0,
             1.0,
         ),
-        CanvasPoint::new(bounds.depth, bounds.min_x, bounds.max_y, 0.0, 1.0),
+        CanvasPoint::new(
+            bounds.depth,
+            bounds.min_x.clone(),
+            bounds.max_y.clone(),
+            0.0,
+            1.0,
+        ),
     ];
     let mut projected = None::<Rect>;
     for corner in corners {
@@ -6806,7 +7741,12 @@ fn incremental_paint_operations(
 fn primary_pointer_positions(
     events: &[egui::Event],
     primary_down_after_events: bool,
-) -> (Option<Pos2>, Vec<Pos2>) {
+) -> (Option<Pos2>, Vec<Pos2>, bool) {
+    if let Some((press_position, drag_positions)) =
+        primary_touch_positions(events, primary_down_after_events)
+    {
+        return (press_position, drag_positions, true);
+    }
     let mut primary_down = primary_down_after_events;
     for event in events.iter().rev() {
         if let egui::Event::PointerButton {
@@ -6843,7 +7783,54 @@ fn primary_pointer_positions(
         }
     }
 
-    (press_position, drag_positions)
+    (press_position, drag_positions, false)
+}
+
+fn primary_touch_positions(
+    events: &[egui::Event],
+    primary_down_after_events: bool,
+) -> Option<(Option<Pos2>, Vec<Pos2>)> {
+    let touch_id = events.iter().find_map(|event| match event {
+        egui::Event::Touch { id, .. } => Some(*id),
+        _ => None,
+    })?;
+    let mut primary_down = primary_down_after_events;
+    for event in events.iter().rev() {
+        if let egui::Event::Touch { id, phase, .. } = event
+            && *id == touch_id
+        {
+            match phase {
+                egui::TouchPhase::Start => primary_down = false,
+                egui::TouchPhase::End | egui::TouchPhase::Cancel => primary_down = true,
+                egui::TouchPhase::Move => {}
+            }
+        }
+    }
+
+    let mut press_position = None;
+    let mut drag_positions = Vec::new();
+    for event in events {
+        let egui::Event::Touch { id, phase, pos, .. } = event else {
+            continue;
+        };
+        if *id != touch_id {
+            continue;
+        }
+        match phase {
+            egui::TouchPhase::Start => {
+                press_position = Some(*pos);
+                primary_down = true;
+            }
+            egui::TouchPhase::Move if primary_down => drag_positions.push(*pos),
+            egui::TouchPhase::End if primary_down => {
+                drag_positions.push(*pos);
+                primary_down = false;
+            }
+            egui::TouchPhase::End | egui::TouchPhase::Cancel => primary_down = false,
+            egui::TouchPhase::Move => {}
+        }
+    }
+    Some((press_position, drag_positions))
 }
 
 fn append_interpolated_points(
@@ -7183,14 +8170,6 @@ fn layer_operation_counts(operations: &[EditOperation]) -> HashMap<Uuid, usize> 
     counts
 }
 
-fn selectable_layer_ids(layers: &[Layer], active_layer_id: Uuid) -> HashSet<Uuid> {
-    layers
-        .iter()
-        .filter(|layer| layer.id == active_layer_id && layer.visible && !layer.locked)
-        .map(|layer| layer.id)
-        .collect()
-}
-
 fn selection_point(position: Pos2) -> SelectionPoint {
     SelectionPoint::new(position.x as f64, position.y as f64)
 }
@@ -7277,6 +8256,38 @@ fn operation_intersects_selection(
             selection.intersects_polygon(points)
         }
     }
+}
+
+fn fully_contained_object_operation_ids(
+    operations: &[EditOperation],
+    contained_operation_ids: &HashSet<Uuid>,
+    layer_id: Uuid,
+) -> HashSet<Uuid> {
+    let mut total_counts = HashMap::<Uuid, usize>::new();
+    let mut contained_counts = HashMap::<Uuid, usize>::new();
+    for operation in operations
+        .iter()
+        .filter(|operation| operation.layer_id == layer_id)
+    {
+        let object_id = operation.object_group_id();
+        *total_counts.entry(object_id).or_default() += 1;
+        if contained_operation_ids.contains(&operation.id) {
+            *contained_counts.entry(object_id).or_default() += 1;
+        }
+    }
+    let fully_contained = contained_counts
+        .into_iter()
+        .filter_map(|(object_id, contained)| {
+            (total_counts.get(&object_id) == Some(&contained)).then_some(object_id)
+        })
+        .collect::<HashSet<_>>();
+    operations
+        .iter()
+        .filter(|operation| {
+            operation.layer_id == layer_id && fully_contained.contains(&operation.object_group_id())
+        })
+        .map(|operation| operation.id)
+        .collect()
 }
 
 fn operation_contained_by_rectangle(
@@ -7420,6 +8431,587 @@ fn point_segment_distance(
     )
 }
 
+#[cfg(test)]
+fn subtract_paint_sources<Mask>(
+    sources: Vec<EditOperation>,
+    masks: &[Mask],
+    subtract: impl Fn(&EditOperation, &Mask) -> Option<Vec<Vec<CanvasPoint>>>,
+) -> Option<Vec<(Uuid, Vec<Vec<CanvasPoint>>)>> {
+    let mut changes = Vec::with_capacity(sources.len());
+    for source in sources {
+        let mut runs = vec![source.points.clone()];
+        for mask in masks {
+            let mut next = Vec::new();
+            for points in runs {
+                let mut fragment = source.clone();
+                fragment.points = points;
+                next.extend(subtract(&fragment, mask)?);
+            }
+            runs = next;
+            if runs.is_empty() {
+                break;
+            }
+        }
+        changes.push((source.id, runs));
+    }
+    Some(changes)
+}
+
+fn subtract_eraser_sources(
+    sources: &[EditOperation],
+    fill_masks: &[Vec<CanvasPoint>],
+    projection_camera: &CameraAddress,
+    subtract_paint: impl Fn(&EditOperation) -> Result<Vec<Vec<CanvasPoint>>>,
+) -> Result<Vec<(Uuid, Vec<EditOperation>)>> {
+    let mut fill_mask_bounds = None::<Rect>;
+    for mask in fill_masks {
+        let Some(bounds) = canvas_points_screen_bounds(mask, projection_camera)? else {
+            continue;
+        };
+        fill_mask_bounds = Some(fill_mask_bounds.map_or(bounds, |current| current.union(bounds)));
+    }
+    let Some(fill_mask_bounds) = fill_mask_bounds else {
+        return Ok(Vec::new());
+    };
+    let mut results = Vec::with_capacity(sources.len());
+    for source in sources {
+        results.push((
+            source,
+            subtract_eraser_operation(
+                source,
+                fill_masks,
+                fill_mask_bounds,
+                projection_camera,
+                &subtract_paint,
+            )?,
+        ));
+    }
+    let changed_fill_groups = results
+        .iter()
+        .filter(|(source, change)| source.kind == EditKind::Fill && change.is_some())
+        .map(|(source, _)| source.object_group_id())
+        .collect::<HashSet<_>>();
+    let mut fill_group_ids = HashMap::new();
+    let mut changes = Vec::new();
+    for (source, change) in results {
+        if change.is_none() && !changed_fill_groups.contains(&source.object_group_id()) {
+            continue;
+        }
+        let mut replacements = change.unwrap_or_else(|| vec![source.clone()]);
+        if source.kind == EditKind::Fill {
+            let group_id = *fill_group_ids
+                .entry(source.object_group_id())
+                .or_insert_with(Uuid::new_v4);
+            for replacement in &mut replacements {
+                replacement.fill_group_id = Some(group_id);
+            }
+        }
+        changes.push((source.id, replacements));
+    }
+    Ok(changes)
+}
+
+fn subtract_eraser_operation(
+    source: &EditOperation,
+    fill_masks: &[Vec<CanvasPoint>],
+    fill_mask_bounds: Rect,
+    projection_camera: &CameraAddress,
+    subtract_paint: &impl Fn(&EditOperation) -> Result<Vec<Vec<CanvasPoint>>>,
+) -> Result<Option<Vec<EditOperation>>> {
+    if matches!(source.kind, EditKind::Paint | EditKind::Fill) {
+        let Some(mut source_bounds) =
+            canvas_points_screen_bounds(&source.points, projection_camera)?
+        else {
+            return Ok(None);
+        };
+        if source.kind == EditKind::Paint {
+            source_bounds = source_bounds.expand(
+                operation_width(source, projection_camera.depth, projection_camera.zoom) * 0.5,
+            );
+        }
+        if !source_bounds.intersects(fill_mask_bounds) {
+            return Ok(None);
+        }
+    }
+    let fragments = match source.kind {
+        EditKind::Paint => subtract_paint(source)?,
+        EditKind::Fill => {
+            subtract_fill_polygon_at_camera(&source.points, fill_masks, projection_camera)?
+        }
+        EditKind::CompactBlock => {
+            let Some(compact_sources) = subtract_compact_sources(
+                &source.compact_sources,
+                fill_masks,
+                fill_mask_bounds,
+                projection_camera,
+                subtract_paint,
+            )?
+            else {
+                return Ok(None);
+            };
+            if compact_sources.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            let mut replacement = source.clone();
+            replacement.compact_sources = compact_sources;
+            recompute_compact_block_bounds(&mut replacement)?;
+            return Ok(Some(vec![replacement]));
+        }
+        EditKind::Erase | EditKind::EraseArea => return Ok(None),
+    };
+    if fragments.len() == 1 && fragments[0] == source.points {
+        return Ok(None);
+    }
+    Ok(Some(
+        fragments
+            .into_iter()
+            .map(|points| {
+                let mut replacement = source.clone();
+                replacement.points = points;
+                if replacement.kind == EditKind::Fill {
+                    replacement.smooth_area = false;
+                }
+                replacement
+            })
+            .collect(),
+    ))
+}
+
+fn subtract_compact_sources(
+    sources: &[EditOperation],
+    fill_masks: &[Vec<CanvasPoint>],
+    fill_mask_bounds: Rect,
+    projection_camera: &CameraAddress,
+    subtract_paint: &impl Fn(&EditOperation) -> Result<Vec<Vec<CanvasPoint>>>,
+) -> Result<Option<Vec<EditOperation>>> {
+    let mut results = Vec::with_capacity(sources.len());
+    for source in sources {
+        results.push((
+            source,
+            subtract_eraser_operation(
+                source,
+                fill_masks,
+                fill_mask_bounds,
+                projection_camera,
+                subtract_paint,
+            )?,
+        ));
+    }
+    if results.iter().all(|(_, change)| change.is_none()) {
+        return Ok(None);
+    }
+    let changed_fill_groups = results
+        .iter()
+        .filter(|(source, change)| source.kind == EditKind::Fill && change.is_some())
+        .map(|(source, _)| source.object_group_id())
+        .collect::<HashSet<_>>();
+    let mut fill_group_ids = HashMap::new();
+    let mut replacements = Vec::new();
+    for (source, change) in results {
+        let mut source_replacements = change.unwrap_or_else(|| vec![source.clone()]);
+        if source.kind == EditKind::Fill && changed_fill_groups.contains(&source.object_group_id())
+        {
+            let group_id = *fill_group_ids
+                .entry(source.object_group_id())
+                .or_insert_with(Uuid::new_v4);
+            for replacement in &mut source_replacements {
+                replacement.fill_group_id = Some(group_id);
+            }
+        }
+        replacements.extend(source_replacements);
+    }
+    Ok(Some(replacements))
+}
+
+fn canvas_points_screen_bounds(
+    points: &[CanvasPoint],
+    camera: &CameraAddress,
+) -> Result<Option<Rect>> {
+    let projected = points
+        .iter()
+        .map(|point| {
+            let (x, y) = camera
+                .canvas_to_screen(point, 0.0, 0.0)
+                .context("eraser source bounds are not representable")?;
+            let position = Pos2::new(x as f32, y as f32);
+            (position.x.is_finite() && position.y.is_finite())
+                .then_some(position)
+                .context("eraser source bounds are not finite")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(pos2_bounds(&projected))
+}
+
+fn eraser_path_fill_masks(
+    paths: &[(Vec<Pos2>, f32)],
+    camera: &CameraAddress,
+    rect: Rect,
+) -> Result<Vec<Vec<CanvasPoint>>> {
+    let mut masks = Vec::new();
+    for (points, width) in paths {
+        if points.is_empty() || !width.is_finite() || *width <= 0.0 {
+            bail!("eraser path produced invalid Fill mask geometry");
+        }
+        let radius = *width * 0.5;
+        let simplified = simplify_render_points_with_tolerance(
+            &points
+                .iter()
+                .map(|point| (point.x, point.y))
+                .collect::<Vec<_>>(),
+            false,
+            0.25,
+        )
+        .into_iter()
+        .map(|(x, y)| Pos2::new(x, y))
+        .collect::<Vec<_>>();
+        let polygons = if simplified.len() == 1 {
+            vec![circle_mask_polygon(simplified[0], radius)]
+        } else {
+            simplified
+                .windows(2)
+                .map(|segment| capsule_mask_polygon(segment[0], segment[1], radius))
+                .collect()
+        };
+        masks.extend(polygons.into_iter().map(|polygon| {
+            polygon
+                .into_iter()
+                .map(|point| screen_to_canvas_for_camera(camera, point, rect))
+                .collect()
+        }));
+    }
+    Ok(masks)
+}
+
+fn circle_mask_polygon(center: Pos2, radius: f32) -> Vec<Pos2> {
+    const STEPS: usize = 16;
+    (0..STEPS)
+        .map(|step| {
+            let angle = std::f32::consts::TAU * step as f32 / STEPS as f32;
+            center + egui::vec2(angle.cos(), angle.sin()) * radius
+        })
+        .collect()
+}
+
+fn capsule_mask_polygon(start: Pos2, end: Pos2, radius: f32) -> Vec<Pos2> {
+    const CAP_STEPS: usize = 8;
+    let direction = end - start;
+    let length = direction.length();
+    if length <= 0.25 {
+        // ponytail: at most 0.125 px conservative over-coverage avoids unstable capsule ears.
+        return circle_mask_polygon(start.lerp(end, 0.5), radius + length * 0.5);
+    }
+    let angle = direction.y.atan2(direction.x);
+    let mut polygon = Vec::with_capacity((CAP_STEPS + 1) * 2);
+    for step in 0..=CAP_STEPS {
+        let theta = angle - std::f32::consts::FRAC_PI_2
+            + std::f32::consts::PI * step as f32 / CAP_STEPS as f32;
+        polygon.push(end + egui::vec2(theta.cos(), theta.sin()) * radius);
+    }
+    for step in 0..=CAP_STEPS {
+        let theta = angle
+            + std::f32::consts::FRAC_PI_2
+            + std::f32::consts::PI * step as f32 / CAP_STEPS as f32;
+        polygon.push(start + egui::vec2(theta.cos(), theta.sin()) * radius);
+    }
+    polygon
+}
+
+pub fn subtract_paint_stroke_by_path(
+    operation: &EditOperation,
+    camera: &CameraAddress,
+    rect: Rect,
+    eraser_points: &[Pos2],
+    eraser_width: f32,
+) -> Option<Vec<Vec<CanvasPoint>>> {
+    if eraser_points.is_empty()
+        || !eraser_width.is_finite()
+        || eraser_width <= 0.0
+        || eraser_points
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+    {
+        return None;
+    }
+    let radius =
+        f64::from(operation_width(operation, camera.depth, camera.zoom) + eraser_width) * 0.5;
+    if !radius.is_finite() || radius <= 0.0 {
+        return None;
+    }
+    subtract_paint_stroke_with(operation, camera, rect, |start, end| {
+        paint_segment_outside_stroke_mask(start, end, eraser_points, radius)
+    })
+}
+
+pub fn subtract_paint_stroke_by_polygon(
+    operation: &EditOperation,
+    camera: &CameraAddress,
+    rect: Rect,
+    polygon: &[Pos2],
+) -> Option<Vec<Vec<CanvasPoint>>> {
+    let polygon = normalized_pos_polygon(polygon);
+    if polygon.len() < 3 || polygon_area_twice(&polygon).abs() < 1.0 {
+        return None;
+    }
+    let radius = f64::from(operation_width(operation, camera.depth, camera.zoom)) * 0.5;
+    if !radius.is_finite() || radius <= 0.0 {
+        return None;
+    }
+    subtract_paint_stroke_with(operation, camera, rect, |start, end| {
+        paint_segment_outside_polygon_mask(start, end, &polygon, radius)
+    })
+}
+
+fn subtract_paint_stroke_with(
+    operation: &EditOperation,
+    camera: &CameraAddress,
+    rect: Rect,
+    outside_intervals: impl Fn(Pos2, Pos2) -> Vec<(f64, f64)>,
+) -> Option<Vec<Vec<CanvasPoint>>> {
+    if operation.kind != EditKind::Paint || operation.points.len() < 2 {
+        return None;
+    }
+    // ponytail: subtract stored segments; persist flattened smoothing only if integration
+    // shows a visible mismatch between replacement caps and rendered smoothing.
+    let projected = operation
+        .points
+        .iter()
+        .map(|point| canvas_point_to_position(camera, point, rect))
+        .collect::<Option<Vec<_>>>()?;
+    let mut unchanged = true;
+    let mut runs = Vec::new();
+    let mut current = Vec::new();
+    let mut current_end = None;
+    for (index, segment) in projected.windows(2).enumerate() {
+        let intervals = outside_intervals(segment[0], segment[1]);
+        unchanged &= intervals.len() == 1 && intervals[0] == (0.0, 1.0);
+        for (start_t, end_t) in intervals {
+            let start_position = segment[0].lerp(segment[1], start_t as f32);
+            let end_position = segment[0].lerp(segment[1], end_t as f32);
+            let start = canvas_point_on_projected_segment(
+                &operation.points[index],
+                &operation.points[index + 1],
+                segment[0],
+                segment[1],
+                start_t,
+                camera,
+            )?;
+            let end = canvas_point_on_projected_segment(
+                &operation.points[index],
+                &operation.points[index + 1],
+                segment[0],
+                segment[1],
+                end_t,
+                camera,
+            )?;
+            if current_end.is_some_and(|last: Pos2| last.distance(start_position) <= 0.01) {
+                if current.last() != Some(&end) {
+                    current.push(end);
+                }
+            } else {
+                if current.len() >= 2 {
+                    runs.push(std::mem::take(&mut current));
+                }
+                current.push(start);
+                current.push(end);
+            }
+            current_end = Some(end_position);
+        }
+    }
+    if unchanged {
+        return Some(vec![operation.points.clone()]);
+    }
+    if current.len() >= 2 {
+        runs.push(current);
+    }
+    Some(runs)
+}
+
+fn paint_segment_outside_stroke_mask(
+    start: Pos2,
+    end: Pos2,
+    mask: &[Pos2],
+    radius: f64,
+) -> Vec<(f64, f64)> {
+    let start = selection_point(start);
+    let end = selection_point(end);
+    let direction = SelectionPoint::new(end.x - start.x, end.y - start.y);
+    let mut breaks = vec![0.0, 1.0];
+
+    if mask.len() == 1 {
+        add_circle_mask_breaks(
+            &mut breaks,
+            start,
+            direction,
+            selection_point(mask[0]),
+            radius,
+        );
+    } else {
+        for segment in mask.windows(2) {
+            let mask_start = selection_point(segment[0]);
+            let mask_end = selection_point(segment[1]);
+            add_capsule_mask_breaks(&mut breaks, start, direction, mask_start, mask_end, radius);
+        }
+    }
+    breaks.sort_by(f64::total_cmp);
+    breaks.dedup_by(|left, right| (*left - *right).abs() <= 1.0e-9);
+
+    let mask_points = mask
+        .iter()
+        .copied()
+        .map(selection_point)
+        .collect::<Vec<_>>();
+    let mut outside = Vec::<(f64, f64)>::new();
+    for interval in breaks.windows(2) {
+        if interval[1] - interval[0] <= 1.0e-9 {
+            continue;
+        }
+        let middle = (interval[0] + interval[1]) * 0.5;
+        let point = SelectionPoint::new(
+            start.x + direction.x * middle,
+            start.y + direction.y * middle,
+        );
+        if polyline_distance(point, &mask_points) > radius {
+            if let Some(last) = outside.last_mut()
+                && (last.1 - interval[0]).abs() <= 1.0e-9
+            {
+                last.1 = interval[1];
+            } else {
+                outside.push((interval[0], interval[1]));
+            }
+        }
+    }
+    outside
+}
+
+fn paint_segment_outside_polygon_mask(
+    start: Pos2,
+    end: Pos2,
+    polygon: &[Pos2],
+    radius: f64,
+) -> Vec<(f64, f64)> {
+    let selection_start = selection_point(start);
+    let selection_end = selection_point(end);
+    let direction = SelectionPoint::new(
+        selection_end.x - selection_start.x,
+        selection_end.y - selection_start.y,
+    );
+    let mut breaks = vec![0.0, 1.0];
+    let polygon_points = polygon
+        .iter()
+        .copied()
+        .map(selection_point)
+        .collect::<Vec<_>>();
+    for (edge_start, edge_end) in polygon_edges_pos(polygon) {
+        add_capsule_mask_breaks(
+            &mut breaks,
+            selection_start,
+            direction,
+            selection_point(edge_start),
+            selection_point(edge_end),
+            radius,
+        );
+    }
+    breaks.sort_by(f64::total_cmp);
+    breaks.dedup_by(|left, right| (*left - *right).abs() <= 1.0e-9);
+
+    let mut outside = Vec::<(f64, f64)>::new();
+    for interval in breaks.windows(2) {
+        if interval[1] - interval[0] <= 1.0e-9 {
+            continue;
+        }
+        let middle = (interval[0] + interval[1]) * 0.5;
+        let point = SelectionPoint::new(
+            selection_start.x + direction.x * middle,
+            selection_start.y + direction.y * middle,
+        );
+        let screen_point = Pos2::new(point.x as f32, point.y as f32);
+        let erased = point_in_pos_polygon(screen_point, polygon)
+            || closed_polyline_distance(point, &polygon_points) <= radius;
+        if !erased {
+            if let Some(last) = outside.last_mut()
+                && (last.1 - interval[0]).abs() <= 1.0e-9
+            {
+                last.1 = interval[1];
+            } else {
+                outside.push((interval[0], interval[1]));
+            }
+        }
+    }
+    outside
+}
+
+fn add_capsule_mask_breaks(
+    breaks: &mut Vec<f64>,
+    start: SelectionPoint,
+    direction: SelectionPoint,
+    mask_start: SelectionPoint,
+    mask_end: SelectionPoint,
+    radius: f64,
+) {
+    add_circle_mask_breaks(breaks, start, direction, mask_start, radius);
+    add_circle_mask_breaks(breaks, start, direction, mask_end, radius);
+    let mask_direction = SelectionPoint::new(mask_end.x - mask_start.x, mask_end.y - mask_start.y);
+    let mask_length = point_distance(mask_start, mask_end);
+    let slope = direction.x * mask_direction.y - direction.y * mask_direction.x;
+    if mask_length > f64::EPSILON && slope.abs() > f64::EPSILON {
+        let base = (start.x - mask_start.x) * mask_direction.y
+            - (start.y - mask_start.y) * mask_direction.x;
+        push_unit_break(breaks, (radius * mask_length - base) / slope);
+        push_unit_break(breaks, (-radius * mask_length - base) / slope);
+    }
+}
+
+fn add_circle_mask_breaks(
+    breaks: &mut Vec<f64>,
+    start: SelectionPoint,
+    direction: SelectionPoint,
+    center: SelectionPoint,
+    radius: f64,
+) {
+    let offset = SelectionPoint::new(start.x - center.x, start.y - center.y);
+    let a = direction.x * direction.x + direction.y * direction.y;
+    if a <= f64::EPSILON {
+        return;
+    }
+    let b = 2.0 * (offset.x * direction.x + offset.y * direction.y);
+    let c = offset.x * offset.x + offset.y * offset.y - radius * radius;
+    let discriminant = b * b - 4.0 * a * c;
+    if discriminant < 0.0 {
+        return;
+    }
+    let root = discriminant.sqrt();
+    push_unit_break(breaks, (-b - root) / (2.0 * a));
+    push_unit_break(breaks, (-b + root) / (2.0 * a));
+}
+
+fn push_unit_break(breaks: &mut Vec<f64>, value: f64) {
+    if (-1.0e-9..=1.0 + 1.0e-9).contains(&value) {
+        breaks.push(value.clamp(0.0, 1.0));
+    }
+}
+
+fn canvas_point_on_projected_segment(
+    start: &CanvasPoint,
+    end: &CanvasPoint,
+    start_position: Pos2,
+    end_position: Pos2,
+    t: f64,
+    camera: &CameraAddress,
+) -> Option<CanvasPoint> {
+    if t <= 1.0e-9 {
+        return Some(start.clone());
+    }
+    if t >= 1.0 - 1.0e-9 {
+        return Some(end.clone());
+    }
+    start.translated_by_screen_delta(
+        camera.depth,
+        camera.zoom,
+        f64::from(end_position.x - start_position.x) * t,
+        f64::from(end_position.y - start_position.y) * t,
+    )
+}
+
 fn wrapped_cycle_index(current: usize, length: usize, step: isize) -> usize {
     debug_assert!(length > 0);
     (current as isize + step).rem_euclid(length as isize) as usize
@@ -7457,6 +9049,68 @@ fn raw_wheel_input_present(events: &[egui::Event]) -> bool {
             egui::Event::MouseWheel { delta, .. }
                 if delta.x.abs() > f32::EPSILON || delta.y.abs() > f32::EPSILON
         )
+    })
+}
+
+fn wheel_zoom_input_diagnostics(events: &[egui::Event]) -> Vec<Value> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let egui::Event::MouseWheel {
+                unit,
+                delta,
+                phase,
+                modifiers,
+            } = event
+            else {
+                return None;
+            };
+            Some(json!({
+                "unit": match unit {
+                    egui::MouseWheelUnit::Line => "line",
+                    egui::MouseWheelUnit::Point => "point",
+                    egui::MouseWheelUnit::Page => "page",
+                },
+                "delta_x": delta.x,
+                "delta_y": delta.y,
+                "phase": match phase {
+                    egui::TouchPhase::Start => "start",
+                    egui::TouchPhase::Move => "move",
+                    egui::TouchPhase::End => "end",
+                    egui::TouchPhase::Cancel => "cancel",
+                },
+                "modifiers": {
+                    "alt": modifiers.alt,
+                    "ctrl": modifiers.ctrl,
+                    "shift": modifiers.shift,
+                    "command": modifiers.command,
+                    "mac_cmd": modifiers.mac_cmd,
+                },
+            }))
+        })
+        .collect()
+}
+
+fn wheel_zoom_gesture_ended(events: &[egui::Event]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::MouseWheel {
+                phase: egui::TouchPhase::End | egui::TouchPhase::Cancel,
+                ..
+            }
+        )
+    })
+}
+
+fn wheel_zoom_camera_diagnostics(camera: &CameraAddress) -> Value {
+    json!({
+        "depth": camera.depth,
+        "tile_x": camera.tile_x.to_string(),
+        "tile_y": camera.tile_y.to_string(),
+        "local_x": camera.local_x,
+        "local_y": camera.local_y,
+        "zoom": camera.zoom,
     })
 }
 
@@ -7597,6 +9251,244 @@ fn area_lasso_points(
             .map(|point| screen_to_canvas_for_camera(camera, *point, rect))
             .collect(),
     )
+}
+
+pub fn subtract_fill_polygon(
+    source: &[CanvasPoint],
+    masks: &[Vec<CanvasPoint>],
+) -> Result<Vec<Vec<CanvasPoint>>> {
+    subtract_fill_polygon_with_limit(source, masks, MAX_FILL_DIFFERENCE_FRAGMENTS)
+}
+
+fn subtract_fill_polygon_with_limit(
+    source: &[CanvasPoint],
+    masks: &[Vec<CanvasPoint>],
+    max_fragments: usize,
+) -> Result<Vec<Vec<CanvasPoint>>> {
+    let anchor = source.first().context("fill subtraction source is empty")?;
+    let camera = CameraAddress {
+        depth: anchor.depth,
+        tile_x: anchor.tile_x.clone(),
+        tile_y: anchor.tile_y.clone(),
+        local_x: anchor.local_x,
+        local_y: anchor.local_y,
+        zoom: 1.0,
+    };
+    subtract_fill_polygon_at_camera_with_limit(source, masks, &camera, max_fragments)
+}
+
+fn subtract_fill_polygon_at_camera(
+    source: &[CanvasPoint],
+    masks: &[Vec<CanvasPoint>],
+    projection_camera: &CameraAddress,
+) -> Result<Vec<Vec<CanvasPoint>>> {
+    subtract_fill_polygon_at_camera_with_limit(
+        source,
+        masks,
+        projection_camera,
+        MAX_FILL_DIFFERENCE_FRAGMENTS,
+    )
+}
+
+fn subtract_fill_polygon_at_camera_with_limit(
+    source: &[CanvasPoint],
+    masks: &[Vec<CanvasPoint>],
+    projection_camera: &CameraAddress,
+    max_fragments: usize,
+) -> Result<Vec<Vec<CanvasPoint>>> {
+    let anchor = source.first().context("fill subtraction source is empty")?;
+    if max_fragments == 0 {
+        bail!("fill subtraction fragment limit is zero");
+    }
+    let mut output_camera = projection_camera.clone();
+    let depth_delta: i32 = projection_camera
+        .depth
+        .saturating_sub(anchor.depth)
+        .try_into()
+        .context("fill subtraction depth span is not representable")?;
+    output_camera.jump_to_depth(anchor.depth);
+    output_camera.zoom *= (crate::coords::DEPTH_RATIO as f64).powi(depth_delta);
+    if !output_camera.zoom.is_finite() || output_camera.zoom <= 0.0 {
+        bail!("fill subtraction depth span is not representable");
+    }
+    let project = |points: &[CanvasPoint]| -> Result<Vec<Pos2>> {
+        points
+            .iter()
+            .map(|point| {
+                let (x, y) = projection_camera
+                    .canvas_to_screen(point, 0.0, 0.0)
+                    .context("fill subtraction point is not representable")?;
+                let position = Pos2::new(x as f32, y as f32);
+                (position.x.is_finite() && position.y.is_finite())
+                    .then_some(position)
+                    .context("fill subtraction point is not finite")
+            })
+            .collect()
+    };
+
+    let source_polygon = normalized_pos_polygon(&project(source)?);
+    let Ok(source_triangles) = triangulate_fill_polygon(&source_polygon, "source") else {
+        let projected_masks = masks
+            .iter()
+            .map(|mask| project(mask).map(|mask| normalized_pos_polygon(&mask)))
+            .collect::<Result<Vec<_>>>()?;
+        let fully_covered = !source_polygon.is_empty()
+            && projected_masks.iter().any(|mask| {
+                source_polygon
+                    .iter()
+                    .all(|point| point_in_pos_polygon(*point, mask))
+                    && polygon_edges_pos(&source_polygon)
+                        .into_iter()
+                        .all(|(start, end)| {
+                            paint_segment_outside_polygon_mask(start, end, mask, 0.0).is_empty()
+                        })
+            });
+        return Ok(if fully_covered {
+            Vec::new()
+        } else {
+            vec![source.to_vec()]
+        });
+    };
+    if source_triangles.len() > max_fragments {
+        bail!("fill subtraction exceeded the {max_fragments}-fragment limit");
+    }
+
+    let mut mask_triangles = Vec::new();
+    for mask in masks {
+        let polygon = normalized_pos_polygon(&project(mask)?);
+        mask_triangles.extend(triangulate_fill_polygon(&polygon, "mask")?);
+    }
+    if mask_triangles.is_empty()
+        || !source_triangles.iter().any(|source_triangle| {
+            mask_triangles.iter().any(|mask_triangle| {
+                fill_polygon_is_nondegenerate(&clip_polygon_to_convex_pos_polygon(
+                    source_triangle,
+                    mask_triangle,
+                ))
+            })
+        })
+    {
+        return Ok(vec![source.to_vec()]);
+    }
+
+    let mut fragments = source_triangles;
+    for mask_triangle in &mask_triangles {
+        let mut next = Vec::new();
+        for fragment in fragments {
+            next.extend(subtract_convex_pos_polygon(&fragment, mask_triangle));
+            if next.len() > max_fragments {
+                bail!("fill subtraction exceeded the {max_fragments}-fragment limit");
+            }
+        }
+        fragments = next;
+        if fragments.is_empty() {
+            break;
+        }
+    }
+
+    fragments
+        .into_iter()
+        .map(|fragment| {
+            let mut points = fragment
+                .into_iter()
+                .map(|point| {
+                    output_camera.screen_to_canvas(point.x as f64, point.y as f64, 0.0, 0.0)
+                })
+                .collect::<Vec<_>>();
+            if let Some(first) = points.first().cloned() {
+                points.push(first);
+            }
+            Ok(points)
+        })
+        .collect()
+}
+
+fn triangulate_fill_polygon(polygon: &[Pos2], label: &str) -> Result<Vec<Vec<Pos2>>> {
+    if !fill_polygon_is_nondegenerate(polygon) {
+        bail!("fill subtraction {label} polygon is degenerate");
+    }
+    let triangles = triangulate_pos_polygon(polygon)
+        .into_iter()
+        .filter(|triangle| polygon_area_twice(triangle).abs() > MIN_FILL_GEOMETRY_AREA_TWICE)
+        .collect::<Vec<_>>();
+    let polygon_area = polygon_area_twice(polygon).abs();
+    let triangle_area = triangles
+        .iter()
+        .map(|triangle| polygon_area_twice(triangle).abs())
+        .sum::<f32>();
+    let tolerance = (polygon_area * 1.0e-4).max(MIN_FILL_FRAGMENT_AREA_TWICE);
+    if (triangle_area - polygon_area).abs() > tolerance {
+        bail!("fill subtraction {label} polygon could not be triangulated");
+    }
+    Ok(triangles)
+}
+
+fn subtract_convex_pos_polygon(subject: &[Pos2], mask: &[Pos2]) -> Vec<Vec<Pos2>> {
+    if !fill_polygon_is_nondegenerate(&clip_polygon_to_convex_pos_polygon(subject, mask)) {
+        return vec![subject.to_vec()];
+    }
+    let mut inside = subject.to_vec();
+    let mut fragments = Vec::new();
+    for (edge_start, edge_end) in polygon_edges_pos(mask) {
+        let outside = clip_pos_polygon_to_half_plane(&inside, edge_start, edge_end, false);
+        if fill_fragment_is_valid(&outside) {
+            fragments.push(outside);
+        }
+        inside = clip_pos_polygon_to_half_plane(&inside, edge_start, edge_end, true);
+        if !fill_fragment_is_valid(&inside) {
+            break;
+        }
+    }
+    fragments
+}
+
+fn clip_pos_polygon_to_half_plane(
+    subject: &[Pos2],
+    edge_start: Pos2,
+    edge_end: Pos2,
+    keep_left: bool,
+) -> Vec<Pos2> {
+    let mut output = Vec::new();
+    let Some(mut previous) = subject.last().copied() else {
+        return output;
+    };
+    let is_inside = |point| {
+        let cross = pos_cross(edge_start, edge_end, point);
+        if keep_left {
+            cross >= 0.0
+        } else {
+            cross <= 0.0
+        }
+    };
+    let mut previous_inside = is_inside(previous);
+    for current in subject.iter().copied() {
+        let current_inside = is_inside(current);
+        if current_inside != previous_inside
+            && let Some(intersection) =
+                clip_edge_line_intersection(previous, current, edge_start, edge_end)
+        {
+            output.push(intersection);
+        }
+        if current_inside {
+            output.push(current);
+        }
+        previous = current;
+        previous_inside = current_inside;
+    }
+    normalized_pos_polygon(&output)
+}
+
+fn fill_fragment_is_valid(points: &[Pos2]) -> bool {
+    fill_polygon_is_nondegenerate(points)
+        && polygon_area_twice(points).abs() >= MIN_FILL_FRAGMENT_AREA_TWICE
+}
+
+fn fill_polygon_is_nondegenerate(points: &[Pos2]) -> bool {
+    points.len() >= 3
+        && points
+            .iter()
+            .all(|point| point.x.is_finite() && point.y.is_finite())
+        && polygon_area_twice(points).abs() >= MIN_FILL_GEOMETRY_AREA_TWICE
 }
 
 fn normalized_pos_polygon(points: &[Pos2]) -> Vec<Pos2> {
@@ -8063,8 +9955,15 @@ fn selection_highlight_render_points(
         return points;
     }
     if operation.kind.is_area() {
-        let points = area_saved_fallback_render_points(&points, fill_fallback_max_points);
-        smooth_pos2_saved_fallback(&points, smoothing_passes, true)
+        area_saved_fallback_render_points(
+            &points,
+            fill_fallback_max_points,
+            if operation.smooth_area {
+                smoothing_passes
+            } else {
+                0
+            },
+        )
     } else {
         smooth_pos2_saved_fallback(&points, smoothing_passes, false)
     }
@@ -8096,54 +9995,73 @@ fn paint_operation_highlight(
 mod tests {
     use super::{
         AUTO_SEGMENTED_FALLBACK_POINTS, CanvasContextMenuKind, ClipboardCommand,
-        ClipboardShortcutKeys, FRAME_TIME_EMA_ALPHA, FrameRateTracker, MAX_BRUSH_SIZE,
-        MAX_FALLBACK_SMOOTHING_INPUT_POINTS, MAX_LASSO_PREVIEW_GAP_PX,
-        MAX_TILE_JOBS_QUEUED_PER_FRAME, MIN_BRUSH_SIZE, PointAppendDecision,
+        ClipboardShortcutKeys, DepthRenderMode, FRAME_TIME_EMA_ALPHA, FallbackPaintOperation,
+        FallbackRenderer, FrameRateTracker, MAX_BRUSH_SIZE, MAX_FALLBACK_SMOOTHING_INPUT_POINTS,
+        MAX_LASSO_PREVIEW_GAP_PX, MAX_MEASURED_FRAME_TIME, MAX_SEGMENTED_FALLBACK_SHAPES_PER_FRAME,
+        MAX_TILE_JOBS_QUEUED_PER_FRAME, MIN_BRUSH_SIZE, OperationBoundsCache, PointAppendDecision,
         QUALITY_SEGMENTED_FALLBACK_POINTS, RectangleSelectionMode, SavedFallbackRenderCache,
-        SavedFallbackRenderFrameKey, SavedFallbackRenderOperationKey, SelectionOverlayBoundsCache,
-        SelectionRotateGesture, SelectionScaleGesture, SelectionScaleHandle, SelectionTargetMode,
-        TILE_POLL_REPAINT_INTERVAL, TileFallbackMode, WHEEL_LINE_SCROLL_POINTS,
+        SavedFallbackRenderFrameKey, SavedFallbackRenderOperationKey, SelectionClipboard,
+        SelectionOverlayBoundsCache, SelectionRotateGesture, SelectionScaleGesture,
+        SelectionScaleHandle, SelectionTargetMode, TILE_POLL_REPAINT_INTERVAL, TileFallbackMode,
+        WHEEL_LINE_SCROLL_POINTS, WHEEL_ZOOM_DIRECTION_LATCH_TIMEOUT, WheelZoomDirectionLatch,
         adjusted_brush_size, alt_vertical_drag_cycle_steps, append_interpolated_points,
         append_preview_point, area_cycle_tool, area_lasso_points, area_rectangle_points,
         area_saved_fallback_render_points, auto_fast_stroke_fallback_active,
-        canvas_context_menu_kind, canvas_overlay_text, clamp_quick_depth,
-        clip_pos_area_operation_to_polygon, clip_pos_polyline_to_polygon, clip_pos2_polygon,
-        clip_pos2_polyline, clipboard_command_from_events, color_from_srgb,
-        consume_segmented_fallback_budget, draft_is_committable, eraser_lasso_operation,
-        fallback_operation_limit, fallback_operation_skip_count, fill_fallback_render_points,
-        format_overlay_coordinate, incremental_paint_operations, interpolation_step_count,
-        large_selection_fast_overlay_active, layer_operation_counts, normalized_pos_polygon,
-        operation_click_score, operation_contained_by_rectangle, operation_intersects_selection,
-        operation_may_intersect_screen_rect, operation_pick_hit, paint_order_wheel_steps,
-        parse_lateral_coordinate, point_append_decision, prepare_draft_for_commit,
+        canvas_context_menu_kind, canvas_overlay_text, capsule_mask_polygon, clamp_quick_depth,
+        clip_polygon_to_convex_pos_polygon, clip_pos_area_operation_to_polygon,
+        clip_pos_polyline_to_polygon, clip_pos2_polygon, clip_pos2_polyline,
+        clipboard_command_from_events, closed_polyline_distance, color_from_srgb,
+        consume_segmented_fallback_budget, depth_render_mode, draft_is_committable,
+        eraser_lasso_operation, eraser_path_fill_masks, fallback_operation_limit,
+        fallback_operation_skip_count, fill_fallback_render_points, format_overlay_coordinate,
+        fully_contained_object_operation_ids, incremental_paint_operations,
+        interpolation_step_count, large_selection_fast_overlay_active, layer_operation_counts,
+        normalized_pos_polygon, operation_click_score, operation_contained_by_rectangle,
+        operation_intersects_selection, operation_pick_hit, paint_fill_group_scanlines,
+        paint_order_wheel_steps, parse_lateral_coordinate, point_append_decision,
+        point_in_pos_polygon, polygon_area_twice, prepare_draft_for_commit,
         primary_pointer_positions, raw_wheel_input_present, rectangle_selection_mode_cycle,
         redo_shortcuts, repaint_interval_for_work, saved_fallback_operation_key,
-        selectable_layer_ids, selection_bounds_signature, selection_highlight_render_points,
+        selection_bounds_signature, selection_highlight_render_points,
         selection_overlay_width_expansion, selection_rotate_handle_at,
         selection_rotate_handle_position, selection_scale_factor, selection_scale_handle_at,
         selection_target_cycle, selection_wheel_steps, set_straight_draft_endpoint,
         should_paint_fill_fallback, should_paint_live_draft, smooth_pos2_draft,
         smooth_pos2_saved_fallback, space_pan_requested, straight_line_requested,
         stroke_fallback_fast_endpoint_caps, stroke_fallback_segmented_point_limit,
-        stroke_fallback_shapes, stroke_fallback_smoothing_passes, surrender_canvas_keyboard_focus,
-        tile_display_rects, tile_fallback_mode, tile_generation_is_paused, tile_keys_for_view,
-        tile_rebuild_deferred_since, tile_request_batch, tool_shortcut_allowed, wheel_zoom_scrolls,
+        stroke_fallback_shapes, stroke_fallback_smoothing_passes, subtract_eraser_sources,
+        subtract_fill_polygon, subtract_fill_polygon_with_limit, subtract_paint_sources,
+        subtract_paint_stroke_by_path, subtract_paint_stroke_by_polygon,
+        surrender_canvas_keyboard_focus, tile_display_rects, tile_fallback_mode,
+        tile_generation_is_paused, tile_keys_for_view, tile_rebuild_deferred_since,
+        tile_request_batch, tool_shortcut_allowed, triangulate_fill_polygon,
+        wheel_zoom_gesture_ended, wheel_zoom_input_diagnostics, wheel_zoom_scrolls,
         wrapped_cycle_index, z_drag_zoom_factor, z_zoom_requested,
         zoom_tile_requests_deferred_since,
     };
-    use crate::coords::{CameraAddress, CanvasPoint};
-    use crate::model::{Color, DEFAULT_LAYER_ID, EditKind, EditOperation, Layer, ToolKind};
+    use crate::coords::{CameraAddress, CanvasPoint, ScreenAffine};
+    use crate::document::{CanvasDocument, VisibleDepthMode};
+    use crate::model::{Color, DEFAULT_LAYER_ID, EditKind, EditOperation, ToolKind};
+    use crate::projection_cache::ProjectedGeometryCache;
+    use crate::raster::{RasterOptions, render_tile_with_options};
     use crate::selection_geometry::{Point2, Rect2, SelectionShape};
     use crate::settings::{
         AppSettings, OverlayProfile, PerformanceProfile, SmoothingLevel, StrokeFallbackJoinMode,
     };
-    use crate::tile_cache::{TILE_BLEED, TILE_SIZE, tile_lod_for_resolution, tile_resolution};
+    use crate::spatial::{OperationIndex, operation_bounds};
+    use crate::tile_cache::{
+        TILE_BLEED, TILE_SIZE, TileKey, tile_lod_for_resolution, tile_resolution,
+    };
+    use anyhow::Context;
     use eframe::egui::{
-        Color32, Event, Modifiers, MouseWheelUnit, PointerButton, Pos2, Rect, Shape, TouchPhase,
+        self, Color32, Event, Modifiers, MouseWheelUnit, PointerButton, Pos2, Rect, Shape,
+        TouchPhase,
     };
     use num_bigint::BigInt;
     use std::collections::HashSet;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use tempfile::TempDir;
     use uuid::Uuid;
 
     #[test]
@@ -8467,6 +10385,102 @@ mod tests {
     }
 
     #[test]
+    fn wheel_zoom_diagnostics_preserve_raw_order_sign_unit_and_phase() {
+        let events = [
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                phase: TouchPhase::Start,
+                modifiers: Modifiers::NONE,
+            },
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: egui::vec2(0.25, -0.75),
+                phase: TouchPhase::Move,
+                modifiers: Modifiers::SHIFT,
+            },
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Page,
+                delta: egui::vec2(0.0, 0.0),
+                phase: TouchPhase::End,
+                modifiers: Modifiers::CTRL,
+            },
+        ];
+
+        let diagnostics = wheel_zoom_input_diagnostics(&events);
+
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(diagnostics[0]["unit"], "line");
+        assert_eq!(diagnostics[0]["delta_y"], 1.0);
+        assert_eq!(diagnostics[0]["phase"], "start");
+        assert_eq!(diagnostics[1]["unit"], "point");
+        assert_eq!(diagnostics[1]["delta_x"], 0.25);
+        assert_eq!(diagnostics[1]["delta_y"], -0.75);
+        assert_eq!(diagnostics[1]["phase"], "move");
+        assert_eq!(diagnostics[1]["modifiers"]["shift"], true);
+        assert_eq!(diagnostics[2]["unit"], "page");
+        assert_eq!(diagnostics[2]["phase"], "end");
+        assert_eq!(diagnostics[2]["modifiers"]["ctrl"], true);
+    }
+
+    #[test]
+    fn wheel_zoom_direction_latch_suppresses_short_opposite_impulses() {
+        let now = Instant::now();
+        let mut latch = WheelZoomDirectionLatch::default();
+
+        let initial = latch.apply(&[-40.0; 14], false, now);
+        assert_eq!(initial.applied_scrolls, vec![-40.0; 14]);
+        assert_eq!(initial.suppressed_scroll_count, 0);
+        assert_eq!(initial.direction_used, Some(-1.0));
+
+        let chatter = latch.apply(&[40.0], false, now + Duration::from_millis(100));
+        assert!(chatter.applied_scrolls.is_empty());
+        assert_eq!(chatter.suppressed_scroll_count, 1);
+        assert_eq!(chatter.direction_before, Some(-1.0));
+        assert_eq!(chatter.direction_after, Some(-1.0));
+
+        let continued = latch.apply(&[-40.0], false, now + Duration::from_millis(150));
+        assert_eq!(continued.applied_scrolls, vec![-40.0]);
+    }
+
+    #[test]
+    fn wheel_zoom_direction_latch_accepts_a_new_direction_after_quiet() {
+        let now = Instant::now();
+        let mut latch = WheelZoomDirectionLatch::default();
+        assert_eq!(latch.apply(&[40.0], false, now).applied_scrolls, [40.0]);
+
+        let changed = latch.apply(&[-40.0], false, now + WHEEL_ZOOM_DIRECTION_LATCH_TIMEOUT);
+        assert_eq!(changed.applied_scrolls, [-40.0]);
+        assert_eq!(changed.direction_before, None);
+        assert_eq!(changed.direction_used, Some(-1.0));
+    }
+
+    #[test]
+    fn wheel_zoom_direction_latch_uses_batch_majority_and_resets_on_end() {
+        let now = Instant::now();
+        let mut latch = WheelZoomDirectionLatch::default();
+
+        let mixed = latch.apply(&[-40.0, -40.0, 40.0], false, now);
+        assert_eq!(mixed.applied_scrolls, [-40.0, -40.0]);
+        assert_eq!(mixed.suppressed_scroll_count, 1);
+
+        let ended = latch.apply(&[], true, now + Duration::from_millis(1));
+        assert_eq!(ended.direction_before, Some(-1.0));
+        assert_eq!(ended.direction_after, None);
+
+        let opposite = latch.apply(&[40.0], false, now + Duration::from_millis(2));
+        assert_eq!(opposite.applied_scrolls, [40.0]);
+
+        let end_event = Event::MouseWheel {
+            unit: MouseWheelUnit::Point,
+            delta: egui::Vec2::ZERO,
+            phase: TouchPhase::End,
+            modifiers: Modifiers::NONE,
+        };
+        assert!(wheel_zoom_gesture_ended(&[end_event]));
+    }
+
+    #[test]
     fn wheel_zoom_accumulates_fractional_point_scroll() {
         let point = |delta_y, phase| Event::MouseWheel {
             unit: MouseWheelUnit::Point,
@@ -8604,6 +10618,1568 @@ mod tests {
     }
 
     #[test]
+    fn paint_stroke_subtraction_handles_width_crossing_tangent_and_full_removal() {
+        let camera = CameraAddress {
+            depth: 12,
+            ..CameraAddress::default()
+        };
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+        let paint = EditOperation::draft(
+            EditKind::Paint,
+            camera.depth,
+            camera.zoom,
+            vec![
+                camera.screen_to_canvas(100.0, 256.0, 512.0, 512.0),
+                camera.screen_to_canvas(400.0, 256.0, 512.0, 512.0),
+            ],
+            Color::BLACK,
+            10.0,
+        );
+        let project_x = |point: &CanvasPoint| {
+            camera
+                .canvas_to_screen(point, 512.0, 512.0)
+                .expect("result projects")
+                .0
+        };
+
+        let outside =
+            subtract_paint_stroke_by_path(&paint, &camera, rect, &[Pos2::new(250.0, 50.0)], 20.0)
+                .expect("valid subtraction");
+        assert_eq!(outside, vec![paint.points.clone()]);
+
+        let crossing = subtract_paint_stroke_by_path(
+            &paint,
+            &camera,
+            rect,
+            &[Pos2::new(250.0, 100.0), Pos2::new(250.0, 400.0)],
+            20.0,
+        )
+        .expect("valid subtraction");
+        assert_eq!(crossing.len(), 2);
+        assert!((project_x(crossing[0].last().unwrap()) - 235.0).abs() < 0.01);
+        assert!((project_x(&crossing[1][0]) - 265.0).abs() < 0.01);
+        assert_eq!(crossing[0].last().unwrap().depth, camera.depth);
+
+        let tangent =
+            subtract_paint_stroke_by_path(&paint, &camera, rect, &[Pos2::new(250.0, 271.0)], 20.0)
+                .expect("valid subtraction");
+        assert_eq!(tangent, vec![paint.points.clone()]);
+
+        let endpoint =
+            subtract_paint_stroke_by_path(&paint, &camera, rect, &[Pos2::new(100.0, 256.0)], 20.0)
+                .expect("valid subtraction");
+        assert_eq!(endpoint.len(), 1);
+        assert!((project_x(&endpoint[0][0]) - 115.0).abs() < 0.01);
+        assert!((project_x(endpoint[0].last().unwrap()) - 400.0).abs() < 0.01);
+
+        let removed = subtract_paint_stroke_by_path(
+            &paint,
+            &camera,
+            rect,
+            &[Pos2::new(100.0, 256.0), Pos2::new(400.0, 256.0)],
+            20.0,
+        )
+        .expect("valid subtraction");
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn paint_stroke_polygon_subtraction_handles_outside_boundary_and_full_removal() {
+        let camera = CameraAddress::default();
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+        let paint = EditOperation::draft(
+            EditKind::Paint,
+            camera.depth,
+            camera.zoom,
+            vec![
+                camera.screen_to_canvas(100.0, 256.0, 512.0, 512.0),
+                camera.screen_to_canvas(400.0, 256.0, 512.0, 512.0),
+            ],
+            Color::BLACK,
+            10.0,
+        );
+        let project_x = |point: &CanvasPoint| {
+            camera
+                .canvas_to_screen(point, 512.0, 512.0)
+                .expect("projected point")
+                .0
+        };
+        let rectangle = |left: f32, top: f32, right: f32, bottom: f32| {
+            [
+                Pos2::new(left, top),
+                Pos2::new(right, top),
+                Pos2::new(right, bottom),
+                Pos2::new(left, bottom),
+            ]
+        };
+
+        let outside = subtract_paint_stroke_by_polygon(
+            &paint,
+            &camera,
+            rect,
+            &rectangle(200.0, 100.0, 300.0, 150.0),
+        )
+        .expect("valid outside polygon");
+        assert_eq!(outside, vec![paint.points.clone()]);
+
+        let crossing = subtract_paint_stroke_by_polygon(
+            &paint,
+            &camera,
+            rect,
+            &rectangle(240.0, 200.0, 260.0, 300.0),
+        )
+        .expect("valid crossing polygon");
+        assert_eq!(crossing.len(), 2);
+        assert!((project_x(crossing[0].last().unwrap()) - 235.0).abs() < 0.01);
+        assert!((project_x(&crossing[1][0]) - 265.0).abs() < 0.01);
+
+        let endpoint = subtract_paint_stroke_by_polygon(
+            &paint,
+            &camera,
+            rect,
+            &rectangle(50.0, 200.0, 200.0, 300.0),
+        )
+        .expect("valid endpoint polygon");
+        assert_eq!(endpoint.len(), 1);
+        assert!((project_x(&endpoint[0][0]) - 205.0).abs() < 0.01);
+
+        let boundary = subtract_paint_stroke_by_polygon(
+            &paint,
+            &camera,
+            rect,
+            &rectangle(240.0, 200.0, 260.0, 252.0),
+        )
+        .expect("valid boundary polygon");
+        assert_eq!(boundary.len(), 2);
+        assert!((project_x(boundary[0].last().unwrap()) - 237.0).abs() < 0.01);
+        assert!((project_x(&boundary[1][0]) - 263.0).abs() < 0.01);
+
+        let removed = subtract_paint_stroke_by_polygon(
+            &paint,
+            &camera,
+            rect,
+            &rectangle(50.0, 200.0, 450.0, 300.0),
+        )
+        .expect("valid containing polygon");
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn vector_eraser_lasso_pipeline_commits_fragments_once_without_erase_area() -> anyhow::Result<()>
+    {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let camera = CameraAddress::default();
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+        let paint = EditOperation::draft(
+            EditKind::Paint,
+            camera.depth,
+            camera.zoom,
+            vec![
+                camera.screen_to_canvas(100.0, 256.0, 512.0, 512.0),
+                camera.screen_to_canvas(400.0, 256.0, 512.0, 512.0),
+            ],
+            Color::BLACK,
+            10.0,
+        );
+        let source_id = paint.id;
+        document.commit(paint.clone())?;
+        let polygons = vec![
+            vec![
+                Pos2::new(180.0, 200.0),
+                Pos2::new(200.0, 200.0),
+                Pos2::new(200.0, 300.0),
+                Pos2::new(180.0, 300.0),
+            ],
+            vec![
+                Pos2::new(280.0, 200.0),
+                Pos2::new(300.0, 200.0),
+                Pos2::new(300.0, 300.0),
+                Pos2::new(280.0, 300.0),
+            ],
+        ];
+        let changes = subtract_paint_sources(vec![paint], &polygons, |source, polygon| {
+            subtract_paint_stroke_by_polygon(source, &camera, rect, polygon)
+        })
+        .expect("valid polygon subtraction");
+        let replacement_ids = document
+            .commit_paint_subtraction(changes, DEFAULT_LAYER_ID)?
+            .expect("lasso changes Paint");
+
+        assert_eq!(replacement_ids.len(), 3);
+        assert_eq!(document.revision(), 2);
+        assert!(
+            document.operations().iter().all(|operation| {
+                operation.kind == EditKind::Paint && operation.id != source_id
+            })
+        );
+        assert!(document.undo()?);
+        assert_eq!(document.operations()[0].id, source_id);
+        Ok(())
+    }
+
+    #[test]
+    fn vector_eraser_pipeline_commits_only_paint_replacements() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let camera = CameraAddress::default();
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+        let paint = EditOperation::draft(
+            EditKind::Paint,
+            camera.depth,
+            camera.zoom,
+            vec![
+                camera.screen_to_canvas(100.0, 256.0, 512.0, 512.0),
+                camera.screen_to_canvas(400.0, 256.0, 512.0, 512.0),
+            ],
+            Color::BLACK,
+            10.0,
+        );
+        let source_id = paint.id;
+        document.commit(paint.clone())?;
+
+        let outside =
+            subtract_paint_stroke_by_path(&paint, &camera, rect, &[Pos2::new(250.0, 50.0)], 20.0)
+                .expect("valid outside mask");
+        assert!(
+            document
+                .commit_paint_subtraction(
+                    vec![(source_id, outside)],
+                    crate::model::DEFAULT_LAYER_ID,
+                )?
+                .is_none()
+        );
+        assert_eq!(document.revision(), 1);
+
+        let crossing = subtract_paint_stroke_by_path(
+            &paint,
+            &camera,
+            rect,
+            &[Pos2::new(250.0, 100.0), Pos2::new(250.0, 400.0)],
+            20.0,
+        )
+        .expect("valid crossing mask");
+        let replacement_ids = document
+            .commit_paint_subtraction(vec![(source_id, crossing)], crate::model::DEFAULT_LAYER_ID)?
+            .expect("crossing changes Paint");
+
+        assert_eq!(replacement_ids.len(), 2);
+        assert_eq!(document.revision(), 2);
+        assert!(
+            document
+                .operations()
+                .iter()
+                .all(|operation| operation.kind == EditKind::Paint)
+        );
+        assert!(document.undo()?);
+        assert_eq!(document.operations()[0].id, source_id);
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_eraser_subtracts_paint_fill_and_compact_block_in_one_history_step()
+    -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let root = temporary.path().join("test.esketch");
+        let mut document = CanvasDocument::open(&root)?;
+        let camera = CameraAddress::default();
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+        let paint = EditOperation::draft(
+            EditKind::Paint,
+            camera.depth,
+            camera.zoom,
+            vec![
+                camera.screen_to_canvas(100.0, 256.0, 512.0, 512.0),
+                camera.screen_to_canvas(400.0, 256.0, 512.0, 512.0),
+            ],
+            Color::BLACK,
+            10.0,
+        );
+        let fill_points = [
+            (150.0, 180.0),
+            (350.0, 180.0),
+            (350.0, 330.0),
+            (150.0, 330.0),
+            (150.0, 180.0),
+        ]
+        .into_iter()
+        .map(|(x, y)| camera.screen_to_canvas(x, y, 512.0, 512.0))
+        .collect::<Vec<_>>();
+        let mut fill = EditOperation::draft(
+            EditKind::Fill,
+            camera.depth,
+            camera.zoom,
+            fill_points.clone(),
+            Color::rgba(40, 80, 160, 255),
+            0.0,
+        );
+        fill.smooth_area = true;
+        let inner_paint = EditOperation::draft(
+            EditKind::Paint,
+            camera.depth,
+            camera.zoom,
+            vec![
+                camera.screen_to_canvas(100.0, 300.0, 512.0, 512.0),
+                camera.screen_to_canvas(400.0, 300.0, 512.0, 512.0),
+            ],
+            Color::rgba(180, 30, 50, 255),
+            8.0,
+        );
+        let mut inner_fill = EditOperation::draft(
+            EditKind::Fill,
+            camera.depth,
+            camera.zoom,
+            fill_points.clone(),
+            Color::rgba(20, 150, 60, 255),
+            0.0,
+        );
+        inner_fill.smooth_area = true;
+        let legacy_erase = EditOperation::draft(
+            EditKind::EraseArea,
+            camera.depth,
+            camera.zoom,
+            fill_points.clone(),
+            Color::WHITE,
+            0.0,
+        );
+        let block = EditOperation::compact_block(
+            DEFAULT_LAYER_ID,
+            fill_points[..4].to_vec(),
+            vec![inner_paint, inner_fill, legacy_erase],
+        );
+        let original_ids = HashSet::from([paint.id, fill.id, block.id]);
+        document.commit(paint)?;
+        document.commit(fill)?;
+        document.commit(block)?;
+
+        let paths = vec![(vec![Pos2::new(250.0, 100.0), Pos2::new(250.0, 400.0)], 20.0)];
+        let fill_masks = eraser_path_fill_masks(&paths, &camera, rect)?;
+        let sources = document.operations().to_vec();
+        let changes = subtract_eraser_sources(&sources, &fill_masks, &camera, |source| {
+            subtract_paint_stroke_by_path(source, &camera, rect, &paths[0].0, paths[0].1)
+                .context("valid Paint subtraction")
+        })?;
+        assert_eq!(changes.len(), 3);
+        let replacement_ids = document
+            .commit_eraser_subtraction(changes, DEFAULT_LAYER_ID)?
+            .expect("mixed eraser changes all sources");
+        assert!(replacement_ids.len() > 3);
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.transaction_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            1
+        );
+        let compact = document
+            .operations()
+            .iter()
+            .find(|operation| operation.is_compact_block())
+            .expect("CompactBlock replacement");
+        assert!(compact.compact_sources.len() > 3);
+        assert!(
+            compact
+                .compact_sources
+                .iter()
+                .any(|source| { source.kind == EditKind::Fill && source.fill_group_id.is_some() })
+        );
+        assert!(
+            document
+                .operations()
+                .iter()
+                .filter(|source| source.kind == EditKind::Fill)
+                .all(|source| !source.smooth_area)
+        );
+        assert!(
+            compact
+                .compact_sources
+                .iter()
+                .filter(|source| source.kind == EditKind::Fill)
+                .all(|source| !source.smooth_area)
+        );
+        assert!(
+            compact
+                .compact_sources
+                .iter()
+                .any(|source| source.kind == EditKind::EraseArea)
+        );
+        assert!(document.undo()?);
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<HashSet<_>>(),
+            original_ids
+        );
+        assert!(document.redo()?);
+        drop(document);
+
+        let document = CanvasDocument::open(&root)?;
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<HashSet<_>>(),
+            replacement_ids.into_iter().collect()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_eraser_skips_a_disjoint_untriangulatable_fill_inside_compact_block()
+    -> anyhow::Result<()> {
+        let camera = CameraAddress::default();
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+        let paint = EditOperation::draft(
+            EditKind::Paint,
+            camera.depth,
+            camera.zoom,
+            vec![
+                camera.screen_to_canvas(100.0, 256.0, 512.0, 512.0),
+                camera.screen_to_canvas(400.0, 256.0, 512.0, 512.0),
+            ],
+            Color::BLACK,
+            10.0,
+        );
+        let invalid_fill = EditOperation::draft(
+            EditKind::Fill,
+            camera.depth,
+            camera.zoom,
+            [
+                (5_000.0, 0.0),
+                (5_100.0, 100.0),
+                (5_000.0, 100.0),
+                (5_100.0, 0.0),
+                (5_000.0, 0.0),
+            ]
+            .into_iter()
+            .map(|(x, y)| camera.screen_to_canvas(x, y, 512.0, 512.0))
+            .collect(),
+            Color::BLACK,
+            0.0,
+        );
+        let invalid_fill_id = invalid_fill.id;
+        let block = EditOperation::compact_block(
+            DEFAULT_LAYER_ID,
+            paint.points.clone(),
+            vec![paint, invalid_fill],
+        );
+        let path = vec![Pos2::new(250.0, 100.0), Pos2::new(250.0, 400.0)];
+        let fill_masks = eraser_path_fill_masks(&[(path.clone(), 20.0)], &camera, rect)?;
+
+        let changes = subtract_eraser_sources(&[block], &fill_masks, &camera, |source| {
+            subtract_paint_stroke_by_path(source, &camera, rect, &path, 20.0)
+                .context("valid Paint subtraction")
+        })?;
+
+        assert_eq!(changes.len(), 1);
+        assert!(
+            changes[0].1[0]
+                .compact_sources
+                .iter()
+                .any(|source| { source.id == invalid_fill_id && source.kind == EditKind::Fill })
+        );
+        assert!(
+            changes[0].1[0]
+                .compact_sources
+                .iter()
+                .filter(|source| source.kind == EditKind::Paint)
+                .count()
+                > 1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_erasers_preserve_partially_intersecting_legacy_invalid_fills() -> anyhow::Result<()> {
+        for lasso in [false, true] {
+            let temporary = TempDir::new()?;
+            let root = temporary.path().join("test.esketch");
+            let mut document = CanvasDocument::open(&root)?;
+            let camera = CameraAddress::default();
+            let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+            let paint = EditOperation::draft(
+                EditKind::Paint,
+                camera.depth,
+                camera.zoom,
+                vec![
+                    camera.screen_to_canvas(100.0, 256.0, 512.0, 512.0),
+                    camera.screen_to_canvas(400.0, 256.0, 512.0, 512.0),
+                ],
+                Color::BLACK,
+                10.0,
+            );
+            let degenerate_points = [150.0, 200.0, 350.0, 150.0]
+                .into_iter()
+                .map(|y| camera.screen_to_canvas(250.0, y, 512.0, 512.0))
+                .collect::<Vec<_>>();
+            let malformed_points = [180.0, 250.0]
+                .into_iter()
+                .map(|y| camera.screen_to_canvas(250.0, y, 512.0, 512.0))
+                .collect::<Vec<_>>();
+            let degenerate_fill = EditOperation::draft(
+                EditKind::Fill,
+                camera.depth,
+                camera.zoom,
+                degenerate_points.clone(),
+                Color::BLACK,
+                0.0,
+            );
+            let malformed_fill = EditOperation::draft(
+                EditKind::Fill,
+                camera.depth,
+                camera.zoom,
+                malformed_points.clone(),
+                Color::BLACK,
+                0.0,
+            );
+            let block = EditOperation::compact_block(
+                DEFAULT_LAYER_ID,
+                paint.points.clone(),
+                vec![paint, degenerate_fill, malformed_fill],
+            );
+            let block_id = block.id;
+            document.commit(block)?;
+
+            let path = vec![Pos2::new(250.0, 175.0), Pos2::new(250.0, 300.0)];
+            let polygon = vec![
+                Pos2::new(240.0, 175.0),
+                Pos2::new(260.0, 175.0),
+                Pos2::new(260.0, 300.0),
+                Pos2::new(240.0, 300.0),
+            ];
+            let fill_masks = if lasso {
+                vec![
+                    polygon
+                        .iter()
+                        .map(|point| {
+                            camera.screen_to_canvas(point.x as f64, point.y as f64, 512.0, 512.0)
+                        })
+                        .collect(),
+                ]
+            } else {
+                eraser_path_fill_masks(&[(path.clone(), 20.0)], &camera, rect)?
+            };
+            let changes =
+                subtract_eraser_sources(document.operations(), &fill_masks, &camera, |source| {
+                    if lasso {
+                        subtract_paint_stroke_by_polygon(source, &camera, rect, &polygon)
+                    } else {
+                        subtract_paint_stroke_by_path(source, &camera, rect, &path, 20.0)
+                    }
+                    .context("valid Paint subtraction")
+                })?;
+
+            document
+                .commit_eraser_subtraction(changes, DEFAULT_LAYER_ID)?
+                .expect("Paint and intersecting legacy Fill geometry change together");
+            let compact = &document.operations()[0];
+            assert!(
+                compact
+                    .compact_sources
+                    .iter()
+                    .any(|source| source.points == degenerate_points)
+            );
+            assert!(
+                compact
+                    .compact_sources
+                    .iter()
+                    .all(|source| source.points != malformed_points)
+            );
+            assert!(document.undo()?);
+            assert_eq!(document.operations()[0].id, block_id);
+            assert!(document.redo()?);
+            drop(document);
+            let reopened = CanvasDocument::open(&root)?;
+            assert_eq!(reopened.operations().len(), 1);
+            assert!(
+                reopened.operations()[0]
+                    .compact_sources
+                    .iter()
+                    .any(|source| source.points == degenerate_points)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_eraser_lasso_subtracts_paint_and_fill_together() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let camera = CameraAddress::default();
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+        let paint = EditOperation::draft(
+            EditKind::Paint,
+            camera.depth,
+            camera.zoom,
+            vec![
+                camera.screen_to_canvas(100.0, 256.0, 512.0, 512.0),
+                camera.screen_to_canvas(400.0, 256.0, 512.0, 512.0),
+            ],
+            Color::BLACK,
+            10.0,
+        );
+        let fill = EditOperation::draft(
+            EditKind::Fill,
+            camera.depth,
+            camera.zoom,
+            [
+                (150.0, 180.0),
+                (350.0, 180.0),
+                (350.0, 330.0),
+                (150.0, 330.0),
+                (150.0, 180.0),
+            ]
+            .into_iter()
+            .map(|(x, y)| camera.screen_to_canvas(x, y, 512.0, 512.0))
+            .collect(),
+            Color::rgba(40, 80, 160, 255),
+            0.0,
+        );
+        let original_ids = HashSet::from([paint.id, fill.id]);
+        document.commit(paint)?;
+        document.commit(fill)?;
+        let polygon = vec![
+            Pos2::new(230.0, 100.0),
+            Pos2::new(270.0, 100.0),
+            Pos2::new(270.0, 400.0),
+            Pos2::new(230.0, 400.0),
+        ];
+        let fill_masks = vec![
+            polygon
+                .iter()
+                .map(|point| camera.screen_to_canvas(point.x as f64, point.y as f64, 512.0, 512.0))
+                .collect::<Vec<_>>(),
+        ];
+        let changes =
+            subtract_eraser_sources(document.operations(), &fill_masks, &camera, |source| {
+                subtract_paint_stroke_by_polygon(source, &camera, rect, &polygon)
+                    .context("valid Paint subtraction")
+            })?;
+        assert_eq!(changes.len(), 2);
+        document
+            .commit_eraser_subtraction(changes, DEFAULT_LAYER_ID)?
+            .expect("lasso changes Paint and Fill");
+        assert!(document.undo()?);
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<HashSet<_>>(),
+            original_ids
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fill_eraser_mask_simplifies_a_dense_straight_path_to_two_capsules_at_most()
+    -> anyhow::Result<()> {
+        let camera = CameraAddress::default();
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+        let path = (0..200)
+            .map(|step| Pos2::new(100.0 + step as f32, 256.0))
+            .collect::<Vec<_>>();
+        let masks = eraser_path_fill_masks(&[(path, 20.0)], &camera, rect)?;
+
+        assert!(masks.len() <= 2, "masks={}", masks.len());
+        assert!(masks.iter().all(|mask| mask.len() == 18));
+        Ok(())
+    }
+
+    #[test]
+    fn generated_eraser_capsules_are_triangulatable() {
+        for radius in [0.5, 1.0, 10.0, 250.0] {
+            for length in [0.0001, 0.001, 0.01, 0.1, 0.24, 0.25, 1.0, 100.0] {
+                for angle in [0.0_f32, 0.3, 1.0, 2.4] {
+                    let end = Pos2::new(angle.cos() * length, angle.sin() * length);
+                    let polygon = capsule_mask_polygon(Pos2::ZERO, end, radius);
+                    triangulate_fill_polygon(&polygon, "mask").unwrap_or_else(|error| {
+                        panic!("radius={radius} length={length} angle={angle}: {error:#}")
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_eraser_noop_error_and_full_compact_delete_are_atomic() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let camera = CameraAddress::default();
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+        let paint = EditOperation::draft(
+            EditKind::Paint,
+            0,
+            1.0,
+            vec![
+                camera.screen_to_canvas(100.0, 256.0, 512.0, 512.0),
+                camera.screen_to_canvas(400.0, 256.0, 512.0, 512.0),
+            ],
+            Color::BLACK,
+            10.0,
+        );
+        let fill_points = [
+            (100.0, 180.0),
+            (400.0, 180.0),
+            (400.0, 330.0),
+            (100.0, 330.0),
+            (100.0, 180.0),
+        ]
+        .into_iter()
+        .map(|(x, y)| camera.screen_to_canvas(x, y, 512.0, 512.0))
+        .collect::<Vec<_>>();
+        let fill = EditOperation::draft(
+            EditKind::Fill,
+            0,
+            1.0,
+            fill_points.clone(),
+            Color::BLACK,
+            0.0,
+        );
+        let block = EditOperation::compact_block(
+            DEFAULT_LAYER_ID,
+            fill_points[..4].to_vec(),
+            vec![paint, fill],
+        );
+        let block_id = block.id;
+        document.commit(block)?;
+        let revision = document.revision();
+
+        let outside = vec![
+            Pos2::new(450.0, 20.0),
+            Pos2::new(500.0, 20.0),
+            Pos2::new(500.0, 80.0),
+            Pos2::new(450.0, 80.0),
+        ];
+        let outside_mask = vec![
+            outside
+                .iter()
+                .map(|point| camera.screen_to_canvas(point.x as f64, point.y as f64, 512.0, 512.0))
+                .collect::<Vec<_>>(),
+        ];
+        let changes =
+            subtract_eraser_sources(document.operations(), &outside_mask, &camera, |source| {
+                subtract_paint_stroke_by_polygon(source, &camera, rect, &outside)
+                    .context("valid outside mask")
+            })?;
+        assert!(changes.is_empty());
+        assert!(
+            document
+                .commit_eraser_subtraction(changes, DEFAULT_LAYER_ID)?
+                .is_none()
+        );
+        assert_eq!(document.revision(), revision);
+
+        let mut invalid_mask = outside_mask[0].clone();
+        invalid_mask[0].local_x = f64::NAN;
+        assert!(
+            subtract_eraser_sources(document.operations(), &[invalid_mask], &camera, |source| {
+                subtract_paint_stroke_by_polygon(source, &camera, rect, &outside)
+                    .context("valid Paint mask")
+            })
+            .is_err()
+        );
+        assert_eq!(document.revision(), revision);
+        assert_eq!(document.operations()[0].id, block_id);
+
+        let covering = vec![
+            Pos2::new(0.0, 0.0),
+            Pos2::new(512.0, 0.0),
+            Pos2::new(512.0, 512.0),
+            Pos2::new(0.0, 512.0),
+        ];
+        let covering_mask = vec![
+            covering
+                .iter()
+                .map(|point| camera.screen_to_canvas(point.x as f64, point.y as f64, 512.0, 512.0))
+                .collect::<Vec<_>>(),
+        ];
+        let changes =
+            subtract_eraser_sources(document.operations(), &covering_mask, &camera, |source| {
+                subtract_paint_stroke_by_polygon(source, &camera, rect, &covering)
+                    .context("valid covering mask")
+            })?;
+        let replacements = document
+            .commit_eraser_subtraction(changes, DEFAULT_LAYER_ID)?
+            .expect("covering mask deletes CompactBlock");
+        assert!(replacements.is_empty());
+        assert!(document.operations().is_empty());
+        assert!(document.undo()?);
+        assert_eq!(document.operations()[0].id, block_id);
+        Ok(())
+    }
+
+    #[test]
+    fn fill_group_subtraction_replaces_untouched_siblings_atomically() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let mut document = CanvasDocument::open(temporary.path().join("test.esketch"))?;
+        let camera = CameraAddress::default();
+        let group_id = Uuid::new_v4();
+        let transaction_id = Uuid::new_v4();
+        let fill = |coordinates: &[(f64, f64)]| {
+            let mut operation = EditOperation::draft(
+                EditKind::Fill,
+                0,
+                1.0,
+                coordinates
+                    .iter()
+                    .map(|(x, y)| camera.screen_to_canvas(*x, *y, 512.0, 512.0))
+                    .collect(),
+                Color::rgba(50, 100, 180, 255),
+                0.0,
+            );
+            operation.paint_order = Some(1);
+            operation.fill_group_id = Some(group_id);
+            operation.transaction_id = transaction_id;
+            operation
+        };
+        let left = fill(&[
+            (100.0, 180.0),
+            (250.0, 180.0),
+            (250.0, 330.0),
+            (100.0, 330.0),
+            (100.0, 180.0),
+        ]);
+        let right = fill(&[
+            (250.0, 180.0),
+            (400.0, 180.0),
+            (400.0, 330.0),
+            (250.0, 330.0),
+            (250.0, 180.0),
+        ]);
+        let original_ids = HashSet::from([left.id, right.id]);
+        let right_points = right.points.clone();
+        document.commit_group(vec![left, right])?;
+        let mask = vec![
+            camera.screen_to_canvas(120.0, 200.0, 512.0, 512.0),
+            camera.screen_to_canvas(180.0, 200.0, 512.0, 512.0),
+            camera.screen_to_canvas(180.0, 300.0, 512.0, 512.0),
+            camera.screen_to_canvas(120.0, 300.0, 512.0, 512.0),
+        ];
+        let changes =
+            subtract_eraser_sources(document.operations(), &[mask], &camera, |_| Ok(Vec::new()))?;
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().any(|(_, replacements)| {
+            replacements.len() == 1 && replacements[0].points == right_points
+        }));
+        document
+            .commit_eraser_subtraction(changes, DEFAULT_LAYER_ID)?
+            .expect("one changed member replaces the whole Fill group");
+        let replacement_groups = document
+            .operations()
+            .iter()
+            .filter_map(|operation| operation.fill_group_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(replacement_groups.len(), 1);
+        assert!(!replacement_groups.contains(&group_id));
+        assert!(document.undo()?);
+        assert_eq!(
+            document
+                .operations()
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<HashSet<_>>(),
+            original_ids
+        );
+        Ok(())
+    }
+
+    fn test_canvas_polygon(depth: i64, coordinates: &[(f64, f64)]) -> Vec<CanvasPoint> {
+        test_canvas_polygon_at(depth, BigInt::from(0), coordinates)
+    }
+
+    fn test_canvas_polygon_at(
+        depth: i64,
+        tile: BigInt,
+        coordinates: &[(f64, f64)],
+    ) -> Vec<CanvasPoint> {
+        let mut points = coordinates
+            .iter()
+            .map(|(x, y)| CanvasPoint::new(depth, tile.clone(), tile.clone(), *x, *y))
+            .collect::<Vec<_>>();
+        if let Some(first) = points.first().cloned() {
+            points.push(first);
+        }
+        points
+    }
+
+    fn test_fill_fragment_operations(
+        source: &EditOperation,
+        masks: &[EditOperation],
+    ) -> anyhow::Result<Vec<EditOperation>> {
+        let fill_group_id = Uuid::new_v4();
+        let mask_points = masks
+            .iter()
+            .map(|mask| mask.points.clone())
+            .collect::<Vec<_>>();
+        subtract_fill_polygon(&source.points, &mask_points).map(|fragments| {
+            fragments
+                .into_iter()
+                .map(|points| {
+                    let mut fragment = source.clone();
+                    fragment.id = Uuid::new_v4();
+                    fragment.fill_group_id = Some(fill_group_id);
+                    fragment.points = points;
+                    fragment
+                })
+                .collect()
+        })
+    }
+
+    fn test_fallback_fill_pixels(
+        operations: &[(Vec<Vec<Pos2>>, Color32)],
+        size: usize,
+    ) -> Vec<Color32> {
+        let context = egui::Context::default();
+        let clip_rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(size as f32, size as f32));
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.painter().with_clip_rect(clip_rect);
+            for (polygons, color) in operations {
+                let polygon_slices = polygons.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                paint_fill_group_scanlines(&painter, clip_rect, &polygon_slices, *color);
+            }
+        });
+        let mut pixels = vec![Color32::from_rgb(250, 250, 248); size * size];
+        for clipped_shape in output.shapes {
+            let Shape::Rect(shape) = clipped_shape.shape else {
+                panic!("fallback Fill emitted a non-rectangle shape");
+            };
+            let painted = shape.rect.intersect(clipped_shape.clip_rect);
+            for y in 0..size {
+                for x in 0..size {
+                    if painted.contains(Pos2::new(x as f32 + 0.5, y as f32 + 0.5)) {
+                        pixels[y * size + x] = shape.fill;
+                    }
+                }
+            }
+        }
+        pixels
+    }
+
+    fn test_projected_polygon(points: &[CanvasPoint], depth: i64) -> Vec<Pos2> {
+        let camera = CameraAddress {
+            depth,
+            tile_x: 0.into(),
+            tile_y: 0.into(),
+            local_x: 0.0,
+            local_y: 0.0,
+            zoom: 1.0,
+        };
+        normalized_pos_polygon(
+            &points
+                .iter()
+                .map(|point| {
+                    let (x, y) = camera
+                        .canvas_to_screen(point, 0.0, 0.0)
+                        .expect("test point is representable");
+                    Pos2::new(x as f32, y as f32)
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn test_fill_area(fragments: &[Vec<CanvasPoint>], depth: i64) -> f32 {
+        fragments
+            .iter()
+            .map(|fragment| {
+                polygon_area_twice(&test_projected_polygon(fragment, depth)).abs() * 0.5
+            })
+            .sum()
+    }
+
+    fn assert_test_fill_area(fragments: &[Vec<CanvasPoint>], depth: i64, local_area: f32) {
+        let expected = local_area * 512.0 * 512.0;
+        let actual = test_fill_area(fragments, depth);
+        assert!(
+            (actual - expected).abs() <= expected.abs().max(1.0) * 1.0e-4,
+            "actual={actual} expected={expected} fragments={}",
+            fragments.len()
+        );
+    }
+
+    fn assert_test_fill_fragments_do_not_overlap(fragments: &[Vec<CanvasPoint>], depth: i64) {
+        let projected = fragments
+            .iter()
+            .map(|fragment| test_projected_polygon(fragment, depth))
+            .collect::<Vec<_>>();
+        for left in 0..projected.len() {
+            for right in left + 1..projected.len() {
+                let overlap =
+                    clip_polygon_to_convex_pos_polygon(&projected[left], &projected[right]);
+                assert!(
+                    polygon_area_twice(&overlap).abs() < 1.0,
+                    "fragments {left} and {right} overlap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fill_polygon_difference_preserves_exact_no_op_depth_and_winding() -> anyhow::Result<()> {
+        let depth = 37;
+        let source = test_canvas_polygon(depth, &[(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)]);
+        let disjoint_reversed =
+            test_canvas_polygon(depth, &[(1.2, 0.8), (1.4, 0.8), (1.4, 0.2), (1.2, 0.2)]);
+        let tangent = test_canvas_polygon(depth, &[(0.9, 0.3), (1.0, 0.3), (1.0, 0.7), (0.9, 0.7)]);
+
+        let fragments = subtract_fill_polygon(&source, &[disjoint_reversed, tangent])?;
+
+        assert_eq!(fragments, vec![source]);
+        assert!(fragments.iter().flatten().all(|point| point.depth == depth));
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_eraser_keeps_a_visible_cross_depth_fill_mask_representable() -> anyhow::Result<()> {
+        let view = CameraAddress {
+            depth: -1,
+            tile_x: BigInt::from(0),
+            tile_y: BigInt::from(0),
+            local_x: 0.5,
+            local_y: 0.5,
+            zoom: 3.0,
+        };
+        let mut source_camera = view.clone();
+        source_camera.jump_to_depth(-5);
+        source_camera.zoom *= (crate::coords::DEPTH_RATIO as f64).powi(4);
+        let polygon = |camera: &CameraAddress, min: f64, max: f64| {
+            [(min, min), (max, min), (max, max), (min, max), (min, min)]
+                .into_iter()
+                .map(|(x, y)| camera.screen_to_canvas(x, y, 512.0, 512.0))
+                .collect::<Vec<_>>()
+        };
+        let source = polygon(&source_camera, -6_000.0, 6_500.0);
+        let mask = polygon(&view, 246.0, 266.0);
+        let fill = EditOperation::draft(
+            EditKind::Fill,
+            -5,
+            source_camera.zoom,
+            source.clone(),
+            Color::BLACK,
+            0.0,
+        );
+
+        let changes = subtract_eraser_sources(&[fill], &[mask], &view, |_| Ok(Vec::new()))?;
+
+        assert_eq!(changes.len(), 1);
+        assert_ne!(changes[0].1[0].points, source);
+        assert!(
+            changes[0]
+                .1
+                .iter()
+                .flat_map(|fragment| &fragment.points)
+                .all(|point| point.depth == -5)
+        );
+        let projected = changes[0]
+            .1
+            .iter()
+            .map(|fragment| {
+                fragment
+                    .points
+                    .iter()
+                    .map(|point| {
+                        let (x, y) = view
+                            .canvas_to_screen(point, 512.0, 512.0)
+                            .expect("replacement remains visible at the erase camera");
+                        Pos2::new(x as f32, y as f32)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !projected
+                .iter()
+                .any(|fragment| point_in_pos_polygon(Pos2::new(256.0, 256.0), fragment))
+        );
+        assert!(
+            projected
+                .iter()
+                .any(|fragment| point_in_pos_polygon(Pos2::new(200.0, 200.0), fragment))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fill_polygon_difference_handles_crossing_containment_and_hole() -> anyhow::Result<()> {
+        let depth = -12;
+        let source = test_canvas_polygon(depth, &[(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)]);
+        let crossing =
+            test_canvas_polygon(depth, &[(0.45, 0.0), (0.55, 0.0), (0.55, 1.0), (0.45, 1.0)]);
+        let crossed = subtract_fill_polygon(&source, &[crossing])?;
+        assert_test_fill_area(&crossed, depth, 0.56);
+        assert!(crossed.len() >= 2);
+
+        let hole = test_canvas_polygon(depth, &[(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6)]);
+        let holed = subtract_fill_polygon(&source, &[hole])?;
+        assert_test_fill_area(&holed, depth, 0.60);
+        assert_test_fill_fragments_do_not_overlap(&holed, depth);
+        assert!(holed.len() > 1);
+        assert!(holed.iter().all(|fragment| {
+            fragment.first() == fragment.last() && fragment.iter().all(|point| point.depth == depth)
+        }));
+
+        let containing_reversed =
+            test_canvas_polygon(depth, &[(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)]);
+        assert!(subtract_fill_polygon(&source, &[containing_reversed])?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn fill_polygon_difference_handles_concave_source_mask_and_multiple_masks() -> anyhow::Result<()>
+    {
+        let depth = 5;
+        let source = test_canvas_polygon(
+            depth,
+            &[
+                (0.1, 0.1),
+                (0.9, 0.1),
+                (0.9, 0.4),
+                (0.4, 0.4),
+                (0.4, 0.9),
+                (0.1, 0.9),
+            ],
+        );
+        let concave_mask = test_canvas_polygon(
+            depth,
+            &[
+                (0.2, 0.15),
+                (0.8, 0.15),
+                (0.8, 0.25),
+                (0.4, 0.25),
+                (0.4, 0.35),
+                (0.2, 0.35),
+            ],
+        );
+        let second_mask =
+            test_canvas_polygon(depth, &[(0.15, 0.6), (0.25, 0.6), (0.25, 0.8), (0.15, 0.8)]);
+
+        let fragments = subtract_fill_polygon(&source, &[concave_mask, second_mask])?;
+
+        assert_test_fill_area(&fragments, depth, 0.29);
+        assert_test_fill_fragments_do_not_overlap(&fragments, depth);
+        assert!(fragments.len() > 2);
+        Ok(())
+    }
+
+    #[test]
+    fn fill_polygon_difference_preserves_degenerate_source_and_rejects_invalid_masks() {
+        let depth = 0;
+        let triangle = test_canvas_polygon(depth, &[(0.1, 0.1), (0.9, 0.1), (0.5, 0.9)]);
+        let crossing =
+            test_canvas_polygon(depth, &[(0.45, 0.0), (0.55, 0.0), (0.55, 1.0), (0.45, 1.0)]);
+        let degenerate = test_canvas_polygon(depth, &[(0.1, 0.1), (0.2, 0.2), (0.3, 0.3)]);
+        assert_eq!(
+            subtract_fill_polygon(&degenerate, &[]).unwrap(),
+            vec![degenerate.clone()]
+        );
+        assert!(subtract_fill_polygon(&triangle, &[degenerate]).is_err());
+
+        let mut nonfinite = triangle.clone();
+        nonfinite[1].local_x = f64::NAN;
+        assert!(subtract_fill_polygon(&nonfinite, &[]).is_err());
+
+        let error = subtract_fill_polygon_with_limit(&triangle, &[crossing], 1)
+            .expect_err("crossing must exceed one fragment");
+        assert!(error.to_string().contains("1-fragment limit"));
+    }
+
+    #[test]
+    fn fill_polygon_difference_erases_subpixel_fragments_that_can_be_zoomed_later() {
+        let source =
+            test_canvas_polygon(0, &[(0.0, 0.0), (0.001, 0.0), (0.001, 0.001), (0.0, 0.001)]);
+        let mask = test_canvas_polygon(
+            0,
+            &[
+                (-0.001, -0.001),
+                (0.002, -0.001),
+                (0.002, 0.002),
+                (-0.001, 0.002),
+            ],
+        );
+
+        assert!(subtract_fill_polygon(&source, &[mask]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fill_polygon_difference_stress_stays_below_fixed_fragment_limit() -> anyhow::Result<()> {
+        let depth = 0;
+        let source = test_canvas_polygon(
+            depth,
+            &[(0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95)],
+        );
+        let masks = (0..48)
+            .map(|index| {
+                let left = 0.06 + index as f64 * 0.018;
+                test_canvas_polygon(
+                    depth,
+                    &[
+                        (left, 0.04),
+                        (left + 0.006, 0.04),
+                        (left + 0.006, 0.96),
+                        (left, 0.96),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let fragments = subtract_fill_polygon(&source, &masks)?;
+
+        assert!(fragments.len() <= 256, "fragments={}", fragments.len());
+        assert_eq!(fragments.len(), 98);
+        assert_test_fill_fragments_do_not_overlap(&fragments, depth);
+        assert_test_fill_area(&fragments, depth, 0.81 - 48.0 * 0.006 * 0.9);
+        Ok(())
+    }
+
+    #[test]
+    fn fill_group_render_removes_raster_seams_and_preserves_fallback_edges() -> anyhow::Result<()> {
+        let depth = 0;
+        let mut source = EditOperation::draft(
+            EditKind::Fill,
+            depth,
+            1.0,
+            test_canvas_polygon(depth, &[(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)]),
+            Color::BLACK,
+            0.0,
+        );
+        source.sequence = 10;
+        source.paint_order = Some(10);
+        let mut mask = EditOperation::draft(
+            EditKind::EraseArea,
+            depth,
+            1.0,
+            test_canvas_polygon(
+                depth,
+                &[
+                    (0.3, 0.3),
+                    (0.7, 0.3),
+                    (0.7, 0.45),
+                    (0.5, 0.45),
+                    (0.5, 0.7),
+                    (0.3, 0.7),
+                ],
+            ),
+            Color::WHITE,
+            0.0,
+        );
+        mask.sequence = 11;
+        mask.paint_order = Some(11);
+        let mut later = EditOperation::draft(
+            EditKind::Fill,
+            depth,
+            1.0,
+            test_canvas_polygon(depth, &[(0.42, 0.5), (0.58, 0.5), (0.58, 0.6), (0.42, 0.6)]),
+            Color::rgba(220, 30, 30, 255),
+            0.0,
+        );
+        later.sequence = 12;
+        later.paint_order = Some(12);
+
+        let mut fragment_operations = test_fill_fragment_operations(&source, &[mask.clone()])?;
+        assert!(fragment_operations.iter().all(|fragment| {
+            fragment.kind == EditKind::Fill
+                && fragment.color == source.color
+                && fragment.paint_order == source.paint_order
+        }));
+        fragment_operations.push(later.clone());
+        let legacy_operations = vec![source, mask.clone(), later];
+        let fallback_operations = |operations: &[EditOperation]| {
+            let mut groups = Vec::<(Vec<Vec<Pos2>>, Color32)>::new();
+            for (index, operation) in operations.iter().enumerate() {
+                let color = operation.opaque_visible_color(Color::WHITE);
+                let points = test_projected_polygon(&operation.points, depth)
+                    .into_iter()
+                    .map(|point| Pos2::new(point.x * 0.25, point.y * 0.25))
+                    .collect();
+                if index > 0 && operations[index - 1].shares_fill_group_with(operation) {
+                    groups
+                        .last_mut()
+                        .expect("previous fallback group")
+                        .0
+                        .push(points);
+                } else {
+                    groups.push((
+                        vec![points],
+                        Color32::from_rgba_unmultiplied(color.r, color.g, color.b, u8::MAX),
+                    ));
+                }
+            }
+            groups
+        };
+        let fragment_fallback =
+            test_fallback_fill_pixels(&fallback_operations(&fragment_operations), 128);
+        let mut ungrouped_fragment_operations = fragment_operations.clone();
+        for operation in &mut ungrouped_fragment_operations {
+            operation.fill_group_id = None;
+        }
+        let ungrouped_fragment_fallback =
+            test_fallback_fill_pixels(&fallback_operations(&ungrouped_fragment_operations), 128);
+        assert_eq!(fragment_fallback, ungrouped_fragment_fallback);
+        let legacy_fallback =
+            test_fallback_fill_pixels(&fallback_operations(&legacy_operations), 128);
+        let fallback_differences = fragment_fallback
+            .iter()
+            .zip(&legacy_fallback)
+            .enumerate()
+            .filter_map(|(index, (fragment, legacy))| {
+                (fragment != legacy).then_some((index, *fragment, *legacy))
+            })
+            .collect::<Vec<_>>();
+        let mask_outline = test_projected_polygon(&mask.points, depth)
+            .into_iter()
+            .map(|point| Point2::new(f64::from(point.x * 0.25), f64::from(point.y * 0.25)))
+            .collect::<Vec<_>>();
+        assert_eq!(fallback_differences.len(), 208);
+        assert!(fallback_differences.iter().all(|(index, _, _)| {
+            let position = Point2::new((index % 128) as f64 + 0.5, (index / 128) as f64 + 0.5);
+            closed_polyline_distance(position, &mask_outline) <= 1.5
+        }));
+        let key = TileKey {
+            depth,
+            x: 0.into(),
+            y: 0.into(),
+            lod: tile_lod_for_resolution(128),
+        };
+
+        let mut differing_pixel_counts = Vec::new();
+        for edge_quality in 0..=2 {
+            let options = RasterOptions::new(edge_quality, 0);
+            let legacy = render_tile_with_options(&legacy_operations, &key, Color::WHITE, options);
+            let fragments =
+                render_tile_with_options(&fragment_operations, &key, Color::WHITE, options);
+            let differences = fragments
+                .as_raw()
+                .iter()
+                .zip(legacy.as_raw())
+                .enumerate()
+                .filter_map(|(index, (fragment, legacy))| {
+                    (fragment != legacy).then_some((index, *fragment, *legacy))
+                })
+                .collect::<Vec<_>>();
+            let width = fragments.width() as usize;
+            let differing_pixels = differences
+                .iter()
+                .map(|(index, _, _)| index / 4)
+                .collect::<HashSet<_>>();
+            differing_pixel_counts.push(differing_pixels.len());
+            assert!(
+                differing_pixels.len() < width * width / 50,
+                "edge_quality={edge_quality} differences={} first={:?}",
+                differences.len(),
+                differences.first()
+            );
+        }
+        assert_eq!(differing_pixel_counts, [0, 0, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn fill_group_fragments_keep_object_payload_semantics_at_extreme_coordinates()
+    -> anyhow::Result<()> {
+        let depth = 1_200;
+        let tile = BigInt::from(10u8).pow(200);
+        let source = EditOperation::draft(
+            EditKind::Fill,
+            depth,
+            1.0,
+            test_canvas_polygon_at(
+                depth,
+                tile.clone(),
+                &[(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)],
+            ),
+            Color::rgba(20, 40, 60, 255),
+            0.0,
+        );
+        let mask = EditOperation::draft(
+            EditKind::EraseArea,
+            depth,
+            1.0,
+            test_canvas_polygon_at(
+                depth,
+                tile.clone(),
+                &[(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6)],
+            ),
+            Color::WHITE,
+            0.0,
+        );
+        let fragments = test_fill_fragment_operations(&source, &[mask])?;
+
+        assert!(fragments.len() > 1);
+        assert_eq!(
+            fragments
+                .iter()
+                .filter_map(|fragment| fragment.fill_group_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            1
+        );
+        assert!(
+            fully_contained_object_operation_ids(
+                &fragments,
+                &HashSet::from([fragments[0].id]),
+                DEFAULT_LAYER_ID,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            fully_contained_object_operation_ids(
+                &fragments,
+                &fragments.iter().map(|fragment| fragment.id).collect(),
+                DEFAULT_LAYER_ID,
+            )
+            .len(),
+            fragments.len()
+        );
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<HashSet<_>>()
+                .len(),
+            fragments.len()
+        );
+        assert!(fragments.iter().all(|fragment| {
+            operation_bounds(fragment).is_some_and(|bounds| {
+                bounds.depth == depth
+                    && bounds.min_x == tile
+                    && bounds.max_x == tile
+                    && bounds.min_y == tile
+                    && bounds.max_y == tile
+            })
+        }));
+
+        let key = TileKey {
+            depth,
+            x: tile.clone(),
+            y: tile.clone(),
+            lod: tile_lod_for_resolution(128),
+        };
+        assert_eq!(
+            OperationIndex::build(&fragments).query(&key).len(),
+            fragments.len()
+        );
+
+        let camera = CameraAddress {
+            depth,
+            tile_x: tile.clone(),
+            tile_y: tile.clone(),
+            local_x: 0.5,
+            local_y: 0.5,
+            zoom: 1.0,
+        };
+        let projected = fragments
+            .iter()
+            .map(|fragment| {
+                fragment
+                    .points
+                    .iter()
+                    .map(|point| {
+                        let (x, y) = camera
+                            .canvas_to_screen(point, 512.0, 512.0)
+                            .expect("same-depth extreme coordinate is representable");
+                        Pos2::new(x as f32, y as f32)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let retained_click = Pos2::new(102.4, 76.8);
+        let hit_indices = projected
+            .iter()
+            .enumerate()
+            .filter_map(|(index, points)| {
+                operation_pick_hit(EditKind::Fill, points, 0.0, retained_click).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hit_indices.len(), 1, "hit_indices={hit_indices:?}");
+        assert!(projected.iter().all(|points| !operation_pick_hit(
+            EditKind::Fill,
+            points,
+            0.0,
+            Pos2::new(256.0, 256.0)
+        )));
+
+        let retained_selection = SelectionShape::Rectangle(Rect2::from_points(
+            Point2::new(98.0, 72.0),
+            Point2::new(106.0, 80.0),
+        ));
+        let hole_selection = SelectionShape::Rectangle(Rect2::from_points(
+            Point2::new(240.0, 240.0),
+            Point2::new(272.0, 272.0),
+        ));
+        let selection_points = projected
+            .iter()
+            .map(|points| {
+                points
+                    .iter()
+                    .map(|point| Point2::new(f64::from(point.x), f64::from(point.y)))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selection_points
+                .iter()
+                .filter(|points| {
+                    operation_intersects_selection(EditKind::Fill, points, 0.0, &retained_selection)
+                })
+                .count(),
+            1
+        );
+        assert!(selection_points.iter().all(|points| {
+            !operation_intersects_selection(EditKind::Fill, points, 0.0, &hole_selection)
+                && operation_contained_by_rectangle(
+                    EditKind::Fill,
+                    points,
+                    0.0,
+                    Rect2::from_points(Point2::new(0.0, 0.0), Point2::new(512.0, 512.0)),
+                )
+        }));
+
+        let transforms = [
+            ScreenAffine::uniform_scale(256.0, 256.0, 0.9).unwrap(),
+            ScreenAffine::rotation(256.0, 256.0, 0.2).unwrap(),
+            ScreenAffine::flip_horizontal(256.0, 256.0).unwrap(),
+            ScreenAffine::flip_vertical(256.0, 256.0).unwrap(),
+        ];
+        for transform in transforms {
+            for point in fragments.iter().flat_map(|fragment| &fragment.points) {
+                let transformed = transform
+                    .transform_canvas_point(point, &camera, 512.0, 512.0)
+                    .expect("fragment transform remains representable");
+                assert_eq!(transformed.depth, depth);
+                assert_eq!(transformed.tile_x, tile);
+                assert_eq!(transformed.tile_y, tile);
+            }
+        }
+
+        let clipboard = SelectionClipboard {
+            operations: fragments.clone(),
+            paste_count: 0,
+        };
+        let recolored = clipboard
+            .operations
+            .iter()
+            .cloned()
+            .map(|mut operation| {
+                operation.color = Color::rgba(200, 100, 50, 255);
+                operation
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            recolored
+                .iter()
+                .zip(&fragments)
+                .all(|(recolored, source)| recolored.points == source.points)
+        );
+        assert_eq!(clipboard.paste_count, 0);
+        Ok(())
+    }
+
+    #[test]
     fn area_polygon_clips_fill_covering_area_into_one_selected_polygon() {
         let area = normalized_pos_polygon(&[
             Pos2::new(0.0, 0.0),
@@ -8725,34 +12301,6 @@ mod tests {
     }
 
     #[test]
-    fn selection_layer_filter_includes_only_the_visible_unlocked_active_layer() {
-        let mut default_layer = Layer::default_layer();
-        let other_layer = Layer {
-            id: Uuid::new_v4(),
-            name: "Other".to_owned(),
-            sort_order: 1,
-            visible: true,
-            locked: false,
-        };
-        let layers = [default_layer.clone(), other_layer.clone()];
-
-        assert_eq!(
-            selectable_layer_ids(&layers, DEFAULT_LAYER_ID),
-            HashSet::from([DEFAULT_LAYER_ID])
-        );
-        assert_eq!(
-            selectable_layer_ids(&layers, other_layer.id),
-            HashSet::from([other_layer.id])
-        );
-
-        default_layer.locked = true;
-        assert!(selectable_layer_ids(&[default_layer], DEFAULT_LAYER_ID).is_empty());
-        let mut hidden = other_layer;
-        hidden.visible = false;
-        assert!(selectable_layer_ids(&[hidden.clone()], hidden.id).is_empty());
-    }
-
-    #[test]
     fn tile_display_uses_content_rect_and_source_bleed_crop() {
         let lod = tile_lod_for_resolution(128);
         let (destination, source) = tile_display_rects(Pos2::new(10.0, 20.0), 1.25, lod);
@@ -8794,6 +12342,26 @@ mod tests {
         assert_eq!(
             tile_fallback_mode(8, [Some((9, 12))]),
             TileFallbackMode::Full
+        );
+    }
+
+    #[test]
+    fn distant_tiles_gate_only_distant_non_empty_views() {
+        assert_eq!(
+            depth_render_mode(VisibleDepthMode::Empty, true),
+            DepthRenderMode::Empty
+        );
+        assert_eq!(
+            depth_render_mode(VisibleDepthMode::Near, true),
+            DepthRenderMode::VectorsNear
+        );
+        assert_eq!(
+            depth_render_mode(VisibleDepthMode::Distant, true),
+            DepthRenderMode::DistantTile
+        );
+        assert_eq!(
+            depth_render_mode(VisibleDepthMode::Distant, false),
+            DepthRenderMode::VectorsNear
         );
     }
 
@@ -8840,22 +12408,28 @@ mod tests {
     fn frame_rate_tracker_measures_active_interactions_and_resets_after_idle() {
         let mut tracker = FrameRateTracker::default();
 
-        tracker.update(1.0 / 20.0, false);
+        assert_eq!(tracker.update(1.0 / 20.0, false), None);
         assert_eq!(tracker.metrics(), None);
 
-        tracker.update(1.0 / 60.0, true);
+        let measured = tracker
+            .update(1.0 / 60.0, true)
+            .expect("active frame measurement");
+        assert!((measured - 1000.0 / 60.0).abs() < 0.01);
         let (fps, frame_time) = tracker.metrics().expect("active measurement");
         assert!((fps - 60.0).abs() < 0.01);
         assert!((frame_time - 1000.0 / 60.0).abs() < 0.01);
 
-        tracker.update(1.0 / 30.0, true);
+        let measured = tracker
+            .update(1.0 / 30.0, true)
+            .expect("continued active frame measurement");
+        assert!((measured - 1000.0 / 30.0).abs() < 0.01);
         let expected = 1.0 / 60.0 + (1.0 / 30.0 - 1.0 / 60.0) * FRAME_TIME_EMA_ALPHA;
         assert!(
             (tracker.metrics().expect("averaged measurement").1 - expected * 1000.0).abs() < 0.01
         );
 
-        tracker.update(1.0 / 20.0, false);
-        tracker.update(1.0 / 40.0, true);
+        assert_eq!(tracker.update(1.0 / 20.0, false), None);
+        assert_eq!(tracker.update(1.0 / 40.0, true), Some(25.0));
         let (fps, _) = tracker.metrics().expect("reset measurement");
         assert!((fps - 40.0).abs() < 0.01);
     }
@@ -8864,11 +12438,16 @@ mod tests {
     fn frame_rate_tracker_rejects_invalid_frame_times() {
         let mut tracker = FrameRateTracker::default();
 
-        tracker.update(f32::NAN, true);
-        tracker.update(0.0, true);
-        tracker.update(1.0, true);
+        assert_eq!(tracker.update(f32::NAN, true), None);
+        assert_eq!(tracker.update(0.0, true), None);
+        assert_eq!(tracker.update(1.0, true), None);
 
         assert_eq!(tracker.metrics(), None);
+
+        assert_eq!(
+            tracker.update(MAX_MEASURED_FRAME_TIME, true),
+            Some(MAX_MEASURED_FRAME_TIME * 1_000.0)
+        );
     }
 
     #[test]
@@ -8906,9 +12485,10 @@ mod tests {
             Event::PointerMoved(Pos2::new(5.0, 5.0)),
         ];
 
-        let (press, positions) = primary_pointer_positions(&events, false);
+        let (press, positions, touch_history) = primary_pointer_positions(&events, false);
 
         assert_eq!(press, Some(Pos2::new(1.0, 1.0)));
+        assert!(!touch_history);
         assert_eq!(
             positions,
             vec![
@@ -8931,10 +12511,55 @@ mod tests {
             },
         ];
 
-        let (press, positions) = primary_pointer_positions(&events, false);
+        let (press, positions, touch_history) = primary_pointer_positions(&events, false);
 
         assert_eq!(press, None);
+        assert!(!touch_history);
         assert_eq!(positions, vec![Pos2::new(6.0, 6.0), Pos2::new(7.0, 7.0)]);
+    }
+
+    #[test]
+    fn primary_pointer_positions_prefer_ordered_pen_touch_history() {
+        let touch = |phase, x| Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(7),
+            phase,
+            pos: Pos2::new(x, x),
+            force: Some(0.5),
+        };
+        let events = vec![
+            touch(egui::TouchPhase::Start, 1.0),
+            Event::PointerButton {
+                pos: Pos2::new(1.0, 1.0),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+            touch(egui::TouchPhase::Move, 2.0),
+            Event::PointerMoved(Pos2::new(2.0, 2.0)),
+            touch(egui::TouchPhase::Move, 3.0),
+            Event::PointerMoved(Pos2::new(3.0, 3.0)),
+            touch(egui::TouchPhase::End, 4.0),
+            Event::PointerButton {
+                pos: Pos2::new(3.0, 3.0),
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+
+        let (press, positions, touch_history) = primary_pointer_positions(&events, false);
+
+        assert_eq!(press, Some(Pos2::new(1.0, 1.0)));
+        assert_eq!(
+            positions,
+            vec![
+                Pos2::new(2.0, 2.0),
+                Pos2::new(3.0, 3.0),
+                Pos2::new(4.0, 4.0)
+            ]
+        );
+        assert!(touch_history);
     }
 
     #[test]
@@ -9711,27 +13336,14 @@ mod tests {
     }
 
     #[test]
-    fn auto_saved_stroke_fallback_uses_fast_shapes_when_tile_generation_is_paused() {
-        let points = vec![
-            Pos2::new(0.0, 0.0),
-            Pos2::new(12.0, 16.0),
-            Pos2::new(28.0, 3.0),
-        ];
+    fn manual_tile_pause_keeps_idle_saved_stroke_smoothing() {
         let auto_fast_path = auto_fast_stroke_fallback_active(false, false, true);
 
-        let (shapes, stats) = stroke_fallback_shapes(
-            points.as_slice(),
-            8.0,
-            Color32::BLACK,
-            stroke_fallback_segmented_point_limit(StrokeFallbackJoinMode::Auto, auto_fast_path),
-            stroke_fallback_fast_endpoint_caps(StrokeFallbackJoinMode::Auto, auto_fast_path),
+        assert!(!auto_fast_path);
+        assert_eq!(
+            stroke_fallback_smoothing_passes(StrokeFallbackJoinMode::Auto, auto_fast_path, 3),
+            3
         );
-
-        assert_eq!(shapes.len(), 1);
-        assert_eq!(stats.stroke_shape_count, 1);
-        assert_eq!(stats.segmented_strokes, 0);
-        assert_eq!(stats.fast_strokes, 1);
-        assert!(matches!(shapes[0], Shape::Path(_)));
     }
 
     #[test]
@@ -9774,6 +13386,63 @@ mod tests {
     }
 
     #[test]
+    fn fallback_operation_budget_never_splits_a_fill_group() {
+        let settings = AppSettings::default();
+        let camera = CameraAddress::default();
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+        let mut older = EditOperation::draft(
+            EditKind::Paint,
+            0,
+            1.0,
+            vec![camera.center_point(), camera.center_point()],
+            Color::BLACK,
+            4.0,
+        );
+        older.sequence = 1;
+        let source = EditOperation::draft(
+            EditKind::Fill,
+            0,
+            1.0,
+            test_canvas_polygon(0, &[(0.1, 0.1), (0.9, 0.1), (0.5, 0.9)]),
+            Color::BLACK,
+            0.0,
+        );
+        let mask = EditOperation::draft(
+            EditKind::EraseArea,
+            0,
+            1.0,
+            test_canvas_polygon(0, &[(0.45, 0.0), (0.55, 0.0), (0.55, 1.0), (0.45, 1.0)]),
+            Color::WHITE,
+            0.0,
+        );
+        let mut fragments = test_fill_fragment_operations(&source, &[mask]).unwrap();
+        for (offset, fragment) in fragments.iter_mut().enumerate() {
+            fragment.sequence = offset as i64 + 2;
+            fragment.paint_order = Some(2);
+        }
+        let operations = std::iter::once(older)
+            .chain(fragments)
+            .map(Arc::new)
+            .collect::<Vec<_>>();
+        let mut renderer = FallbackRenderer::default();
+
+        let (projected, skipped, _) = renderer.project_operations(
+            &operations,
+            &camera,
+            rect,
+            None,
+            Some(1),
+            settings.stroke_fallback_joins,
+            false,
+            settings.smoothing,
+            Instant::now(),
+        );
+
+        assert_eq!(skipped, 1);
+        assert_eq!(projected.len(), operations.len() - 1);
+    }
+
+    #[test]
     fn operation_screen_cull_rejects_definitely_offscreen_fallback_operations() {
         let camera = CameraAddress::default();
         let viewport = Rect::from_min_max(Pos2::ZERO, Pos2::new(1280.0, 720.0));
@@ -9786,9 +13455,17 @@ mod tests {
             Color::BLACK,
             8.0,
         );
-        assert!(operation_may_intersect_screen_rect(
-            &visible, &camera, viewport, 8.0
-        ));
+        let mut cache = OperationBoundsCache::default();
+        let visible_lookup =
+            cache.operation_may_intersect_screen_rect(&visible, &camera, viewport, 8.0);
+        assert!(!visible_lookup.cache_hit);
+        assert!(visible_lookup.may_intersect);
+        assert_eq!(cache.len(), 1);
+
+        let repeated_lookup =
+            cache.operation_may_intersect_screen_rect(&visible, &camera, viewport, 8.0);
+        assert!(repeated_lookup.cache_hit);
+        assert!(repeated_lookup.may_intersect);
 
         let offscreen = EditOperation::draft(
             EditKind::Paint,
@@ -9801,9 +13478,222 @@ mod tests {
             Color::BLACK,
             8.0,
         );
-        assert!(!operation_may_intersect_screen_rect(
-            &offscreen, &camera, viewport, 8.0
+        let compact = EditOperation::compact_block(
+            DEFAULT_LAYER_ID,
+            offscreen.points.clone(),
+            vec![offscreen],
+        );
+        let compact_source = compact.compact_sources.first().expect("compact source");
+        let compact_source_lookup =
+            cache.operation_may_intersect_screen_rect(compact_source, &camera, viewport, 8.0);
+        assert!(!compact_source_lookup.cache_hit);
+        assert!(!compact_source_lookup.may_intersect);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn operation_bounds_cache_survives_navigation_anchor_reset_and_explicitly_clears() {
+        let viewport = Rect::from_min_max(Pos2::ZERO, Pos2::new(1280.0, 720.0));
+        let camera = CameraAddress::default();
+        let center = camera.center_point();
+        let operation = EditOperation::draft(
+            EditKind::Paint,
+            camera.depth,
+            camera.zoom,
+            vec![center.clone(), center],
+            Color::BLACK,
+            8.0,
+        );
+        let mut bounds_cache = OperationBoundsCache::default();
+        let first =
+            bounds_cache.operation_may_intersect_screen_rect(&operation, &camera, viewport, 8.0);
+        assert!(!first.cache_hit);
+
+        let mut projected_geometry = ProjectedGeometryCache::default();
+        assert!(projected_geometry.begin_frame(&camera, viewport).is_some());
+        let mut moved_camera = camera;
+        moved_camera.tile_x = 1_000.into();
+        moved_camera.zoom = 2.0;
+        assert!(
+            projected_geometry
+                .begin_frame(&moved_camera, viewport)
+                .is_some()
+        );
+
+        let after_anchor_reset = bounds_cache.operation_may_intersect_screen_rect(
+            &operation,
+            &moved_camera,
+            viewport,
+            8.0,
+        );
+        assert!(after_anchor_reset.cache_hit);
+        assert_eq!(bounds_cache.len(), 1);
+
+        bounds_cache.clear();
+        assert_eq!(bounds_cache.len(), 0);
+        let after_clear = bounds_cache.operation_may_intersect_screen_rect(
+            &operation,
+            &moved_camera,
+            viewport,
+            8.0,
+        );
+        assert!(!after_clear.cache_hit);
+    }
+
+    #[test]
+    fn fallback_renderer_centralizes_frame_and_invalidation_lifecycle() {
+        let settings = AppSettings::default();
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(512.0, 512.0));
+        let camera = CameraAddress::default();
+        let frame_key = SavedFallbackRenderFrameKey::new(1, &camera, rect, &settings, false);
+        let operation_key = SavedFallbackRenderOperationKey {
+            scope_id: Uuid::nil(),
+            operation_id: Uuid::nil(),
+            sequence: 1,
+            render_variant: 0,
+        };
+        let center = camera.center_point();
+        let operation = EditOperation::draft(
+            EditKind::Paint,
+            camera.depth,
+            camera.zoom,
+            vec![center.clone(), center],
+            Color::BLACK,
+            8.0,
+        );
+        let mut renderer = FallbackRenderer::default();
+        let operations = vec![Arc::new(operation.clone())];
+
+        renderer.begin_frame(frame_key.clone());
+        renderer
+            .saved_render_cache
+            .insert(operation_key, vec![Pos2::ZERO, Pos2::new(1.0, 1.0)]);
+        let bounds = renderer
+            .operation_bounds_cache
+            .operation_may_intersect_screen_rect(&operation, &camera, rect, 8.0);
+        assert!(!bounds.cache_hit);
+        renderer.segmented_shape_budget_remaining = 0;
+
+        renderer.begin_frame(frame_key);
+        assert_eq!(renderer.saved_render_cache.cached_operation_count(), 1);
+        assert_eq!(renderer.operation_bounds_cache.len(), 1);
+        assert_eq!(
+            renderer.segmented_shape_budget_remaining,
+            MAX_SEGMENTED_FALLBACK_SHAPES_PER_FRAME
+        );
+
+        let mut moved_camera = camera.clone();
+        moved_camera.tile_x = 100.into();
+        renderer.begin_frame(SavedFallbackRenderFrameKey::new(
+            1,
+            &moved_camera,
+            rect,
+            &settings,
+            false,
         ));
+        assert_eq!(renderer.saved_render_cache.cached_operation_count(), 0);
+        assert_eq!(renderer.operation_bounds_cache.len(), 1);
+
+        let visible_tiles = Vec::new();
+        let (visible, first_visible_cache_hit) =
+            renderer.visible_operations(1, &visible_tiles, || vec![0]);
+        assert!(!first_visible_cache_hit);
+        assert_eq!(visible.len(), 1);
+        let (cached_visible, repeated_visible_cache_hit) =
+            renderer.visible_operations(1, &visible_tiles, || {
+                panic!("same visible-operation cache key should not query again")
+            });
+        assert!(repeated_visible_cache_hit);
+        assert_eq!(cached_visible.len(), 1);
+
+        renderer.begin_frame(SavedFallbackRenderFrameKey::new(
+            2, &camera, rect, &settings, false,
+        ));
+        renderer.operation_bounds_cache.clear();
+        let (projected, skipped, first_stats) = renderer.project_operations(
+            &operations,
+            &camera,
+            rect,
+            None,
+            None,
+            settings.stroke_fallback_joins,
+            false,
+            settings.smoothing,
+            Instant::now(),
+        );
+        assert_eq!(projected.len(), 1);
+        assert_eq!(skipped, 0);
+        assert!(matches!(
+            projected.first(),
+            Some(FallbackPaintOperation::Projected { .. })
+        ));
+        assert_eq!(first_stats.projected_operations, 1);
+        assert_eq!(first_stats.fallback_bounds_cache_hits, 0);
+        assert_eq!(first_stats.fallback_bounds_cache_misses, 1);
+
+        let derived_key = saved_fallback_operation_key(
+            operation.id,
+            &operation,
+            settings.stroke_fallback_joins,
+            false,
+            settings.smoothing,
+        );
+        renderer
+            .saved_render_cache
+            .insert(derived_key, vec![Pos2::ZERO, Pos2::new(1.0, 1.0)]);
+        let (derived, _, derived_stats) = renderer.project_operations(
+            &operations,
+            &camera,
+            rect,
+            None,
+            None,
+            settings.stroke_fallback_joins,
+            false,
+            settings.smoothing,
+            Instant::now(),
+        );
+        assert!(matches!(
+            derived.first(),
+            Some(FallbackPaintOperation::CachedDerived { .. })
+        ));
+        assert_eq!(derived_stats.fallback_cache_hits, 1);
+        assert_eq!(derived_stats.projected_operations, 0);
+        assert_eq!(derived_stats.fallback_bounds_cache_hits, 0);
+        assert_eq!(derived_stats.fallback_bounds_cache_misses, 0);
+
+        let mut zoomed_camera = camera.clone();
+        zoomed_camera.zoom = 1.1;
+        renderer.begin_frame(SavedFallbackRenderFrameKey::new(
+            3,
+            &zoomed_camera,
+            rect,
+            &settings,
+            false,
+        ));
+        let (_, _, warmed_stats) = renderer.project_operations(
+            &operations,
+            &zoomed_camera,
+            rect,
+            None,
+            None,
+            settings.stroke_fallback_joins,
+            false,
+            settings.smoothing,
+            Instant::now(),
+        );
+        assert_eq!(warmed_stats.fallback_bounds_cache_hits, 1);
+        assert_eq!(warmed_stats.fallback_bounds_cache_misses, 0);
+
+        renderer.clear();
+        assert_eq!(renderer.saved_render_cache.cached_operation_count(), 0);
+        assert_eq!(renderer.operation_bounds_cache.len(), 0);
+        assert_eq!(
+            renderer.segmented_shape_budget_remaining,
+            MAX_SEGMENTED_FALLBACK_SHAPES_PER_FRAME
+        );
+        let (visible, visible_cache_hit) = renderer.visible_operations(1, &visible_tiles, Vec::new);
+        assert!(!visible_cache_hit);
+        assert!(visible.is_empty());
     }
 
     #[test]
@@ -10103,10 +13993,26 @@ mod tests {
             Pos2::new(0.0, 0.0),
         ];
 
-        let rendered = area_saved_fallback_render_points(&square, 64);
+        let rendered = area_saved_fallback_render_points(&square, 64, 0);
 
         assert_eq!(rendered, square);
         assert!(smooth_pos2_saved_fallback(&rendered, 3, true).len() > rendered.len());
+    }
+
+    #[test]
+    fn freehand_area_fallback_smooths_closed_corners() {
+        let square = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(10.0, 0.0),
+            Pos2::new(10.0, 10.0),
+            Pos2::new(0.0, 10.0),
+            Pos2::new(0.0, 0.0),
+        ];
+
+        let rendered = area_saved_fallback_render_points(&square, 64, 2);
+
+        assert!(rendered.len() > square.len());
+        assert!(!rendered.contains(&square[1]));
     }
 
     #[test]
@@ -10121,7 +14027,7 @@ mod tests {
             Pos2::new(0.0, 0.0),
         ];
 
-        let rendered = area_saved_fallback_render_points(&points, 4);
+        let rendered = area_saved_fallback_render_points(&points, 4, 0);
 
         assert_eq!(rendered, vec![points[0], points[1], points[3], points[5]]);
     }
